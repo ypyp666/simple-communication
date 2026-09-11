@@ -150,11 +150,13 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
     }
 
     // 大量消息直接在功能函数里逐条发给拉取人自己的socket
+    // 字段名必须与实时转发(Repost)完全一致：消息ID统一叫 serverId（此前拉取用 ID，
+    // 实时转发用 serverId，同一语义两个名字，客户端只能靠兜底解析）
     for (const auto& m : msgs)
     {
         json one = {
             {"type", "repost"},
-            {"ID", std::to_string(m.messageId)},
+            {"serverId", std::to_string(m.messageId)},
             {"accountId", session->account},
             {"sendId", std::to_string(m.senderId)},
             {"targetId", std::to_string(m.targetId)},
