@@ -14,10 +14,13 @@ LoginBackend::LoginBackend(QObject* parent, TcpClient* tcpclient)
 
 LoginBackend::~LoginBackend()
 {
-    // 如果是自己创建的TcpClient，需要手动删除
-    if (m_tcpClient) {
+    // 只有自己创建的 TcpClient 才由这里负责处理
+    // 借用的指针归 parent 管理：MainBackend 析构时 Qt 按创建顺序先销毁 TcpClient，
+    // 轮到本析构函数时 m_tcpClient 已是悬垂指针，解引用是 UB，所以借用情况下一律不碰
+    if (m_ownTcpClient && m_tcpClient) {
         m_tcpClient->disconnectFromServer();
-        // 不要delete，因为已经设置了parent，Qt会自动清理
+        delete m_tcpClient;
+        m_tcpClient = nullptr;
     }
 }
 
@@ -31,6 +34,20 @@ void LoginBackend::startLogin(const QString& accountId, const QString& password)
     // 连接服务器（异步操作）
     m_tcpClient->connectToServer("192.168.20.128", 8899);
     emit loginWaiting();
+}
+
+void LoginBackend::ModifyPwdAquird(const QString& account, const QString& newPassword)
+{
+    // 保存修改密码所需参数（连接建立后由 MainBackend 路由回来调 sendModifyPwdRequest 发包）
+    m_accountId = account;
+    m_newPassword = newPassword;
+    m_loginCompleted = false;
+
+    // 连接服务器（异步）。修改密码无需登录，但同样走这条共享 TCP 连接。
+    // 注意：不能在连接建立前 sendData，否则数据会因 socket 未连接而直接丢弃，
+    // 所以请求的发送延迟到 onTcpConnected 路由之后由 sendModifyPwdRequest 完成
+    m_tcpClient->connectToServer("192.168.20.128", 8899);
+    emit modifyPwdWaiting();
 }
 
 void LoginBackend::sendLoginRequest()
@@ -57,6 +74,27 @@ void LoginBackend::sendLoginRequest()
     m_tcpClient->sendData(packet);
     
     qDebug() << "发送登录请求:" << jsonData;
+}
+
+void LoginBackend::sendModifyPwdRequest()
+{
+    // 构建修改密码数据包（JSON格式），账号/新密码来自 ModifyPwdAquird 保存的成员
+    QJsonObject modifyPwdData;
+    modifyPwdData["type"] = "modify_password";
+    modifyPwdData["account"] = m_accountId;
+    modifyPwdData["new_password"] = m_newPassword;
+    
+    // 序列化JSON
+    QJsonDocument doc(modifyPwdData);
+    QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
+    
+    // 添加换行符作为包分隔符（解决TCP粘包问题）
+    QByteArray packet = jsonData + '\n';
+    
+    // 发送数据包
+    m_tcpClient->sendData(packet);
+    
+    qDebug() << "发送修改密码请求:" << jsonData;
 }
 
 void LoginBackend::onTcpConnected()
@@ -104,6 +142,15 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
             qDebug() << "登录失败:" << response["message"].toString();
             emit loginFailed();
         }
+    } else if (type == "modify_password_response") {
+        // 修改密码响应：服务器成功/失败只发对应信号，UI 据此提示并切页
+        if (response["success"].toBool()) {
+            qDebug() << "修改密码成功";
+            emit modifyPwdSuccess();
+        } else {
+            qDebug() << "修改密码失败:" << response["message"].toString();
+            emit modifyPwdFailed();
+        }
     }
 }
 
@@ -118,4 +165,17 @@ void LoginBackend::onTcpConnectionTimeout()
 {
     qDebug() << "登录连接超时（30秒）";
     emit loginTimeout();
+}
+
+void LoginBackend::onModifyPwdError(QAbstractSocket::SocketError error)
+{
+    Q_UNUSED(error);
+    qDebug() << "修改密码连接出错:" << m_tcpClient->errorString();
+    emit modifyPwdFailed();
+}
+
+void LoginBackend::onModifyPwdTimeout()
+{
+    qDebug() << "修改密码连接超时（30秒）";
+    emit modifyPwdTimeout();
 }

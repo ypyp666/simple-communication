@@ -38,6 +38,10 @@ signals:
     void registerFailed();
     void loginWaiting();  // 登录等待中信号
     void loginTimeout();  // 登录连接超时信号
+    void modifyPwdSuccess();  // 修改密码成功（忘记密码页提交后服务器确认）
+    void modifyPwdFailed();   // 修改密码失败（服务器拒绝/解析失败/TCP错误）
+    void modifyPwdTimeout();  // 修改密码连接超时
+    void modifyPwdWaiting();  // 修改密码等待中信号
     void sendWaiting();  // 发送等待信号
     void messageSendSuccess(const QString& tempId, const QString& serverId);  // 发送成功（tempId=本地临时消息ID，serverId=服务器分配的ID）
     void messageSendFailed(const QString& tempId, const QString& serverId);  // 发送失败（未连接/服务器拒绝/超时等），UI变红色感叹号
@@ -61,6 +65,8 @@ signals:
 public slots:
     void login(const QString& username, const QString& password);
     void registerUser(const QString& username, const QString& password);
+    // 修改密码入口（忘记密码页提交后调用）：未登录态走 TCP，设置功能枚举后连接服务器
+    void modifyPwd(const QString& account, const QString& newPassword);
     void JsonParsing(const QByteArray packet);
     void sendMessage(const MessageInfo& message);
 
@@ -101,6 +107,14 @@ private:
     LoginBackend* m_loginBackend;
     ChatBackend* m_chatBackend;
     QThread* m_dbThread;  // 后台数据库线程
+
+    // 注册登录后端（登录/修改密码）的信号连接，从构造函数抽出，避免构造函数越堆越长
+    void setupLoginConnections();
+    // 未登录态流程（登录/注册/修改密码）结束时统一收尾：清掉功能标记，回到"空闲"态
+    void resetFeature();
+    // 当前 TCP 连接所服务的功能（未登录态：登录 / 修改密码），
+    // onTcpConnected/Error/Timeout 据此把 TcpClient 的信号路由到对应后端的功能函数
+    LoginFeature m_currentFeature = LoginFeature::None;
 };
 
 #endif // MAINBACKEND_H

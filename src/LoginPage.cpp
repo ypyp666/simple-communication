@@ -3,6 +3,8 @@
 #include <QTimer>
 #include <QMouseEvent>
 #include <QKeyEvent>
+#include <QRegularExpressionValidator>
+#include <QPropertyAnimation>
 
 LoginPage::LoginPage(MainBackend* backend, QWidget *parent)
     : QWidget(parent)
@@ -72,6 +74,10 @@ void LoginPage::setupUI()
     accountLayout->setSpacing(0);
 
     accountEdit = new QLineEdit(this);
+    // 账号输入校验：只允许数字，最长10位（QRegularExpressionValidator 在录入阶段就拦截非法字符，
+    // 字母/符号根本进不了框；量词 {0,10} 同时限制最大长度）
+    accountEdit->setValidator(new QRegularExpressionValidator(
+        QRegularExpression("[0-9]{0,15}"), accountEdit));
     // 设置占位符（placeholder）：输入框为空时显示灰色的"请输入账号"，一旦输入文字就自动隐藏占位符并显示用户内容，全部删光后占位符自动回来
     // 这是 QLineEdit 的内建行为，由 Qt 内部根据 text() 是否为空自动切换，无需自己写代码
     accountEdit->setPlaceholderText("请输入账号");
@@ -123,6 +129,9 @@ void LoginPage::setupUI()
     passwordLayout->setSpacing(0);
 
     passwordEdit = new QLineEdit(this);
+    // 密码输入校验：允许可见 ASCII 字符（[!-~] 覆盖字母、数字、常用符号），最长20位
+    passwordEdit->setValidator(new QRegularExpressionValidator(
+        QRegularExpression("[!-~]{0,20}"), passwordEdit));
     // 密码框占位符：同账号框，空时显示"请输入密码"，输入后自动被用户文本替代
     passwordEdit->setPlaceholderText("请输入密码");
     passwordEdit->setFixedHeight(45);
@@ -194,6 +203,19 @@ void LoginPage::setupUI()
 
     mainLayout->addWidget(loginBtn);
 
+    // 登录错误提示行：常驻占一行（16px），布局不跳动；默认无文字，登录失败/超时时显示红字
+    m_loginErrorHint = new QLabel(this);
+    m_loginErrorHint->setFixedHeight(16);
+    m_loginErrorHint->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
+    m_loginErrorHint->setStyleSheet("QLabel { color: rgba(224, 91, 91, 0.75); font-size: 12px; font-weight: bold; }");
+    mainLayout->addWidget(m_loginErrorHint);
+
+    // 登录按钮左右抖动动画：keyValueAt 设四次左右偏移，基准位置在第一次出错时捕获
+    m_shakeAnim = new QPropertyAnimation(loginBtn, "pos", this);
+    m_shakeAnim->setDuration(320);
+    // 抖动结束 → 恢复按钮正常样式（updateLoginButtonState 按当前账号/密码状态重设正确样式）
+    connect(m_shakeAnim, &QPropertyAnimation::finished, this, &LoginPage::updateLoginButtonState);
+
     // ========== 第五层：忘记密码和注册 ==========
     QHBoxLayout* bottomLayout = new QHBoxLayout();
     bottomLayout->setSpacing(0);
@@ -201,6 +223,7 @@ void LoginPage::setupUI()
     // ========== 忘记密码按钮 ==========
     // 普通状态：透明无边框，只显示灰色文字（视觉上像文字链接，不像按钮）
     forgotPwdBtn = new QPushButton("忘记密码", this);
+    forgotPwdBtn->setEnabled(false);  // 暂时禁用：忘记密码功能未完成，禁止点击
     forgotPwdBtn->setStyleSheet(R"(
         QPushButton {
             color: #666666;                /* 文字颜色：灰色 */
@@ -241,6 +264,10 @@ void LoginPage::setupUI()
     connect(passwordToggleBtn, &QPushButton::clicked, this, &LoginPage::onPasswordToggle);
     connect(accountEdit, &QLineEdit::textChanged, this, &LoginPage::updateLoginButtonState);
     connect(passwordEdit, &QLineEdit::textChanged, this, &LoginPage::updateLoginButtonState);
+    // 账号输入变化时同步记录当前账号（点"忘记密码"时带过去）
+    connect(accountEdit, &QLineEdit::textChanged, this, [=](const QString& text){
+        m_currentAccount = text;//void textChanged(const QString &text);
+    });
     connect(this,&LoginPage::loginAquiard,m_backend,&MainBackend::login);
     // 专门监听后端登录结果信号，在这里判断是否登录成功
     connect(m_backend, &MainBackend::loginSuccess, this, [=](const QString& accountId){
@@ -249,10 +276,13 @@ void LoginPage::setupUI()
         emit loginSuccess(accountId, accountId); // 转发给容器
     });
     connect(m_backend, &MainBackend::loginFailed, this, [=](){
-        // 服务器验证失败，弹窗提示，窗口保持打开
+        // 服务器验证失败：停动画 + 按钮红框抖动 + 红字提示（不再用弹窗），窗口保持打开
         stopLoginAnimation();
-        QMessageBox::warning(this, "登录失败", "账号或密码错误");
+        showLoginError("账号或密码错误");
     });
+    // 任一输入框有变化 → 清掉错误提示红字
+    connect(accountEdit, &QLineEdit::textChanged, m_loginErrorHint, &QLabel::clear);
+    connect(passwordEdit, &QLineEdit::textChanged, m_loginErrorHint, &QLabel::clear);
     // 监听登录等待信号
     connect(m_backend, &MainBackend::loginWaiting, this, &LoginPage::onLoginWaiting);
     // 监听登录超时信号
@@ -263,8 +293,13 @@ void LoginPage::setupUI()
     updateLoginButtonState();
 
     // 点击"注册账号"/"忘记密码"：本页面不做切换，只发信号，由容器切页面
-    connect(registerBtn, &QPushButton::clicked, this, &LoginPage::registerRequested);
-    connect(forgotPwdBtn, &QPushButton::clicked, this, &LoginPage::forgotPasswordRequested);
+    connect(registerBtn, &QPushButton::clicked, this, [=]() {
+
+        emit registerRequested();
+    });
+    connect(forgotPwdBtn, &QPushButton::clicked, this, [=]() {
+        emit forgotPasswordRequested(m_currentAccount);  // 携带当前输入的账号
+    });
 }
 
  bool LoginPage::eventFilter(QObject* obj, QEvent* event)//QObject类的原生虚函数，用于拦截事件并进行处理
@@ -448,6 +483,11 @@ void LoginPage::updateLoginButtonState()
     // 密码框联动：账号框有输入才允许输密码
     passwordEdit->setEnabled(!accountEdit->text().isEmpty());
 
+    if(accountEdit->text().size()>=5)
+    {
+        forgotPwdBtn->setEnabled(true);
+    }
+
     bool canLogin = !accountEdit->text().isEmpty() && !passwordEdit->text().isEmpty();
 
     if (canLogin) {
@@ -485,13 +525,37 @@ void LoginPage::updateLoginButtonState()
     }
 }
 
+// 登录等待期间统一开关整页交互
+// 禁用阶段：输入框 + 全部按钮锁死，防止等待中重复提交或偷改账号密码
+// 恢复阶段：输入框和"常驻可用"的按钮直接开回来；loginBtn / passwordEdit / forgotPwdBtn
+//          不在这里恢复，交给紧随其后的 updateLoginButtonState() 按当前输入重新判定，
+//          否则会把本该禁用的控件误打开（如账号没填满时不允许点忘记密码）
+void LoginPage::setInputsEnabled(bool enabled)
+{
+    // 输入框
+    accountEdit->setEnabled(enabled);
+    passwordEdit->setEnabled(enabled);
+
+    // 按钮
+    passwordToggleBtn->setEnabled(enabled);
+    accountDropdownBtn->setEnabled(enabled);
+    registerBtn->setEnabled(enabled);
+    addAccountBtn->setEnabled(enabled);
+
+    // 状态由输入内容决定的控件：只在禁用阶段直接锁上
+    if (!enabled) {
+        loginBtn->setEnabled(false);
+        forgotPwdBtn->setEnabled(false);
+    }
+}
+
 void LoginPage::onLoginWaiting()
 {
     // 保存原始按钮文本
     m_originalLoginText = loginBtn->text();
 
-    // 禁用登录按钮，防止重复点击
-    loginBtn->setEnabled(false);
+    // 锁住整页交互（输入框 + 所有按钮），防止等待期间重复点击或改账号密码
+    setInputsEnabled(false);
 
     // 初始化点的数量
     m_dotsCount = 0;
@@ -499,7 +563,8 @@ void LoginPage::onLoginWaiting()
     // 更新按钮文本为"正在登录中"
     loginBtn->setText("正在登录中");
 
-    // 设置登录中的样式（灰色背景）
+ 
+   // 设置登录中的样式（灰色背景）
     loginBtn->setStyleSheet(R"(
         QPushButton {
             border-radius: 8px;
@@ -510,7 +575,6 @@ void LoginPage::onLoginWaiting()
             border: none;
         }
     )");
-
     // 启动定时器，每500ms更新一次点的数量
     m_loginAnimationTimer->start(500);
 }
@@ -538,7 +602,9 @@ void LoginPage::stopLoginAnimation()
     // 恢复原始按钮文本
     loginBtn->setText(m_originalLoginText);
 
-    // 恢复按钮状态
+    // 先解锁整页交互，再按当前输入内容重算各控件状态
+    // （顺序不能反：updateLoginButtonState 会覆盖登录按钮/密码框的状态）
+    setInputsEnabled(true);
     updateLoginButtonState();
 }
 
@@ -547,6 +613,42 @@ void LoginPage::onLoginTimeout()
     // 停止登录动画
     stopLoginAnimation();
 
-    // 弹出提示框
-    QMessageBox::warning(this, "连接超时", "连接超时，请检查网络设置");
+    // 按钮红框抖动 + 红字提示（不再用弹窗）
+    showLoginError("连接超时，请检查网络设置");
+}
+
+// 登录错误提示（登录失败/连接超时共用）：按钮临时套半透明红框并左右抖动，
+// 下方常驻提示行显示红字；动画结束由 finished → updateLoginButtonState 恢复正常样式
+void LoginPage::showLoginError(const QString& text)
+{
+    m_loginErrorHint->setText(text);
+
+    // 临时错误态样式：按钮整体染成红色系（淡红内里 + 红字 + 红框），与忘记密码页同款
+    loginBtn->setStyleSheet(R"(
+        QPushButton {
+            border-radius: 8px;
+            background-color: rgba(224, 91, 91, 0.14);   /* 内里染淡红 */
+            color: rgba(224, 91, 91, 0.85);              /* "登录"文字跟着变红 */
+            font-size: 16px;
+            font-weight: bold;
+            border: 2px solid rgba(224, 91, 91, 0.45);   /* 红框同步调柔 */
+        }
+        QPushButton:hover  { background-color: rgba(224, 91, 91, 0.20); }
+        QPushButton:pressed { background-color: rgba(224, 91, 91, 0.26); }
+    )");
+
+    // 左右抖动：以基准位为中心 ±8/±5px 递减摆动，结束时回到基准位
+    m_shakeAnim->stop();          // 上一次还在抖就先停，防止连点叠加
+    if (!m_btnRestValid) {        // 只在按钮处于布局位时捕获基准（第一次出错时）
+        m_btnRestPos = loginBtn->pos();
+        m_btnRestValid = true;
+    }
+    const QPoint base = m_btnRestPos;
+    m_shakeAnim->setStartValue(base);
+    m_shakeAnim->setKeyValueAt(0.15, base + QPoint(-8, 0));
+    m_shakeAnim->setKeyValueAt(0.35, base + QPoint( 8, 0));
+    m_shakeAnim->setKeyValueAt(0.55, base + QPoint(-5, 0));
+    m_shakeAnim->setKeyValueAt(0.75, base + QPoint( 5, 0));
+    m_shakeAnim->setEndValue(base);
+    m_shakeAnim->start();
 }

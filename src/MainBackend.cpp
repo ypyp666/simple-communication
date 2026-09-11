@@ -38,7 +38,6 @@ MainBackend::MainBackend(QObject* parent)
             m_databaseManager, &DatabaseManager::updateMessageId);
 
 
-
     // 5. 结果信号（后台线程发出）→ 本类槽（主线程）：跨线程自动 QueuedConnection
     connect(m_databaseManager, &DatabaseManager::messageSaved,
             this, &MainBackend::onDbMessageSaved);
@@ -66,28 +65,8 @@ MainBackend::MainBackend(QObject* parent)
             this, &MainBackend::messageSendSuccess);
     connect(m_chatBackend, &ChatBackend::sendFailed,
             this, &MainBackend::messageSendFailed);
-    // 转发 LoginBackend 的信号到 MainBackend
-    connect(m_loginBackend, &LoginBackend::loginSuccess, 
-            this, [=](){
-                s_loggedIn = true;              // 更新全局登录状态
-                m_chatBackend->setUserId(m_userid);  // 同步登录账号给聊天后端（拉取重试需要）
-                emit loginSuccess(m_userid);
-                // 登录成功即拉取服务器缓存中未确认的消息（首次登录：TCP连上→登录成功→拉取）
-                m_chatBackend->sendPullRequest(m_userid);
-            });
-    connect(m_loginBackend, &LoginBackend::loginFailed, 
-            this,[=](){
-                s_loggedIn = false;             // 登录失败，重置全局登录状态
-                emit loginFailed();
-            });
-    connect(m_loginBackend, &LoginBackend::loginWaiting, 
-            this, [=](){
-                emit loginWaiting();
-            });
-    connect(m_loginBackend, &LoginBackend::loginTimeout, 
-            this, [=](){
-                emit loginTimeout();
-            });
+    // 注册登录后端（登录/修改密码）的信号连接，抽成独立方法，避免构造函数越堆越长
+    setupLoginConnections();
     // 转发 ChatBackend 的聊天相关信号
     connect(m_chatBackend, &ChatBackend::contactsLoaded,
             this, &MainBackend::contactsLoaded);
@@ -109,6 +88,64 @@ MainBackend::~MainBackend()
     // 析构时自动清理子对象（通过 Qt 的父子机制）
 }
 
+// ===== 登录后端信号连接（登录 / 修改密码）=====
+// 统一规则，后续接入注册、登出照此办理：
+//   1) 纯转发（无副作用）→ 直接"信号对信号"连接，一行即可，不需要 lambda
+//   2) 有副作用的 → 用 lambda，其中"清功能标记"这步复用 resetFeature()
+void MainBackend::setupLoginConnections()
+{
+    // --- 登录 ---
+    connect(m_loginBackend, &LoginBackend::loginSuccess,
+            this, [this](){
+                s_loggedIn = true;                   // 更新全局登录状态
+                resetFeature();                      // 登录流程结束，清掉功能标记
+                m_chatBackend->setUserId(m_userid);  // 同步登录账号给聊天后端（拉取重试需要）
+                emit loginSuccess(m_userid);
+                // 登录成功即拉取服务器缓存中未确认的消息（首次登录：TCP连上→登录成功→拉取）
+                m_chatBackend->sendPullRequest(m_userid);
+            });
+    connect(m_loginBackend, &LoginBackend::loginFailed,
+            this, [this](){
+                s_loggedIn = false;                  // 登录失败，重置全局登录状态
+                resetFeature();
+                emit loginFailed();
+            });
+    // 纯转发：等待信号没有任何副作用，信号对信号连接即可
+    connect(m_loginBackend, &LoginBackend::loginWaiting, this, &MainBackend::loginWaiting);
+    connect(m_loginBackend, &LoginBackend::loginTimeout,
+            this, [this](){
+                resetFeature();
+                emit loginTimeout();
+            });
+
+    // --- 修改密码（忘记密码页提交后）---
+    // 修改密码流程无论成败都是终态，转发前先清掉功能标记，
+    // 防止残留值把后续 TCP 信号误路由到修改密码
+    connect(m_loginBackend, &LoginBackend::modifyPwdSuccess,
+            this, [this](){
+                resetFeature();
+                emit modifyPwdSuccess();
+            });
+    connect(m_loginBackend, &LoginBackend::modifyPwdFailed,
+            this, [this](){
+                resetFeature();
+                emit modifyPwdFailed();
+            });
+    connect(m_loginBackend, &LoginBackend::modifyPwdTimeout,
+            this, [this](){
+                resetFeature();
+                emit modifyPwdTimeout();
+            });
+    connect(m_loginBackend, &LoginBackend::modifyPwdWaiting, this, &MainBackend::modifyPwdWaiting);
+}
+
+// 未登录态流程（登录 / 注册 / 修改密码）无论成败都回到"空闲"态：清掉功能标记，
+// 避免残留值让 onTcpConnected/onTcpError/onTcpConnectionTimeout 误路由到上一次的功能
+void MainBackend::resetFeature()
+{
+    m_currentFeature = LoginFeature::None;
+}
+
 ChatBackend* MainBackend::getChatBackend()
 {
     return m_chatBackend;
@@ -119,8 +156,21 @@ void MainBackend::login(const QString& userId, const QString& password)
     m_userid = userId;
     m_password = password;
     s_loggedIn = false;  // 新的登录会话开始，重置全局登录状态
+    m_currentFeature = LoginFeature::Login;  // 标记当前连接服务于"登录"
     // 转发调用到 LoginBackend
     m_loginBackend->startLogin(userId, password);
+}
+
+void MainBackend::modifyPwd(const QString& account, const QString& newPassword)
+{
+    s_loggedIn = false;  // 修改密码在未登录态进行
+    // 转发到 LoginBackend：保存参数并发起连接，实际请求等 connected 后由路由发。
+    // 注意顺序：功能标记必须在连接发起【之后】再设——connectToServer 内部 abort 旧连接时
+    // 可能同步触发 disconnected → onTcpDisconnected → resetFeature()，
+    // 若标记设在前面会被这一下清掉，等 connected 到达时就掉进 else 兜底被当成登录了。
+    // 网络信号（connected/error）都走事件循环，最早也是本函数返回后才派发，这里后设标记绝对安全
+    m_loginBackend->ModifyPwdAquird(account, newPassword);
+    m_currentFeature = LoginFeature::ModifyPassword; // 标记当前连接服务于"修改密码"
 }
 
 void MainBackend::sendMessage(const MessageInfo& message)
@@ -233,15 +283,17 @@ void MainBackend::disconnectSession()
 }
 
 // ===== TcpClient 共享信号统一路由（胶水层） =====
-// TCP连接成功：根据全局登录状态决定走"登录"还是直接"拉取"
+// TCP连接成功：按"登录后/修改密码/登录"三种场景分发
 void MainBackend::onTcpConnected()
 {
     if (s_loggedIn) {
         // 已登录过（断线重连场景）：无需重新登录，直接拉取服务器缓存的未确认消息
         m_chatBackend->sendPullRequest(m_userid);
-
+    } else if (m_currentFeature == LoginFeature::ModifyPassword) {
+        // 修改密码场景：连接建立后发送修改密码请求（不能登录，也不能拉取）
+        m_loginBackend->sendModifyPwdRequest();
     } else {
-        // 未登录（首次登录场景）：交给登录后端发登录请求，登录成功后再拉取
+        // 登录场景：交给登录后端发登录请求，登录成功后再拉取
         m_loginBackend->onTcpConnected();
     }
 }
@@ -249,6 +301,9 @@ void MainBackend::onTcpConnected()
 // TCP断开：所有需要感知断线的后端都通知到
 void MainBackend::onTcpDisconnected()
 {
+    // 连接断了，"当前连接服务于哪个功能"的上下文随之失效，先清掉再分发，
+    // 防止残留值把下次连接的 TCP 信号误路由到上一次的功能（如修改密码）
+    resetFeature();
     if (!s_loggedIn) {
         // 已登录过无需再重新登录，直接拉取服务器缓存的未确认消息
         m_loginBackend->onTcpDisconnected();
@@ -258,21 +313,31 @@ void MainBackend::onTcpDisconnected()
     m_tcpClient->reconnect();
 }
 
-// TCP错误：分发给所有后端
+// TCP错误：按功能枚举分发（登录 / 修改密码 / 聊天三种后端各回各家）
 void MainBackend::onTcpError(QAbstractSocket::SocketError error)
 {
-    m_loginBackend->onTcpError(error);
-    m_chatBackend->onTcpError(error);
+    if (s_loggedIn) {
+        // 会话中途的错误（断线、服务器重启等）交给聊天后端，避免误弹登录失败
+        m_chatBackend->onTcpError(error);
+    } else if (m_currentFeature == LoginFeature::ModifyPassword) {
+        // 修改密码流程中的错误 → 修改密码失败（不是登录失败）
+        m_loginBackend->onModifyPwdError(error);
+    } else {
+        // 登录流程中的错误 → 登录失败
+        m_loginBackend->onTcpError(error);
+    }
 }
 
-// TCP连接超时：分发给所有后端
+// TCP连接超时：按功能枚举分发
 void MainBackend::onTcpConnectionTimeout()
 {
-    if (!s_loggedIn) {
+    if (s_loggedIn) {
+        m_chatBackend->onTcpConnectionTimeout();
+    } else if (m_currentFeature == LoginFeature::ModifyPassword) {
+        m_loginBackend->onModifyPwdTimeout();
+    } else {
         m_loginBackend->onTcpConnectionTimeout();
-        return;
     }
-    m_chatBackend->onTcpConnectionTimeout();
 }
 
 void MainBackend::registerUser(const QString& username, const QString& password)
@@ -299,6 +364,9 @@ void MainBackend::JsonParsing(const QByteArray packet)
     QJsonObject response = doc.object();
     QString type = response["type"].toString();
     if (type == "login_response") {
+        m_loginBackend->onTcpDataReceived(packet);
+    } else if (type == "modify_password_response") {
+        // 修改密码响应（忘记密码页提交后），交给登录后端解析成 modifyPwd 结果信号
         m_loginBackend->onTcpDataReceived(packet);
     } else if (type == "repost_response") {
         m_chatBackend->onTcpDataReceived(packet);

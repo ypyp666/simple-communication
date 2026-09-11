@@ -7,6 +7,7 @@
 #include <QDateTime>
 #include "TcpClient.h"
 #include <QMap>
+#include <QSet>
 #include <QTimer>
 #include "FeatureStructs.h"  // 引入共享结构体：ContactInfo / MessageInfo / OutgoingMessage
 
@@ -49,7 +50,11 @@ public slots:
     void onTcpDisconnected();
     void onTcpError(QAbstractSocket::SocketError error);
     void onTcpConnectionTimeout();
+    // 【发消息回执】处理服务器对"我发出的消息"的确认包（type=repost_response），
+    // 不是收消息！解析 success/tempId/serverId 后发 sendSuccess/sendFailed 让 UI 停止转圈动画
     void onTcpDataReceived(const QByteArray& packet);
+    // 【收消息】处理服务器转发来的他人消息（type=repost），
+    // 解析出完整 MessageInfo 后发 newMessageReceived（UI显示 + 存库 + 回ACK）
     void onTcpRepost(const QByteArray& packet);
     // 回复接收确认：收到消息后回ACK给服务器
     void sendReceiveAck(const QString& serverId, bool success);
@@ -66,6 +71,11 @@ private:
     QString m_password;
     QTimer* m_pullTimer;
     int pullCount = 0;//拉取请求次数，最多3次
+    QMap<QString, QTimer*> m_pendingSends;  // tempId → 发送超时定时器（30秒兜底，防止服务器不回包气泡永久转圈）
+    QSet<QString> m_pendingAcks;  // 待回复确认（receive_ack）的消息ID队列：onTcpRepost 收到有效消息时登记，
+                                  // sendReceiveAck 回执成功后移除；防止拿空ID/重复ID回ACK（空serverId会让服务器stoull崩溃）
+
+    void removeSendTimer(const QString& tempId);  // 收到回执或超时触发后清理对应定时器
 };
 
 #endif // CHATBACKEND_H

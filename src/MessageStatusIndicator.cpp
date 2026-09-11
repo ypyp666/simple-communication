@@ -58,16 +58,22 @@ void MessageStatusIndicator::paintEvent(QPaintEvent *event)
     painter.setRenderHint(QPainter::Antialiasing);  // 抗锯齿，让圆圈/感叹号边缘平滑
 
     const int size = qMin(width(), height());
-    QRectF rect((width() - size) / 2.0, (height() - size) / 2.0, size, size);
+    // 生成一个正方形区域，保证就算控件宽高不一致，绘图区域也是居中正方形
+    QRectF rect((width() - size) / 2.0, (height() - size) / 2.0, size, size);//居中公式
 
     if (m_status == Sending) {
         // ===== 发送中：旋转小圆圈（一段弧线，缺口让它看起来在转） =====
         QPen pen(QColor("#4a90d9"), 2.0, Qt::SolidLine, Qt::RoundCap);
-        painter.setPen(pen);
+        //QPen是画笔，用于绘制线、圆等图形，`Qt::SolidLine`：实线（还有虚线、点线 Qt::DashLine 等）
+        //Qt::RoundCap→ 圆角端点，如果默认是`Qt::FlatCap`：圆弧两头是平切的硬切口，RoundCap：圆弧的首尾端点变成半圆形圆头，让动画看的更顺畅
+        painter.setPen(pen);//把画笔交给画家对象
         painter.setBrush(Qt::NoBrush);
-        QRectF arcRect = rect.adjusted(2, 2, -2, -2);
+        //Brush是画刷：用来填充闭合图形内部（比如画圆的时候填充内部颜色），Qt::NoBrush：关闭填充
+        QRectF arcRect = rect.adjusted(2, 2, -2, -2);//向内收缩两个像素
+        //如果直接贴着 rect 边缘画圆弧，线条**一半会跑到控件外面，被窗口裁切**，圆弧会缺边。向内缩进 2px
         // drawArc 的角度单位是 1/16 度；留 90° 缺口，更像加载动画
         painter.drawArc(arcRect, m_angle * 16, 270 * 16);
+        //第一个参数 arcRect：圆弧的外接正方形。在这个正方形内画椭圆弧；正方形 → 画出来是圆弧（正圆上的一段弧
     } else if (m_status == Failed) {
         // ===== 发送失败：红色圆形底 + 白色感叹号 =====
         painter.setPen(Qt::NoPen);

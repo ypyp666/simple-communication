@@ -158,6 +158,17 @@ void ChatBackend::sendMessage(const QString& contactId, const OutgoingMessage& m
     QByteArray packet = messageJsonStr + "\n";
     m_tcpClient->sendData(packet);
 
+    // 发送超时兜底：30秒内没等到服务器的 repost_response 就判失败，
+    // 防止服务器不回包时气泡永久转圈（回包正常到达时由 onTcpDataReceived 清理定时器）
+    QTimer* sendTimer = new QTimer(this);
+    sendTimer->setSingleShot(true);
+    m_pendingSends.insert(message.tempId, sendTimer);
+    connect(sendTimer, &QTimer::timeout, this, [this, tempId = message.tempId]() {
+        qDebug() << "发送消息超时，未收到服务器回执 tempId=" << tempId;
+        emit sendFailed(tempId, "");  // 超时拿不到服务器ID，UI显示红色感叹号待用户重发
+        removeSendTimer(tempId);
+    });
+    sendTimer->start(30000);
 }
 
 void ChatBackend::sendFile(const QString& contactId, const QString& filePath)
@@ -216,7 +227,11 @@ void ChatBackend::onTcpConnectionTimeout()
 {
     qDebug() << "TCP连接超时";
 }
-void ChatBackend::onTcpDataReceived(const QByteArray& packet)
+// 【发消息回执】由 MainBackend::JsonParsing 分发调用（type=repost_response 时走到这）。
+// 职责：解析服务器对"我发出的消息"的处理结果（success/tempId/serverId），
+//       发 sendSuccess/sendFailed 通知 UI 停止转圈动画、把临时ID替换为服务器ID。
+// 注意：这不是收消息！收消息走 onTcpRepost（type=repost）。
+void ChatBackend::onTcpDataReceived(const QByteArray& packet)//这个是服务器回执是对发送消息的确认，要更改本地的临时ID为服务器ID
 {
     qDebug() << "[ChatBackend::onTcpDataReceived] 收到原始包:" << packet;  // 调试用：完整打印服务器回包
     QJsonParseError error;
@@ -239,8 +254,24 @@ void ChatBackend::onTcpDataReceived(const QByteArray& packet)
        } else {
            emit sendFailed(tempId, serverId);
        }
+       removeSendTimer(tempId);  // 服务器已回执（无论成败），取消超时兜底
     }
 }
+
+// 收到某条消息的回执（成功/失败）或自身超时触发后，清理对应的超时定时器
+void ChatBackend::removeSendTimer(const QString& tempId)
+{
+    auto it = m_pendingSends.find(tempId);
+    if (it != m_pendingSends.end()) {
+        it.value()->stop();
+        it.value()->deleteLater();
+        m_pendingSends.erase(it);
+    }
+}
+// 【收消息】由 MainBackend::JsonParsing 分发调用（type=repost 时走到这）。
+// 职责：解析服务器转发来的他人消息（字段：serverId/sendId/targetId/content/sendTime），
+//       组装成 MessageInfo（contactId=发送者，isSelf=false，isRead=false），
+//       发 newMessageReceived 交给 MainBackend → UI显示 + 存库 + 回 receive_ack。
 void ChatBackend::onTcpRepost(const QByteArray& packet)
 {
     QJsonParseError error;
@@ -253,7 +284,17 @@ void ChatBackend::onTcpRepost(const QByteArray& packet)
     QString type = messageJson["type"].toString();
     if (type == "repost") {
         MessageInfo message;
-        message.id = messageJson["ID"].toString();           // 服务器分配的消息ID
+        // 协议字段已统一：服务器实时转发(Repost)与拉取重推(Pull)都用 serverId，
+        // 客户端不再兼容旧字段名 ID（旧兜底分支为死代码，已删除）
+        message.id = messageJson["serverId"].toString();
+        if (message.id.isEmpty()) {
+            // 拿不到ID：无法存库也无法回ACK（空serverId会让服务器stoull抛异常），
+            // 直接丢弃不emit——不回ACK服务器缓存里就留着这条消息，下次拉取/重发还能补救
+            qWarning() << "repost包缺少消息ID（serverId为空），丢弃该消息且不回ACK，等待服务器重发:" << packet;
+            return;
+        }
+        // 登记进待确认队列：持有有效ID才允许回receive_ack，同时防止同一ID重复回执
+        m_pendingAcks.insert(message.id);
         message.accountId = messageJson["accountId"].toString();
         message.senderId = messageJson["sendId"].toString();
         message.targetId = messageJson["targetId"].toString();
@@ -269,8 +310,21 @@ void ChatBackend::onTcpRepost(const QByteArray& packet)
 }
 
 // 回复接收确认：收到消息后回ACK给服务器（成功=true移除缓存，失败=false让服务器重发）
+// 只有登记在 m_pendingAcks 里的有效ID才会真正发出：
+// - 空ID直接拦截（历史bug：空serverId发到服务器，DeleteCache里stoull("")抛异常）
+// - 队列里没有的ID说明已回执过或从未收到过，拦掉重复ACK
 void ChatBackend::sendReceiveAck(const QString& serverId, bool success)
 {
+    if (serverId.isEmpty()) {
+        qWarning() << "receive_ack被拦截：消息ID为空，不发送";
+        return;
+    }
+    if (!m_pendingAcks.contains(serverId)) {
+        qWarning() << "receive_ack被拦截：消息" << serverId << "不在待确认队列中（已回执过或未收到过），跳过";
+        return;
+    }
+    m_pendingAcks.remove(serverId);  // 出队：一条消息只回一次ACK
+
     QJsonObject ack;
     ack["type"] = "receive_ack";
     ack["success"] = success;
@@ -284,7 +338,7 @@ void ChatBackend::sendReceiveAck(const QString& serverId, bool success)
 // 发送拉取请求：接收失败时向服务器请求重发未收到的缓存消息
 void ChatBackend::sendPullRequest(const QString& targetId)
 {
-    //m_pullTimer->start(30000);//30秒触发一次（暂时不用拉取重试计时，注释掉）
+    m_pullTimer->start(30000);
     QJsonObject pullReq;
     pullReq["type"] = "pull_msg";
     pullReq["targetId"] = targetId;  // 拉取发给自己的消息
@@ -308,13 +362,13 @@ void ChatBackend::onPullTimerTimeout()
     }
 }
 
-// 拉取请求确认：服务器把该账号所有缓存消息重发完后发来确认包
-// 【内容由你实现】建议：收到确认说明本次拉取已完成，停止定时器并重置次数，避免继续重拉
+// 拉取请求确认：服务器把该账号所有缓存消息重发完后发来的确认包（仅状态字段：code/error/success/count）
+// 【职责】收到确认说明本次拉取已完成：停止定时器并重置次数，避免继续重拉。
+// 注意：实际消息内容不在这个包里！每条消息由服务器以独立的 type=repost 包推送，
+//       走 onTcpRepost 解析；在这里解析消息字段（ID/Id等）只会读到空值，产生空气泡
 void ChatBackend::onPullResponse(const QByteArray& packet)
 {
-    Q_UNUSED(packet);
-    m_pullTimer->stop();
-    pullCount = 0;QJsonParseError error;
+    QJsonParseError error;
     QJsonDocument doc = QJsonDocument::fromJson(packet, &error);
     if (error.error != QJsonParseError::NoError) {
         qDebug() << "JSON解析失败:" << error.errorString();
@@ -322,30 +376,15 @@ void ChatBackend::onPullResponse(const QByteArray& packet)
     }
     QJsonObject response = doc.object();
     QString type = response["type"].toString();
-    QString serverId = response["Id"].toString();  // 服务器分配的消息ID
     if (type == "pull_response") {
         bool success = response["success"].toBool();
         if (success) {
-            qDebug() << "拉取请求成功";
-            MessageInfo message;
-            message.id = response["ID"].toString();           // 服务器分配的消息ID
-            message.accountId = response["accountId"].toString();
-            message.senderId = response["sendId"].toString();
-            message.targetId = response["targetId"].toString();
-            message.content = response["content"].toString();
-            message.sendTime = QDateTime::fromString(response["sendTime"].toString(), Qt::ISODate);
-            message.contactId = message.senderId;            // 对方发来的消息，对话对方=发送者
-            message.isSelf = false;                           // 对方发的，不是自己发的
-            message.isRead = false;                           // 收到时默认未读
-            message.isFile = false;
-            message.isOffline = false;
-            emit newMessageReceived(message);
+            qDebug() << "拉取请求成功，缓存消息已全部重发完毕，条数：" << response["count"].toInt();
+            m_pullTimer->stop();  // 拉取完成，停止30秒重试定时器
+            pullCount = 0;        // 重置重试次数
         } else {
-            qDebug() << "拉取请求失败";
+            // 服务器 pull_response 失败时错误文案放在 message 字段（与 login/repost_response 一致，协议统一用 message）
+            qDebug() << "拉取请求失败：" << response["message"].toString();
         }
     }
-    // TODO: 用户实现，例如：
-    // m_pullTimer->stop();   // 拉取完成，停止30秒重试定时器
-    // pullCount = 0;         // 重置重试次数
-    // 也可先解析 packet 校验 type 是否为 pull_response 再处理
 }

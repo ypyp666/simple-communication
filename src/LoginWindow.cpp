@@ -8,6 +8,9 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     setWindowTitle("登录");
     setFixedSize(400, 500);
     setModal(true);// 设置为模态对话框，用户只能在登录窗口操作，必须登录后才能进入主界面
+    // 固定尺寸窗口默认只显示关闭按钮（×），显式打开最小化提示后，
+    // Windows 原生标题栏就会在 × 左边显示最小化按钮（−），最小化到任务栏不受固定尺寸影响
+    setWindowFlag(Qt::WindowMinimizeButtonHint, true);
 
     // 设置窗口圆角和阴影（容器背景，三个页面背景透明，透出这个渐变）
     setStyleSheet(R"(
@@ -24,7 +27,7 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     m_stackedWidget = new QStackedWidget(this);
     m_loginPage = new LoginPage(backend, this);      // 登录页
     m_registerPage = new RegisterPage(this);         // 注册页
-    m_forgotPage = new ForgotPasswordPage(this);     // 忘记密码页
+    m_forgotPage = new ForgotPasswordPage(backend, this);     // 忘记密码页（传 backend，修改密码要走 TCP）
 
     // 顺序即页码：登录页=0，注册页=1，忘记密码页=2
     m_stackedWidget->addWidget(m_loginPage);
@@ -41,7 +44,8 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     connect(m_loginPage, &LoginPage::registerRequested, this, [=]() {
         m_stackedWidget->setCurrentIndex(1);
     });
-    connect(m_loginPage, &LoginPage::forgotPasswordRequested, this, [=]() {
+    connect(m_loginPage, &LoginPage::forgotPasswordRequested, this, [=](const QString& account) {
+        m_forgotPage->setAccount(account);          // 把登录页输入的账号带过去
         m_stackedWidget->setCurrentIndex(2);
     });
     // 注册页/忘记密码页点"返回登录" → 切回登录页(0)
