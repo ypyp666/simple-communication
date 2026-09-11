@@ -10,7 +10,7 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
         // 1. 把字符串解析成json结构化对象
         json msg = json::parse(input);
 
-        // 2. 取键值，示例：假设客户端发送 {"type":"login","account":"123","pwd":"456"}，把键值对应的值取出来
+        // 2. 取键值，示例：假设客户端发送 {"type":"login","account":"123","password":"456"}，把键值对应的值取出来
         std::string type = msg.value<std::string>("type", "");
         std::string account = msg.value<std::string>("account", "");
         std::string pwd = msg.value<std::string>("password", "");
@@ -30,6 +30,15 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
             CmdHandler hander = it->second;
             rsp = hander(msg, conn, m_session) + '\n';
         }
+        else
+        {
+            rsp = json{
+                {"type", "error_response"},
+                {"code", 400},
+                {"message", "暂不支持该请求类型"},
+                {"success", false}
+            }.dump() + "\n";
+        }
         return rsp;
         /*if (type == "login")
         {
@@ -39,7 +48,7 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
             // 构造返回json
             json rsp;
             rsp["code"] = 200;
-            rsp["msg"] = "登录成功";
+            rsp["message"] = "登录成功";
             rsp["data"]["user"] = account;
 
             // dump() 把json转回字符串，结尾加换行符和你的协议匹配
@@ -53,7 +62,7 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
             // 注册逻辑，执行insert数据库
             json rsp;
             rsp["code"] = 201;
-            rsp["msg"] = "注册完成";
+            rsp["message"] = "注册完成";
             std::string send_str = rsp.dump() + "\n";
         }*/
     }
@@ -61,17 +70,17 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
     catch (json::parse_error& e)
     {
         std::cerr << "JSON解析失败：" << e.what() << " 原始报文：" << input << std::endl;
-        return json{{"code",400},{"msg","JSON格式错误"}}.dump() + "\n";
+        return json{{"type", "error_response"}, {"code",400}, {"message","JSON格式错误"}, {"success", false}}.dump() + "\n";
     }
     catch (json::out_of_range& e)
     {
         std::cerr << "JSON缺少指定键：" << e.what() << std::endl;
-        return json{{"code",400},{"msg","请求字段缺失"}}.dump() + "\n";
+        return json{{"type", "error_response"}, {"code",400}, {"message","请求字段缺失"}, {"success", false}}.dump() + "\n";
     }
     catch (std::exception& e)
     {
         std::cerr << "未知错误：" << e.what() << std::endl;
-        return json{{"code",500},{"msg","服务内部异常"}}.dump() + "\n";
+        return json{{"type", "error_response"}, {"code",500}, {"message","服务内部异常"}, {"success", false}}.dump() + "\n";
     }
-    return json{{"code",500},{"msg","未知故障"}}.dump() + "\n";
+    return json{{"type", "error_response"}, {"code",500}, {"message","未知故障"}, {"success", false}}.dump() + "\n";
 }

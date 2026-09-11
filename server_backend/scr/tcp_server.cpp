@@ -1,4 +1,5 @@
 #include "tcp_server.h"
+#include <cerrno>
 #include <iostream>
 #include <cstring>
 #include <unistd.h>
@@ -9,6 +10,32 @@
 #include "json_shift.h"   // 你的 JSON 解析和业务转发
 #include "mysql.h"        // 你的数据库连接
 #include "OnlineSessionManager.h"
+
+namespace
+{
+    bool SendAll(int fd, const std::string& data)
+    {
+        std::size_t sent = 0;
+        while (sent < data.size())
+        {
+            const ssize_t size = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+            if (size < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return false;
+            }
+            if (size == 0)
+            {
+                return false;
+            }
+            sent += static_cast<std::size_t>(size);
+        }
+        return true;
+    }
+}
 
 // ---------- 构造/析构 ----------
 TcpServer::TcpServer()
@@ -133,6 +160,7 @@ void* TcpServer::ClientWork(void* arg) {
     constexpr int CACHE_LIMIT = 4096;
     char recv_buf[BUF_MAX] = {0};
     bool offline = false;
+    std::string single_json;
 
     while (true) {
         memset(recv_buf, 0, sizeof(recv_buf));
@@ -151,7 +179,6 @@ void* TcpServer::ClientWork(void* arg) {
             cache.push(recv_buf[i]);
         }
 
-        std::string single_json;
         while (!cache.empty()) {
             char ch = cache.front();
             cache.pop();
@@ -159,7 +186,12 @@ void* TcpServer::ClientWork(void* arg) {
                 std::cout << "[" << ip << "] 完整JSON: " << single_json << std::endl;
                 std::string rsp = single_json + "\n";
                 std::string reply = JsonParsing(rsp, mysqlconnect,sess);
-                send(fd, reply.c_str(), reply.size(), 0);
+                if (!SendAll(fd, reply))
+                {
+                    std::cout<<'\n'<<std::endl;
+                    offline = true;
+                    break;
+                }
                 single_json.clear();
             } else {
                 single_json += ch;
@@ -167,6 +199,10 @@ void* TcpServer::ClientWork(void* arg) {
         }
     }
 
+    // 下线时把会话从在线列表移除
+    if (!sess->account.empty()) {
+        OnlineSessionManager::Instance().removeSession(sess->account);
+    }
     std::cout << "[客户端下线] IP: " << ip << std::endl;
     close(fd);
     delete data;

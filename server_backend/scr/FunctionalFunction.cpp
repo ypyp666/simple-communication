@@ -1,6 +1,33 @@
 
 #include "FunctionalFunction.h"
+#include <cerrno>
 #include <sys/socket.h>
+
+namespace
+{
+    bool SendAll(int fd, const std::string& data)
+    {
+        std::size_t sent = 0;
+        while (sent < data.size())
+        {
+            const ssize_t size = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+            if (size < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return false;
+            }
+            if (size == 0)
+            {
+                return false;
+            }
+            sent += static_cast<std::size_t>(size);
+        }
+        return true;
+    }
+}
 
 void Login(json& res,int account,  std::string& pwd, mysqlconn& conn)
 {
@@ -10,25 +37,25 @@ void Login(json& res,int account,  std::string& pwd, mysqlconn& conn)
         case 0:
             res["type"]="login_response";
             res["code"] = 400;
-            res["error"] = "Data abnormal crash";//数据异常崩溃
+            res["message"] = "Data abnormal crash";//数据异常崩溃
             res["success"]=false;
             break;
         case 1:
             res["type"]="login_response";
             res["code"] = 400;
-            res["error"] = "Account does not exist";
+            res["message"] = "Account does not exist";
             res["success"]=false;
             break;
         case 2:
             res["type"]="login_response";
             res["code"] = 400;
-            res["error"] = "Incorrect password";
+            res["message"] = "Incorrect password";
             res["success"]=false;
             break;
         case 3:
             res["type"]="login_response";
             res["code"] = 0;
-            res["error"] = 0;
+            res["message"] = "";
             res["success"]=true;
             break;
         default:
@@ -50,7 +77,7 @@ void Repost(json& res, json& message, SessionPtr target_session, mysqlconn& conn
     {
         res["type"] = "repost_response";
         res["code"] = 500;
-        res["error"] = "消息存储失败";
+        res["message"] = "消息存储失败";
         res["success"] = false;
         return;
     }
@@ -58,20 +85,22 @@ void Repost(json& res, json& message, SessionPtr target_session, mysqlconn& conn
     {
         res["type"] = "repost_response";
         res["code"] = 500;
-        res["error"] = "消息过程运行错误或者账号异常";
+        res["message"] = "消息过程运行错误或者账号异常";
         res["success"] = false;
+        return;
     }
-    message["ID"]=outMessageId;
+    // Qt 前端按字符串读取这些标识，不能直接返回 JSON 数字
+    message["serverId"] = std::to_string(outMessageId);
 
    // 目标用户在线，直接转发；协议要求每条JSON以\n结尾
     std::string forward = message.dump() + "\n";
      if (!(target_session == nullptr))
     {
-         if (send(target_session->fd, forward.c_str(), forward.size(), 0) < 0)
+         if (!SendAll(target_session->fd, forward))
          {
              res["type"] = "repost_response";
              res["code"] = 500;
-             res["error"] = "消息转发失败";
+              res["message"] = "消息转发失败";
              res["success"] = false;
              return;
          }
@@ -79,9 +108,9 @@ void Repost(json& res, json& message, SessionPtr target_session, mysqlconn& conn
 
     res["type"] = "repost_response";
     res["code"] = 0;
-    res["error"] = 0;
+    res["message"] = "";
     res["success"] = true;
-    res["messageId"] = outMessageId;
+    res["serverId"] = std::to_string(outMessageId);
 }
 
 void Pull(json& res, SessionPtr session, mysqlconn& conn)
@@ -91,7 +120,7 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
     if (!session->state)
     {
         res["code"] = 401;
-        res["error"] = "当前登录状态异常请重新登录";
+        res["message"] = "当前登录状态异常请重新登录";
         res["success"] = false;
         return;
     }
@@ -105,17 +134,17 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
     catch (const std::exception& e)
     {
         res["code"] = 400;
-        res["error"] = "账号格式非法";
+        res["message"] = "账号格式非法";
         res["success"] = false;
         return;
     }
 
     std::vector<MessageInfo> msgs;
     int retcode = 0;
-    if (!conn.callLoadMessage(targetId, msgs, retcode))
+    if (!conn.callLoadMessage(targetId, msgs, retcode) && retcode != 2)
     {
         res["code"] = 500;
-        res["error"] = "消息加载失败, retcode=" + std::to_string(retcode);
+        res["message"] = "消息加载失败, retcode=" + std::to_string(retcode);
         res["success"] = false;
         return;
     }
@@ -125,13 +154,16 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
     {
         json one = {
             {"type", "repost"},
-            {"ID", m.messageId},
-            {"senderId", m.senderId},
-            {"targetId", m.targetId},
-            {"sendtime", m.sendtime},
+            {"ID", std::to_string(m.messageId)},
+            {"accountId", session->account},
+            {"sendId", std::to_string(m.senderId)},
+            {"targetId", std::to_string(m.targetId)},
+            {"sendTime", m.sendTime},
             {"content", m.content},
+            {"isOffline", true},
         };
         std::string buf = one.dump() + "\n";
+        std::cout<<buf<<std::endl;
         if (send(session->fd, buf.c_str(), buf.size(), 0) < 0)
         {
             std::cerr << "消息推送失败, msgId=" << m.messageId << std::endl;
@@ -139,21 +171,13 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
         }
     }
 
-    if(retcode==1)
+    if (retcode == 1 || retcode == 2)
     {
-      // 最后返回确认状态包（含条数）
-      res["code"] = 0;
-      res["error"] = 0;
-      res["success"] = true;
-      res["count"] = msgs.size();
-    }
-    else if(retcode==2)
-    {
-      // 最后返回确认状态包（含条数）
-      res["code"] = 0;
-      res["error"] = "未有离线消息";
-      res["success"] = true;
-      res["count"] = msgs.size();
+        // 最后返回确认状态包（含条数）
+        res["code"] = 0;
+        res["message"] = retcode == 2 ? "未有离线消息" : "";
+        res["success"] = true;
+        res["count"] = msgs.size();
     }
 }
 
@@ -163,14 +187,14 @@ void DeleteCache(json& res,std::string serverId,mysqlconn& conn)
     const unsigned int parsedSendId = std::stoull(messageID);
     if(!conn.callDeleteMessage(parsedSendId))
     {
-        res["type"]="receiveACK";
+        res["type"]="receive_ack";
         res["code"]=500;
-        res["error"]="，数据库调用异常";
-        res["success"]="false";
+        res["message"]="，数据库调用异常";
+        res["success"]=false;
         return;
     }
-    res["type"]="receiveACK";
+    res["type"]="receive_ack";
     res["code"]=0;
-    res["error"]="";
+    res["message"]="";
     res["success"]=true;
 }

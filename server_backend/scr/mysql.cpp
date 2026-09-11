@@ -179,7 +179,7 @@ bool mysqlconn::callMessage(nlohmann::json& rsp, uint32_t& outMessageId)
     const std::string sendID = rsp.value<std::string>("sendId", "");
     const std::string targetID = rsp.value<std::string>("targetId", "");
     const std::string content = rsp.value<std::string>("content", "");
-    const std::string sendtime = rsp.value<std::string>("sendTime", "");
+    const std::string sendTime = rsp.value<std::string>("sendTime", "");
 
     uint32_t sendIdValue = 0;
     uint32_t targetIdValue = 0;
@@ -210,16 +210,16 @@ bool mysqlconn::callMessage(nlohmann::json& rsp, uint32_t& outMessageId)
         mysql, escaped_content.data(), content.c_str(), content.size());
     escaped_content.resize(contentLength);
 
-    std::string escaped_sendtime(sendtime.size() * 2 + 1, '\0');
-    const unsigned long sendtimeLength = mysql_real_escape_string(
-        mysql, escaped_sendtime.data(), sendtime.c_str(), sendtime.size());
-    escaped_sendtime.resize(sendtimeLength);
+    std::string escaped_sendTime(sendTime.size() * 2 + 1, '\0');
+    const unsigned long sendTimeLength = mysql_real_escape_string(
+        mysql, escaped_sendTime.data(), sendTime.c_str(), sendTime.size());
+    escaped_sendTime.resize(sendTimeLength);
 
     // 拼接调用存储过程的SQL：PROCEDURE只能用CALL调用，字符串字段用单引号包裹
     std::string sql = "CALL Message('" + escaped_content + "'"
                     + ", " + std::to_string(sendIdValue)
                     + ", " + std::to_string(targetIdValue)
-                    + ", '" + escaped_sendtime + "', @out_msg_id)";
+                    + ", '" + escaped_sendTime + "', @out_msg_id)";
 
     std::cout << "执行SQL: " << sql << std::endl;   // 调试用，发布时建议去掉
     std::cout<<escaped_content<<std::endl;
@@ -401,7 +401,7 @@ bool mysqlconn::callLoadMessage(int targetID, std::vector<MessageInfo>& outMessa
         return false;
     }
 
-    // 第一个结果集：消息数据，按 消息ID/发送者ID/目标ID/发送时间/文本内容 顺序读取（与存储过程字段顺序保持一致）
+    // 第一个结果集：消息数据，按 消息ID/发送者ID/目标ID/文本内容/发送时间 顺序读取（与当前存储过程字段顺序保持一致）
     MYSQL_RES* result = mysql_store_result(mysql);
     if (result != nullptr)
     {
@@ -413,7 +413,8 @@ bool mysqlconn::callLoadMessage(int targetID, std::vector<MessageInfo>& outMessa
             m.senderId  = (row[1] != nullptr) ? static_cast<uint32_t>(std::stoul(row[1])) : 0;
             m.targetId  = (row[2] != nullptr) ? static_cast<uint32_t>(std::stoul(row[2])) : 0;
             m.content   = (row[3] != nullptr) ? row[3] : "";
-            m.sendtime  = (row[4] != nullptr) ? row[4] : "";
+            m.sendTime  = (row[4] != nullptr) ? row[4] : "";
+            std::cout<<m.content<<std::endl;
             outMessages.push_back(m);
         }
         mysql_free_result(result);
