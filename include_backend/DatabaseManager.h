@@ -49,8 +49,10 @@ public slots:
     // === 消息操作 ===
     QList<MessageInfo> loadMessages(const QString& contactId);
     QList<MessageInfo> loadAllMessages();
-    // 分页加载某个联系人的消息，page从1开始，单页上限50条，按发送时间正序
-    QList<MessageInfo> loadMessagesPage(const QString& contactId, int page = 1, int pageSize = 50);
+    // 分页加载某个联系人的消息（槽，跨线程信号调用，结果经 messagesPageLoaded 信号送回主线程）。
+    // page 从 1 开始，1 = 最新一页（离现在最近的 pageSize 条），page 越大越往历史翻；
+    // 单页上限 50 条，查出的列表已反转成时间正序（旧→新），UI 可直接按顺序插入
+    void loadMessagesPage(const QString& contactId, int page = 1, int pageSize = 50);
     bool deleteMessage(const QString& messageId);
     void clearAllMessages();
 
@@ -62,6 +64,11 @@ signals:
     void messageSaved(bool success);
     void messageIdUpdated(bool success);
     void messagesLoaded(const QList<MessageInfo>& messages);
+    // 分页查询结果（后台线程发出，主线程的 MainBackend 接收后转发 UI）。
+    // hasMore：返回条数 == pageSize 就认为历史还没翻到底（最后一页恰好整页时
+    // 会多查一次空页，无害）；UI 据此决定"滚到顶部还拉不拉更早一页"
+    void messagesPageLoaded(const QString& contactId, int page,
+                            const QList<MessageInfo>& messages, bool hasMore);
     void databaseInitialized(bool success);
 
 private:

@@ -25,6 +25,12 @@ public:
     // 设置账号输入框内容（登录页点"忘记密码"时把当前输入的账号带过来）
     void setAccount(const QString& account);
 
+    // 真正"进入本页"时调用（由 LoginWindow 切页时显式调，见 LoginWindow.cpp）：
+    // 把上次留下的输入状态清回初始态。
+    // 注意不能挂在 showEvent 里：窗口从最小化还原/重新获得焦点时 Qt 也会补发 showEvent，
+    // 那一刻用户并没有离开本页——清空会把已经敲进去的密码抹掉（与 RegisterPage::enterPage 同一原因）
+    void enterPage();
+
 signals:
     void backToLoginRequested();   // 点击"返回登录"
     // 提交修改密码请求：两次密码校验通过后发给主后端（MainBackend 接收后转 LoginBackend 走 TCP）
@@ -53,6 +59,8 @@ private:
     void onModifyPwdSuccess();
     //槽函数：修改密码失败信号
     void onModifyPwdFailed();
+    //槽函数：修改密码时网络层连不上（服务器没跑/断网），与服务器拒绝分开提示
+    void onModifyPwdNetworkError();
     //槽函数：修改密码连接超时信号
     void onModifyPwdTimeout();
 

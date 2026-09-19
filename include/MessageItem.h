@@ -20,7 +20,8 @@ public:
     void setStatus(MessageStatusIndicator::Status status);
 
 signals:
-    void retryRequested(const QString& messageId);  // 用户点击失败感叹号 → 请求重发该消息
+    // 用户点击失败感叹号 → 请求重发该消息；携带功能枚举（气泡固定 MessageSend）供后端路由
+    void retryRequested(const QString& messageId, LoginFeature feature);
 
 private:
     void setupUI(const MessageInfo& message);

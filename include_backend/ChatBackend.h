@@ -21,7 +21,6 @@ public:
 
 signals:
     void contactsLoaded(const QList<ContactInfo>& contacts);
-    void messagesLoaded(const QList<MessageInfo>& messages);
     void newMessageReceived(const MessageInfo& message);        // 接收成功（携带完整消息，UI显示+存库+回ACK）
     void messageReceiveFailed(const QString& serverId);         // 接收失败（携带服务器消息ID，回ACK让服务器重发）
     void contactStatusChanged(const QString& contactId, bool isOnline);
@@ -36,7 +35,6 @@ signals:
 
 public slots:
     void loadContacts();
-    void loadMessages(const QString& contactId);
     void startSendMessage(const QString& contactId, const OutgoingMessage& message);
     void sendFile(const QString& contactId, const QString& filePath);
     void markMessagesAsRead(const QString& contactId);

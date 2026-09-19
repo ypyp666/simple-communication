@@ -75,8 +75,12 @@ add_executable(ChatUI
     src/main.cpp                 # 程序入口
     src/MainWindow.cpp           # 主窗口实现
     src/ChatWindow.cpp           # 聊天窗口实现
+    src/SearchWindow.cpp         # 搜索窗口窗口实现
+    src/AgentWindow.cpp          # 代理窗口窗口实现
+    src/ContactWindow.cpp        # 联系人窗口实现
     src/ContactList.cpp          # 联系人列表实现
     src/ChatArea.cpp             # 聊天区域实现
+    src/MessageList.cpp          # 消息列表实现
     src/MessageItem.cpp          # 消息项实现
     src/MessageStatusIndicator.cpp # 消息状态指示器实现（发送中旋转圆圈/失败感叹号）
     src/ChatInput.cpp            # 输入框实现
@@ -85,6 +89,7 @@ add_executable(ChatUI
     src/LoginPage.cpp            # 登录页实现
     src/RegisterPage.cpp         # 注册页实现
     src/ForgotPasswordPage.cpp   # 忘记密码页实现
+    src/GlassCard.cpp            # 局部毛玻璃卡片（忘记密码页/注册页共用）
     src/MainBackend.cpp        # 主后端实现
     resources.qrc             # Qt 资源文件（图标）
 
@@ -96,9 +101,11 @@ add_executable(ChatUI
 
     # 头文件（让 IDE 能够找到定义）
     include/MainWindow.h
+    include/SearchWindow.h
     include/ChatWindow.h
     include/ContactList.h
     include/ChatArea.h
+    include/MessageList.h   
     include/MessageItem.h
     include/MessageStatusIndicator.h
     include/ChatInput.h
@@ -107,7 +114,12 @@ add_executable(ChatUI
     include/LoginPage.h
     include/RegisterPage.h
     include/ForgotPasswordPage.h
+    include/GlassCard.h
     include/MainBackend.h
+    include/ContactWindow.h
+    include/AgentWindow.h
+
+
 
     include_backend/ChatBackend.h
     include_backend/DatabaseManager.h

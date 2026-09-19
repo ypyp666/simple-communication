@@ -15,8 +15,9 @@ public:
     explicit TcpClient(QObject* parent = nullptr);
     ~TcpClient();
 
-    void connectToServer(const QString& host, int port);
-    void reconnect();  // 用上次保存的主机/端口重新连接
+    // 按地址路由表依次尝试（表见 TcpClient.cpp 顶部的 kEndpoints），调用方不再传 IP
+    void connectToServer();
+    void reconnect();  // 断线重连：同样按整张地址表走一遍
     void disconnectFromServer();
     void sendData(const QByteArray& data);
     bool isConnected() const;
@@ -37,12 +38,19 @@ private slots:
     void onConnectTimeout();
 
 private:
+    // 按 m_endpointIndex 找下一个可用地址并发起连接；返回 false = 表已翻到底
+    bool startNextAttempt();
+    // 当前地址失败后换下一个；返回 false = 已经是最后一个候选
+    bool tryNextEndpoint();
+
     QTcpSocket* m_socket;
     QByteArray m_recvBuffer;
     QTimer* m_connectTimeoutTimer;
-    QString m_host;
+    QString m_host;          // 当前尝试的地址（只用于日志，权威来源是 .cpp 里的地址表）
 
     int m_port;
+    int m_endpointIndex;     // 当前尝试到地址表第几项（见 kEndpoints）
+    bool m_routing;          // true = 正在挨个试地址：失败先重试，不立刻上报
 };
 
 #endif // TCPCLIENT_H

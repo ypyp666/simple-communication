@@ -1,11 +1,14 @@
 #include "MainWindow.h"
 #include "ChatWindow.h"
 #include "StatusBar.h"
+#include "ContactWindow.h"
+#include "SearchWindow.h"
+#include "AgentWindow.h"
 
 MainWindow::MainWindow(QWidget *parent, MainBackend* backend) : QMainWindow(parent)
 {
     m_backend = backend;
-    setWindowTitle("我的聊天软件");
+    setWindowTitle("CCEarth");
     setMinimumSize(900, 600);
     resize(1000, 700);
 
@@ -26,7 +29,6 @@ void MainWindow::initUI()
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->setSpacing(0);
     StatusBar* statusPage = new StatusBar(this);
-    statusPage->setFixedWidth(30);
     mainLayout->addWidget(statusPage);
 }
 
@@ -37,7 +39,13 @@ void MainWindow::initPages()
 
     // 添加聊天页面（传入主后端对象）
     ChatWindow* chatWindow = new ChatWindow(this, m_backend);
+    ContactWindow* contactWindow = new ContactWindow(this);
+    SearchWindow* searchWindow = new SearchWindow(this);
+    AgentWindow* agentWindow = new AgentWindow(this);
     pageStack->addWidget(chatWindow);
+    pageStack->addWidget(contactWindow);
+    pageStack->addWidget(searchWindow);
+    pageStack->addWidget(agentWindow);
 
 
     // 默认显示聊天页面

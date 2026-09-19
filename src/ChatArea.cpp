@@ -82,21 +82,49 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent)
     // 连接输入框信号到 ChatArea 信号
     connect(chatInput, &ChatInput::sendMessage, this, &ChatArea::sendMessage);
     connect(chatInput, &ChatInput::sendFile, this, &ChatArea::sendFile);
+
+    // 滚动条到顶 → 请求加载更早一页历史消息。
+    // m_loadingOlder 防重复：一次翻页期间滚动条可能多次停在顶上（插入前内容少时本来就在顶），
+    // 不挡的话同一页会连发好几遍请求
+    connect(scrollArea->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
+        if (value <= 0 && !m_loadingOlder) {
+            emit loadOlderMessages();
+        }
+    });
 }
 
-void ChatArea::addMessage(const MessageInfo& message)
+// 单条消息 → [气泡+时间标签] 对。追加（atTop=false，插在 stretch 前）和
+// 前插（atTop=true，插在布局最前面）共用这一份，时间标签保持在气泡下方，顺序与原来一致
+void ChatArea::appendMessageWidgets(const MessageInfo& message, bool atTop)
 {
     MessageItem* item = new MessageItem(message, this);
     m_messageItems.insert(message.id, item);  // 记录 消息ID→Item，供发送状态切换使用
     // 消息项内点击失败感叹号 → ChatArea 转发重发请求
     connect(item, &MessageItem::retryRequested, this, &ChatArea::retrySend);
-    
-    messagesLayout->insertWidget(messagesLayout->count() - 1, item);
-    //弹簧布局占一个单位，确保消息添加完成后滚动到最底部
+
     QLabel* timeLabel = new QLabel(message.sendTime.toString("HH:mm"), this);
     timeLabel->setStyleSheet("color: #999; font-size: 11px;");
     timeLabel->setAlignment(Qt::AlignCenter);
-    messagesLayout->insertWidget(messagesLayout->count() - 1, timeLabel);
+
+    if (atTop) {
+        // 前插：先插气泡到 index 0，再插时间标签到 index 1（时间在气泡下方），
+        // 布局末尾的 stretch 不受影响，原有内容整体顺延
+        messagesLayout->insertWidget(0, item);
+        messagesLayout->insertWidget(1, timeLabel);
+    } else {
+        // 追加：都插在 stretch 之前（count()-1 是 stretch 的位置）
+        messagesLayout->insertWidget(messagesLayout->count() - 1, item);
+        messagesLayout->insertWidget(messagesLayout->count() - 1, timeLabel);
+    }
+}
+
+void ChatArea::addMessage(const MessageInfo& message, bool scrollToBottom)
+{
+    appendMessageWidgets(message, false);
+
+    if (!scrollToBottom) {
+        return;  // 前插历史消息时不滚底（prependMessages 自己维护滚动位置）
+    }
 
     QTimer::singleShot(10, this, [this]() -> void {
         QScrollBar* scrollBar = scrollArea->verticalScrollBar();//获取垂直滚动条
@@ -105,8 +133,32 @@ void ChatArea::addMessage(const MessageInfo& message)
         }
         scrollBar->setValue(scrollBar->maximum());//滚动到最底部
     });//添加消息后，滚动到最底部，延迟10ms秒，确保消息添加完成后再滚动
- 
+}
 
+// 把一页历史消息插到聊天区顶部（时间正序，旧→新，与 DatabaseManager::loadMessagesPage
+// 反转后的顺序一致），并保持用户当前看到的滚动位置：
+// 插入前记下"滚动条值 + 最大值"，插入后内容整体变高，把滚动条值加上"变高的增量"，
+// 用户视觉上原地不动——否则插完会直接跳到新插入的内容上，像被人拽着往上翻
+void ChatArea::prependMessages(const QList<MessageInfo>& messages)
+{
+    QScrollBar* scrollBar = scrollArea->verticalScrollBar();
+    const int oldMax = scrollBar ? scrollBar->maximum() : 0;
+    const int oldValue = scrollBar ? scrollBar->value() : 0;
+
+    for (const auto& msg : messages) {
+        appendMessageWidgets(msg, true);
+    }
+
+    if (scrollBar) {
+        // 布局尺寸不是插入后立刻生效的，延迟到下一轮事件循环再校正滚动位置
+        QTimer::singleShot(0, this, [this, oldMax, oldValue]() {
+            QScrollBar* bar = scrollArea->verticalScrollBar();
+            if (bar == nullptr) {
+                return;
+            }
+            bar->setValue(bar->maximum() - oldMax + oldValue);
+        });
+    }
 }
     
    /*

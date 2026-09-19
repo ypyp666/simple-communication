@@ -8,8 +8,8 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);//Qt应用程序的核心控制类，控制事件循环
     app.setWindowIcon(QIcon(":/res/icon/application.png"));//设置窗口图标
-    app.setApplicationName("ChatApllication");//设置应用名称
-    app.setOrganizationName("ChatApllication");//设置组织名称
+    app.setApplicationName("CCEarth");//设置应用名称
+    app.setOrganizationName("CCEarth");//设置组织名称
     app.setApplicationVersion("1.0");//设置应用版本
     MainBackend mainBackend; // 主后端实例
 

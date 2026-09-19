@@ -9,6 +9,7 @@
 #include <QCryptographicHash>
 #include <QDebug>
 #include <QCoreApplication>
+#include <algorithm>  // std::reverse（分页查询结果新→旧反转成正序）
 
 DatabaseManager::DatabaseManager(QObject* parent, const QString& accountId)
     : QObject(parent)
@@ -594,26 +595,34 @@ QList<MessageInfo> DatabaseManager::loadMessages(const QString& contactId)
     return messages;
 }
 
-QList<MessageInfo> DatabaseManager::loadMessagesPage(const QString& contactId, int page, int pageSize)
+// 分页加载某个联系人的消息（在后台 DB 线程执行，由 MainBackend 的请求信号触发）。
+// 翻页方向：page=1 是最新一页。实现上先按 send_time 倒序取"离现在最近的 pageSize 条"，
+// 查完再反转成时间正序——这样"第 2 页"自然就是再往前的一段历史，
+// 而不像 ASC+OFFSET 那样 page=1 永远是最旧的开头（聊天首屏应该看到最新消息）
+void DatabaseManager::loadMessagesPage(const QString& contactId, int page, int pageSize)
 {
     QList<MessageInfo> messages;
-
-    if (!m_messageDatabase.isOpen()) {
-        qDebug() << "Message database is not open";
-        return messages;
-    }
+    bool hasMore = false;
 
     // 参数保护：页码从1开始，单页1~50条
     if (page < 1) page = 1;
     if (pageSize < 1) pageSize = 50;
     if (pageSize > 50) pageSize = 50;
 
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        emit messagesPageLoaded(contactId, page, messages, hasMore);
+        return;
+    }
+
     QSqlQuery query(m_messageDatabase);
 
+    // 倒序取页：OFFSET (page-1)*pageSize 表示跳过最近的 (page-1) 页，
+    // 剩下最靠前的 pageSize 条就是"第 page 页"（比第 page-1 页更早的历史）
     QString sql = R"(
         SELECT * FROM messages
         WHERE contact_id = ?
-        ORDER BY send_time ASC
+        ORDER BY send_time DESC
         LIMIT ? OFFSET ?
     )";
 
@@ -624,7 +633,8 @@ QList<MessageInfo> DatabaseManager::loadMessagesPage(const QString& contactId, i
 
     if (!query.exec()) {
         qDebug() << "Failed to load messages page:" << query.lastError().text();
-        return messages;
+        emit messagesPageLoaded(contactId, page, messages, hasMore);
+        return;
     }
 
     while (query.next()) {
@@ -647,7 +657,14 @@ QList<MessageInfo> DatabaseManager::loadMessagesPage(const QString& contactId, i
         messages.append(msg);
     }
 
-    return messages;
+    // 拿满一页说明后面大概率还有更早的；不足一页就是已经翻到头了
+    hasMore = (messages.size() == pageSize);
+
+    // 查出来是"新→旧"，反转成"旧→新"（聊天区从上到下的显示顺序），
+    // UI 拿到手可以直接按顺序插，不用再关心查询方向
+    std::reverse(messages.begin(), messages.end());
+
+    emit messagesPageLoaded(contactId, page, messages, hasMore);
 }
 
 QList<MessageInfo> DatabaseManager::loadAllMessages()

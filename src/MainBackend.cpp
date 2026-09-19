@@ -36,11 +36,17 @@ MainBackend::MainBackend(QObject* parent)
             m_databaseManager, &DatabaseManager::setCurrentAccountId);
     connect(this, &MainBackend::dbUpdateMessageIDRequested,
             m_databaseManager, &DatabaseManager::updateMessageId);
+    // 分页读消息请求：contactId+page 排队到后台 DB 线程执行（QSqlDatabase 不能跨线程直调）
+    connect(this, &MainBackend::dbLoadMessagesPageRequested,
+            m_databaseManager, &DatabaseManager::loadMessagesPage);
 
 
     // 5. 结果信号（后台线程发出）→ 本类槽（主线程）：跨线程自动 QueuedConnection
     connect(m_databaseManager, &DatabaseManager::messageSaved,
             this, &MainBackend::onDbMessageSaved);
+    // 分页查询结果：后台线程查完排队回主线程，转发给 UI
+    connect(m_databaseManager, &DatabaseManager::messagesPageLoaded,
+            this, &MainBackend::onDbMessagesPageLoaded);
     connect(m_databaseManager, &DatabaseManager::databaseInitialized,
                     this, &MainBackend::onDbInitialized);
     connect(m_databaseManager, &DatabaseManager::messageIdUpdated,
@@ -70,8 +76,6 @@ MainBackend::MainBackend(QObject* parent)
     // 转发 ChatBackend 的聊天相关信号
     connect(m_chatBackend, &ChatBackend::contactsLoaded,
             this, &MainBackend::contactsLoaded);
-    connect(m_chatBackend, &ChatBackend::messagesLoaded,
-            this, &MainBackend::messagesLoaded);
     connect(m_chatBackend, &ChatBackend::newMessageReceived,
             this, &MainBackend::onMessageReceived);
     connect(m_chatBackend, &ChatBackend::messageReceiveFailed,
@@ -110,6 +114,13 @@ void MainBackend::setupLoginConnections()
                 resetFeature();
                 emit loginFailed();
             });
+    // 网络层连不上（服务器没跑/断网）：与"密码错误"分开，UI 提示语不同，但同样是流程终态
+    connect(m_loginBackend, &LoginBackend::loginNetworkError,
+            this, [this](const QString& reason){
+                s_loggedIn = false;
+                resetFeature();
+                emit loginNetworkError(reason);
+            });
     // 纯转发：等待信号没有任何副作用，信号对信号连接即可
     connect(m_loginBackend, &LoginBackend::loginWaiting, this, &MainBackend::loginWaiting);
     connect(m_loginBackend, &LoginBackend::loginTimeout,
@@ -131,12 +142,65 @@ void MainBackend::setupLoginConnections()
                 resetFeature();
                 emit modifyPwdFailed();
             });
+    // 修改密码时网络层连不上：与"服务器拒绝"（modifyPwdFailed）分开，提示语不同，同样是终态
+    connect(m_loginBackend, &LoginBackend::modifyPwdNetworkError,
+            this, [this](const QString& reason){
+                resetFeature();
+                emit modifyPwdNetworkError(reason);
+            });
     connect(m_loginBackend, &LoginBackend::modifyPwdTimeout,
             this, [this](){
                 resetFeature();
                 emit modifyPwdTimeout();
             });
     connect(m_loginBackend, &LoginBackend::modifyPwdWaiting, this, &MainBackend::modifyPwdWaiting);
+
+    // --- 注册（注册页）---
+    // 与修改密码同一套规则：注册无论成败都是终态，转发前先清功能标记
+    // 取号成功：连接已经建好，后面就进入"提交注册"阶段了，功能标记随之从
+    // ConnectForRegister 切到 Register——否则提交阶段这条连接上的错误/超时
+    // 会被当成取号阶段的问题（报 connectForRegisterFailed 而不是 registerNetworkError）
+    connect(m_loginBackend, &LoginBackend::connectForRegisterSuccess,
+            this, [this](const QString& account){
+                m_currentFeature = LoginFeature::Register;
+                emit connectForRegisterSuccess(account);
+            });
+    // 取号（连接期）失败/超时同样是终态：转发前先清功能标记；
+    // 等待信号无副作用，信号对信号直连即可
+    connect(m_loginBackend, &LoginBackend::connectForRegisterFailed,
+            this, [this](){
+                resetFeature();
+                emit connectForRegisterFailed();
+            });
+    connect(m_loginBackend, &LoginBackend::connectForRegisterTimeout,
+            this, [this](){
+                resetFeature();
+                emit connectForRegisterTimeout();
+            });
+    connect(m_loginBackend, &LoginBackend::connectForRegisterWaiting, this, &MainBackend::connectForRegisterWaiting);
+    connect(m_loginBackend, &LoginBackend::registerSuccess,
+            this, [this](){
+                resetFeature();
+                emit registerSuccess();
+            });
+    connect(m_loginBackend, &LoginBackend::registerFailed,
+            this, [this](){
+                resetFeature();
+                emit registerFailed();
+            });
+    // 注册时网络层连不上：与"服务器拒绝"（registerFailed）分开，提示语不同，同样是终态
+    connect(m_loginBackend, &LoginBackend::registerNetworkError,
+            this, [this](const QString& reason){
+                resetFeature();
+                emit registerNetworkError(reason);
+            });
+    connect(m_loginBackend, &LoginBackend::registerTimeout,
+            this, [this](){
+                resetFeature();
+                emit registerTimeout();
+            });
+    // 纯转发：等待信号没有任何副作用，信号对信号连接即可
+    connect(m_loginBackend, &LoginBackend::registerWaiting, this, &MainBackend::registerWaiting);
 }
 
 // 未登录态流程（登录 / 注册 / 修改密码）无论成败都回到"空闲"态：清掉功能标记，
@@ -187,6 +251,26 @@ void MainBackend::sendMessage(const MessageInfo& message)
     m_chatBackend->startSendMessage(message.contactId, out);
 
     saveMessage(message);  // 异步保存到数据库（后台线程执行，不阻塞UI）
+}
+
+// 统一的"重试"入口（胶水层）：指示器（MessageStatusIndicator）点击重试时携带功能枚举上来，
+// 这里按枚举把请求路由到对应的后端
+void MainBackend::onRetryRequested(LoginFeature feature, const QString& id, const MessageInfo& message)
+{
+    Q_UNUSED(id);
+    switch (feature) {
+    case LoginFeature::MessageSend:
+        // 聊天消息重发：交给 ChatBackend 的发送链路（与首次发送同一条路）
+        sendMessage(message);
+        break;
+    case LoginFeature::ConnectForRegister:
+        // 注册页账号行（取号连接阶段）失败重试：重新发起 TCP 连接向服务器取号（交给 LoginBackend）
+        prepareRegisterConnection();
+        break;
+    default:
+        // None / Login / ModifyPassword 不走指示器重试，忽略
+        break;
+    }
 }
 
 // ===== 数据库异步接口 =====
@@ -249,9 +333,20 @@ void MainBackend::loadContacts()
     m_chatBackend->loadContacts();
 }
 
-void MainBackend::loadMessages(const QString& contactId)
+// 分页加载本地聊天记录：只发请求信号，实际查询在后台 DB 线程执行，
+// 结果从 onDbMessagesPageLoaded 转发回 UI（不能在主线程直调 DatabaseManager 的查询）
+void MainBackend::loadMessages(const QString& contactId, int page)
 {
-    m_chatBackend->loadMessages(contactId);
+    emit dbLoadMessagesPageRequested(contactId, page, 50);  // 单页固定50条（项目约定的分页上限）
+}
+
+// 后台DB线程分页查询完成（主线程）：原样转发给 UI。
+// UI 拿 contactId 比对"还是不是当前联系人"（快速切换联系人时慢一拍的结果不能盖到新联系人上），
+// 拿 page 区分首屏（清空重放）还是翻历史（插到顶部）
+void MainBackend::onDbMessagesPageLoaded(const QString& contactId, int page,
+                                         const QList<MessageInfo>& messages, bool hasMore)
+{
+    emit messagesPageLoaded(contactId, page, messages, hasMore);
 }
 
 void MainBackend::sendFile(const QString& contactId, const QString& filePath)
@@ -292,6 +387,14 @@ void MainBackend::onTcpConnected()
     } else if (m_currentFeature == LoginFeature::ModifyPassword) {
         // 修改密码场景：连接建立后发送修改密码请求（不能登录，也不能拉取）
         m_loginBackend->sendModifyPwdRequest();
+    } else if (m_currentFeature == LoginFeature::ConnectForRegister) {
+        // 注册取号场景：连接一建立就由登录后端把账号下发出去（emit connectForRegisterSuccess），
+        // 这里同样不能掉进下面的登录兜底——否则连上就发一个空账号的畸形登录包
+        m_loginBackend->sendconnectForRegister();
+    } else if (m_currentFeature == LoginFeature::Register) {
+        // 注册提交场景（取号成功后的复用连接）：这里什么都不发——用户还没填完密码，
+        // 注册请求要等点"注册"后才由 onSubmitClicked → registerUser 发出。
+        // 若漏掉这个分支会掉进下面的登录兜底，连上就发一个空账号的畸形登录包
     } else {
         // 登录场景：交给登录后端发登录请求，登录成功后再拉取
         m_loginBackend->onTcpConnected();
@@ -301,12 +404,39 @@ void MainBackend::onTcpConnected()
 // TCP断开：所有需要感知断线的后端都通知到
 void MainBackend::onTcpDisconnected()
 {
-    // 连接断了，"当前连接服务于哪个功能"的上下文随之失效，先清掉再分发，
-    // 防止残留值把下次连接的 TCP 信号误路由到上一次的功能（如修改密码）
+    // 先记住断线前的功能再清标记：未登录态的断线要自动重连，
+    // 重连成功的 connected 事件必须按原功能路由——不恢复标记的话会掉进
+    // else 兜底被当成登录，拿上次残留的账号密码发一个登录包
+    LoginFeature feature = m_currentFeature;
     resetFeature();
     if (!s_loggedIn) {
-        // 已登录过无需再重新登录，直接拉取服务器缓存的未确认消息
-        m_loginBackend->onTcpDisconnected();
+        // 按断线前的功能决定要不要重连、以及重连后走哪条路。
+        // 只在确实有流程在跑（feature != None）时才重连：
+        // 登录页闲置时断网就不该拿残留凭证偷偷发登录包
+        switch (feature) {
+        case LoginFeature::Login:
+            // 登录中断线：重连成功后走登录兜底重发登录请求
+            m_currentFeature = LoginFeature::Login;
+            m_tcpClient->reconnect();
+            break;
+        case LoginFeature::ConnectForRegister:
+            // 取号中断线：重连成功后重新发 connect_for_register 取号
+            m_currentFeature = LoginFeature::ConnectForRegister;
+            m_tcpClient->reconnect();
+            break;
+        case LoginFeature::Register:
+            // 提交阶段断线：重连后停在 Register 分支，等用户重新点"注册"
+            m_currentFeature = LoginFeature::Register;
+            m_tcpClient->reconnect();
+            break;
+        case LoginFeature::ModifyPassword:
+            // 改密中断线：重连成功后重发修改密码请求
+            m_currentFeature = LoginFeature::ModifyPassword;
+            m_tcpClient->reconnect();
+            break;
+        default:
+            break;  // None：没有流程在跑，不重连
+        }
         return;
     }
     m_chatBackend->onTcpDisconnected();
@@ -322,6 +452,12 @@ void MainBackend::onTcpError(QAbstractSocket::SocketError error)
     } else if (m_currentFeature == LoginFeature::ModifyPassword) {
         // 修改密码流程中的错误 → 修改密码失败（不是登录失败）
         m_loginBackend->onModifyPwdError(error);
+    } else if (m_currentFeature == LoginFeature::ConnectForRegister) {
+        // 注册取号时的连接错误 → 账号行指示器变红可重试（不能报"登录失败"）
+        m_loginBackend->onConnectForRegisterError(error);
+    } else if (m_currentFeature == LoginFeature::Register) {
+        // 注册提交阶段的错误 → 走注册提交流程（不能报"登录失败"）
+        m_loginBackend->onRegisterError(error);
     } else {
         // 登录流程中的错误 → 登录失败
         m_loginBackend->onTcpError(error);
@@ -335,16 +471,32 @@ void MainBackend::onTcpConnectionTimeout()
         m_chatBackend->onTcpConnectionTimeout();
     } else if (m_currentFeature == LoginFeature::ModifyPassword) {
         m_loginBackend->onModifyPwdTimeout();
+    } else if (m_currentFeature == LoginFeature::ConnectForRegister) {
+        m_loginBackend->onConnectForRegisterTimeout();
+    } else if (m_currentFeature == LoginFeature::Register) {
+        m_loginBackend->onRegisterTimeout();
     } else {
         m_loginBackend->onTcpConnectionTimeout();
     }
 }
 
+// 注册第二段（提交）：填好密码后由 RegisterPage 的 registerAquiard 直接绑定到本槽，
+// 不做"保存参数 + 重连"那套中间层——第一段（进页面）已经把 TCP 拉起来了，
+// 这里只把账号/密码原样转给 LoginBackend 把提交请求发出去
 void MainBackend::registerUser(const QString& username, const QString& password)
 {
-    Q_UNUSED(username);
-    Q_UNUSED(password);
-    emit registerSuccess();
+    m_loginBackend->sendRegisterRequest(username, password);
+}
+
+// 注册页显示时的取号连接：只连 TCP，不发提交请求，账号由服务器在连接建立后下发。
+// 顺序同 modifyPwd：先发起连接，再设功能标记——connectToServer 内部 abort 旧连接时
+// 可能同步触发 disconnected → resetFeature() 把标记清掉，设早了等 connected 到达时
+// 就会掉进 else 兜底被当成登录（发一个空账号的登录请求）
+void MainBackend::prepareRegisterConnection()
+{
+    s_loggedIn = false;
+    m_loginBackend->connectForRegister();
+    m_currentFeature = LoginFeature::ConnectForRegister;   // 标记这条连接服务于"注册取号"
 }
 
 void MainBackend::JsonParsing(const QByteArray packet)
@@ -367,6 +519,13 @@ void MainBackend::JsonParsing(const QByteArray packet)
         m_loginBackend->onTcpDataReceived(packet);
     } else if (type == "modify_password_response") {
         // 修改密码响应（忘记密码页提交后），交给登录后端解析成 modifyPwd 结果信号
+        m_loginBackend->onTcpDataReceived(packet);
+    } else if (type == "connect_for_register_response") {
+        // 注册取号响应（注册页显示后服务器回的账号下发包），交给登录后端解析成
+        // connectForRegisterSuccess(account)（带服务器分配的账号）/ connectForRegisterFailed
+        m_loginBackend->onTcpDataReceived(packet);
+    } else if (type == "register_response") {
+        // 注册提交响应（点"注册"后服务器回的结果包），交给登录后端解析成 register 结果信号
         m_loginBackend->onTcpDataReceived(packet);
     } else if (type == "repost_response") {
         m_chatBackend->onTcpDataReceived(packet);

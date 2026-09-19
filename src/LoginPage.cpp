@@ -280,6 +280,12 @@ void LoginPage::setupUI()
         stopLoginAnimation();
         showLoginError("账号或密码错误");
     });
+    // 网络层连不上（服务器没开进程/断网等）：提示语必须和"密码错误"区分开，
+    // 否则用户会对着正确的密码反复重试
+    connect(m_backend, &MainBackend::loginNetworkError, this, [=](){
+        stopLoginAnimation();
+        showLoginError("无法连接服务器，请检查网络或稍后再试");
+    });
     // 任一输入框有变化 → 清掉错误提示红字
     connect(accountEdit, &QLineEdit::textChanged, m_loginErrorHint, &QLabel::clear);
     connect(passwordEdit, &QLineEdit::textChanged, m_loginErrorHint, &QLabel::clear);

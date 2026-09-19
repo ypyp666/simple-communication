@@ -29,13 +29,17 @@ public:
 //纯g++编译器看不懂必须借助Qt的元对象管理器QMetaObject来处理信号槽机制，还要通过MOC这个Qt自带的元对象编译器翻译成C++的语法
 private slots://slots声明的函数可以接受其他对象发出的信号
     void onContactsLoaded(const QList<ContactInfo>& contacts);//联系人列表加载完成后，更新左侧界面
-    void onMessagesLoaded(const QList<MessageInfo>& messages);//消息列表加载完成后，更新右侧界面
+    // 分页查询结果到达：page==1 清空重放（刚点开联系人），page>1 前插（翻更早历史）
+    void onMessagesPageLoaded(const QString& contactId, int page,
+                              const QList<MessageInfo>& messages, bool hasMore);
+    // 聊天区滚到顶部：请求加载更早一页历史消息
+    void onLoadOlderMessages();
     void onContactSelected(const QString& contactId, const QString& contactName);//联系人列表中选择联系人时，更新右侧界面
     void onSendMessage(const QString& content);//发送消息
     void onSendFile(const QString& filePath);//发送文件
     void onMessageSendFailed(const QString& messageId, const QString& serverId);// 后端发送失败信号 → 对应消息变红色感叹号
     void onMessageSendSuccess(const QString& messageId, const QString& serverId);// 后端发送成功信号 → 隐藏发送等待动画，并用服务器ID更新本地消息
-    void onRetrySend(const QString& messageId);// 用户点击失败感叹号 → 重发该消息
+    void onRetrySend(const QString& messageId, LoginFeature feature);// 用户点击失败感叹号 → 重发该消息（带功能枚举转主后端路由）
     void onMessageReceiveFailed(const QString& serverId);// 后端接收失败信号 → 提示用户拉取
     void onMessageReceived(const MessageInfo& message);// 后端收到对方新消息 → 显示到聊天区
 //QList 是一个模板类，用于存储一个有序的元素集合，每个元素可以是任意类型,其作用相当于vector，但是更方便
@@ -56,6 +60,9 @@ private:
     QString currentContactName;//当前选中的联系人名称
     QString currentAccountId;//当前登录账号ID
     QMap<QString, MessageInfo> m_pendingMessages;  // 消息ID → 已发送但未确认的消息（超时后可点击感叹号重发）
+    // === 本地聊天记录分页状态（当前联系人）===
+    int m_currentPage = 1;   // 已加载到的页码（1=最新一页，递增往历史翻）
+    bool m_hasMore = false;  // 历史是否还没翻到底（由后端查询结果带回，切联系人前先置 false 防误触发）
 
 };
 

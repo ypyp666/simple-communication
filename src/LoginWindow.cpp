@@ -5,7 +5,7 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     : QDialog(parent)
 {
     // ========== 窗口级设置 ==========
-    setWindowTitle("登录");
+    setWindowTitle("CCEarth");
     setFixedSize(400, 500);
     setModal(true);// 设置为模态对话框，用户只能在登录窗口操作，必须登录后才能进入主界面
     // 固定尺寸窗口默认只显示关闭按钮（×），显式打开最小化提示后，
@@ -26,7 +26,7 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     // 而不是像登录→主界面那样换一个窗口
     m_stackedWidget = new QStackedWidget(this);
     m_loginPage = new LoginPage(backend, this);      // 登录页
-    m_registerPage = new RegisterPage(this);         // 注册页
+    m_registerPage = new RegisterPage(backend, this);        // 注册页（传 backend，注册要走 TCP）
     m_forgotPage = new ForgotPasswordPage(backend, this);     // 忘记密码页（传 backend，修改密码要走 TCP）
 
     // 顺序即页码：登录页=0，注册页=1，忘记密码页=2
@@ -43,10 +43,17 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     // 登录页点"注册账号" → 切到注册页(1)；点"忘记密码" → 切到忘记密码页(2)
     connect(m_loginPage, &LoginPage::registerRequested, this, [=]() {
         m_stackedWidget->setCurrentIndex(1);
+        // 切到注册页后再调 enterPage()：复位上次留下的输入 + 通知后端建连接取号。
+        // 显式在这里调而不是让注册页自己挂 showEvent——窗口最小化再还原时 Qt 也会补发
+        // showEvent，那样会把用户正输入的密码清掉、还会重复取号（详见 RegisterPage::enterPage）
+        m_registerPage->enterPage();
     });
     connect(m_loginPage, &LoginPage::forgotPasswordRequested, this, [=](const QString& account) {
         m_forgotPage->setAccount(account);          // 把登录页输入的账号带过去
         m_stackedWidget->setCurrentIndex(2);
+        // 同注册页：切页后显式复位上一轮留下的输入。不能挂 showEvent——窗口最小化还原时
+        // Qt 会补发 showEvent，把用户正输入的密码清掉
+        m_forgotPage->enterPage();
     });
     // 注册页/忘记密码页点"返回登录" → 切回登录页(0)
     connect(m_registerPage, &RegisterPage::backToLoginRequested, this, [=]() {

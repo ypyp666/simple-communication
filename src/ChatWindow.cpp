@@ -98,8 +98,11 @@ ChatWindow::ChatWindow(QWidget *parent, MainBackend* backendPtr) : QWidget(paren
 // 1. 后端加载完联系人 → 主窗口显示联系人列表
 connect(backend, &MainBackend::contactsLoaded, this, &ChatWindow::onContactsLoaded);
 
-// 2. 后端加载完消息 → 主窗口显示聊天记录
-connect(backend, &MainBackend::messagesLoaded, this, &ChatWindow::onMessagesLoaded);
+// 2. 后端分页查询完消息 → 主窗口显示聊天记录（page/hasMore 用于翻历史）
+connect(backend, &MainBackend::messagesPageLoaded, this, &ChatWindow::onMessagesPageLoaded);
+
+// 2.5 聊天区滚到顶部 → 加载更早一页历史消息
+connect(chatArea, &ChatArea::loadOlderMessages, this, &ChatWindow::onLoadOlderMessages);
 
 // 3. 点击左侧联系人 → 主窗口切换当前聊天对象
 connect(contactList, &ContactList::contactSelected, this, &ChatWindow::onContactSelected);
@@ -139,9 +142,38 @@ void ChatWindow::onContactsLoaded(const QList<ContactInfo>& contacts)
     contactList->setContacts(contacts);//槽函数接收到联系人列表，设置到联系人列表控件
 }
 
-void ChatWindow::onMessagesLoaded(const QList<MessageInfo>& messages)
+void ChatWindow::onMessagesPageLoaded(const QString& contactId, int page,
+                                      const QList<MessageInfo>& messages, bool hasMore)
 {
-    chatArea->setMessages(messages);//槽函数接收到消息列表，设置到聊天区域控件
+    // 结果比对：查询是异步的，快速切换联系人时，上一个联系人的慢结果
+    // 可能比新联系人的还晚回来——不是当前联系人的直接丢弃
+    if (contactId != currentContactId) {
+        return;
+    }
+
+    if (page <= 1) {
+        // 首屏（最新一页）：清空重放，addMessage 内部会滚到底部
+        chatArea->setMessages(messages);
+    } else {
+        // 翻历史：前插到顶部并保持滚动位置；解除"加载中"标志允许继续往上翻
+        chatArea->setLoadingOlder(false);
+        chatArea->prependMessages(messages);
+    }
+
+    m_currentPage = page;
+    m_hasMore = hasMore;   // 后端说没了就到头了，滚顶信号会被 onLoadOlderMessages 挡掉
+}
+
+// 聊天区滚到顶部 → 请求更早一页。
+// 三个前置条件：有联系人、首屏已经加载过（m_hasMore 才有效）、历史还没翻到底
+void ChatWindow::onLoadOlderMessages()
+{
+    if (currentContactId.isEmpty() || !m_hasMore) {
+        return;
+    }
+    // 置"加载中"：请求往返期间滚动条可能多次到顶，挡住重复请求
+    chatArea->setLoadingOlder(true);
+    backend->loadMessages(currentContactId, m_currentPage + 1);
 }
 
 void ChatWindow::onContactSelected(const QString& contactId, const QString& contactName)
@@ -160,8 +192,12 @@ void ChatWindow::onContactSelected(const QString& contactId, const QString& cont
     // 恢复新联系人的输入内容
     QString savedContent = backend->getInputContent(contactId);
     chatArea->setInputContent(savedContent);
-    
-    backend->loadMessages(contactId);//槽函数点击左侧联系人，加载该联系人所有消息
+
+    // 分页状态复位：先关 m_hasMore 再发请求——切换瞬间聊天区内容被清空，
+    // 滚动条归零会触发 loadOlderMessages，不关的话会拿新联系人的 ID 去翻旧页码
+    m_currentPage = 1;
+    m_hasMore = false;
+    backend->loadMessages(contactId, 1);//加载该联系人最新一页消息（50条），翻历史由滚顶触发
 }
 
 void ChatWindow::onSendMessage(const QString& content)
@@ -208,14 +244,15 @@ void ChatWindow::onMessageSendSuccess(const QString& messageId, const QString& s
     // take 已经移除，不用再 remove
 }
 
-// 用户点击失败感叹号 → 用保存的消息内容重发，并恢复发送中动画
-void ChatWindow::onRetrySend(const QString& messageId)
+// 用户点击失败感叹号 → 把重试请求连同功能枚举交给主后端路由（气泡固定 MessageSend → ChatBackend），
+// 并恢复发送中动画
+void ChatWindow::onRetrySend(const QString& messageId, LoginFeature feature)
 {
     auto it = m_pendingMessages.find(messageId);
     if (it == m_pendingMessages.end()) {
         return;
     }
-    backend->sendMessage(it.value());
+    backend->onRetryRequested(feature, messageId, it.value());
     chatArea->setMessageStatus(messageId, MessageStatusIndicator::Sending);
 }
 

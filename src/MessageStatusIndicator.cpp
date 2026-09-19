@@ -42,11 +42,18 @@ void MessageStatusIndicator::setStatus(Status status)
     update();
 }
 
+// 设置本指示器所属的功能：点击重试时随 retryClicked 一起发出去，
+// 上层按枚举把请求路由到对应后端（气泡=MessageSend，注册页账号行=Register）
+void MessageStatusIndicator::setFeature(LoginFeature feature)
+{
+    m_feature = feature;
+}
+
 // 点击红色感叹号 → 触发重发（仅在发送失败状态下有效）
 void MessageStatusIndicator::mousePressEvent(QMouseEvent *event)
 {
     if (m_status == Failed && event->button() == Qt::LeftButton) {
-        emit retryClicked();
+        emit retryClicked(m_feature);
     }
     QWidget::mousePressEvent(event);
 }
@@ -63,7 +70,12 @@ void MessageStatusIndicator::paintEvent(QPaintEvent *event)
 
     if (m_status == Sending) {
         // ===== 发送中：旋转小圆圈（一段弧线，缺口让它看起来在转） =====
-        QPen pen(QColor("#4a90d9"), 2.0, Qt::SolidLine, Qt::RoundCap);
+        // 颜色 = 主题蓝 #4a90d9 压到很低的透明度（alpha 80 ≈ 31%）：
+        // 叠在账号行那层浅白底上，只比输入框底色深一点点——看得见在转，
+        // 又不会像纯蓝那样把底衬得突兀。想更淡/更明显就调 alpha
+        QColor arcColor("#4a90d9");
+        arcColor.setAlpha(80);
+        QPen pen(arcColor, 2.0, Qt::SolidLine, Qt::RoundCap);
         //QPen是画笔，用于绘制线、圆等图形，`Qt::SolidLine`：实线（还有虚线、点线 Qt::DashLine 等）
         //Qt::RoundCap→ 圆角端点，如果默认是`Qt::FlatCap`：圆弧两头是平切的硬切口，RoundCap：圆弧的首尾端点变成半圆形圆头，让动画看的更顺畅
         painter.setPen(pen);//把画笔交给画家对象

@@ -14,6 +14,9 @@
 #include <qnamespace.h>
 #include "GlassCard.h"   // 卡片局部毛玻璃（已提取为独立文件，忘记密码页/注册页共用）
 
+// 密码位数下限：不足 5 位时提交按钮保持置灰（与注册页同一规则）
+static constexpr int kMinPasswordLength = 5;
+
 ForgotPasswordPage::ForgotPasswordPage(MainBackend* backend, QWidget *parent)
     : QWidget(parent), m_backend(backend)
 {
@@ -292,7 +295,8 @@ void ForgotPasswordPage::setupUI()
     FrameLayout->addLayout(grid);
 
     // 提交按钮（先做个占位效果，具体逻辑后面再接后端）
-    fSubmitBtn = new QPushButton("确认修改", this);
+    // 父对象与注册页一致：挂在卡片里（fCardFrame），而不是页面根布局
+    fSubmitBtn = new QPushButton("确认修改", fCardFrame);
     fSubmitBtn->setFixedHeight(42);
     fSubmitBtn->setStyleSheet(R"(
         QPushButton {
@@ -311,8 +315,9 @@ void ForgotPasswordPage::setupUI()
         }
     )");
     fSubmitBtn->setEnabled(false);
-    layout->addWidget(fSubmitBtn);
-    layout->addSpacing(6);  // 主按钮和次要的返回按钮贴紧凑，形成一组操作
+    // 放进卡片内部（表单正下方），与注册页布局一致；"返回登录"仍留在卡片外
+    FrameLayout->addWidget(fSubmitBtn);
+    layout->addSpacing(6);  // 卡片 ↔ 下面错误提示行的间距
 
     // 错误提示行：常驻占一行（16px），布局不跳动；默认无文字，密码不一致时才显示红字
     m_pwdMismatchHint = new QLabel(this);
@@ -386,6 +391,8 @@ void ForgotPasswordPage::setupUI()
     connect(m_backend, &MainBackend::modifyPwdWaiting, this, &ForgotPasswordPage::onModifyPwdWaiting);
     connect(m_backend, &MainBackend::modifyPwdSuccess, this, &ForgotPasswordPage::onModifyPwdSuccess);
     connect(m_backend, &MainBackend::modifyPwdFailed, this, &ForgotPasswordPage::onModifyPwdFailed);
+    // 网络层连不上（服务器没跑/断网）与"服务器拒绝"分开：信号带 reason，槽用不到，靠参数少的槽自动丢弃
+    connect(m_backend, &MainBackend::modifyPwdNetworkError, this, &ForgotPasswordPage::onModifyPwdNetworkError);
     connect(m_backend, &MainBackend::modifyPwdTimeout, this, &ForgotPasswordPage::onModifyPwdTimeout);
     connect(m_modifyPwdAnimTimer, &QTimer::timeout, this, &ForgotPasswordPage::updateSubmitButtonAnimation);
 }
@@ -398,13 +405,58 @@ void ForgotPasswordPage::setAccount(const QString& account)
     }
 }
 
+// 真正"进入本页"时调用（LoginWindow 切到本页时显式调，见 LoginWindow.cpp）：
+// 把上次留下的输入状态清回初始态，避免回到本页还看到上一轮的密码/强度条/提示语。
+// 账号框 fAccountEdit 不清：它在切页前由 LoginWindow 调 setAccount 预填，是只读展示框
+//
+// 为什么不做成 showEvent：窗口从最小化还原、重新获得焦点时 Qt 也会给本页补发一次
+// showEvent，可那时用户并没有离开过本页。挂在那儿会把用户已经敲进去的密码清掉（与注册页同一坑）
+void ForgotPasswordPage::enterPage()
+{
+    // 两个密码框清空：本来有内容时 clear() 会发 textChanged，
+    // 强度条、眼睛按钮、提交按钮会顺着信号自动复位
+    fNewPwdEdit->clear();
+    fConfirmEdit->clear();
+
+    // 上面两下只在"本来有内容"时才发信号，本来就是空的不发；
+    // 所以派生出来的状态再显式复位一遍，保证每次进页都是同一副初始模样
+    fNewPwdEdit->setEchoMode(QLineEdit::Password);   // 上次点过眼睛要收回密文态
+    fConfirmEdit->setEchoMode(QLineEdit::Password);
+    fNewPwdToggleBtn->setIcon(QIcon(":/res/icon/eyes_show.svg"));
+    fConfirmToggleBtn->setIcon(QIcon(":/res/icon/eyes_show.svg"));
+    fNewPwdToggleBtn->setVisible(false);             // 空密码不显示眼睛按钮
+    fConfirmToggleBtn->setVisible(false);
+
+    m_hasIllegal = false;                            // 非法字符标记清零（否则会拦住下次提交）
+    m_strengthWidget->setVisible(false);             // 强度条整块收起
+    m_strengthLabel->clear();
+    m_symbolHint->setText("密码由大小写字母、数字和符号组成，\n符号仅支持 ! ? - .");
+    m_symbolHint->setStyleSheet("color: #9aa4b5; font-size: 10px;");
+
+    // 提示行复位：上一轮可能停着绿色成功提示或红色错误提示，样式也要跟着回红字默认值
+    m_pwdMismatchHint->clear();
+    m_pwdMismatchHint->setStyleSheet(
+        "QLabel { color: rgba(224, 91, 91, 0.6); font-size: 12px; font-weight: bold; }");
+
+    // 等待态收尾：停加点动画 + 把等待中锁住的控件解锁。
+    // setInputsEnabled(true) 内部会调 updateSubmitButtonState()，
+    // 此时两个密码框都是空的 → 按钮自动回到"禁用 + 灰蓝底"的初始样式，
+    // 上一轮抖动动画若被打断留下的红色错误态样式也一并被覆盖
+    m_modifyPwdAnimTimer->stop();
+    m_dostcount = 0;
+    fSubmitBtn->setText(tr("确认修改"));
+    setInputsEnabled(true);
+}
+
 // 密码强度检测：点击"确认修改"前也复用这套分级，保证前端提示与提交校验一致。
 // 分级（区分大小写，符号仅允许 ! ? - . ，密码最多15位）：
 //   0 级：未输入 → 四杠全灭
-//   1 弱(红/1杠)：只有数字/字母/符号中的一种
-//   2 中(黄/2杠)：任意两种组合（数字+字母、字母+符号、符号+数字）
-//   3 强(绿/3杠)：数字+字母+符号都有（不区分大小写）
-//   4 极强(蓝/4杠)：数字+字母+符号都有，且同时含大写和小写字母
+//   1 弱(红/1杠)：数字 / 小写 / 大写 / 符号 里只命中一种
+//   2 中(黄/2杠)：命中任意两种
+//   3 强(绿/3杠)：命中任意三种
+//   4 极强(蓝/4杠)：四种全中（数字+小写+大写+符号）
+// 注：大小写各自算独立的一种（不再合成"字母类"），四种标志非空组合共 2^4-1=15 种，
+//     下面直接用 4 位掩码把这 15 种情况显式穷举，不用中间量推导
 void ForgotPasswordPage::updatePasswordStrength(const QString& pwd)
 {
     // 空密码：隐藏整块强度条（用户要求"输入密码之后才开始显示"）
@@ -424,21 +476,39 @@ void ForgotPasswordPage::updatePasswordStrength(const QString& pwd)
         else if (c == '!' || c == '?' || c == '-' || c == '.') hasSymbol = true;
         else                      m_hasIllegal = true;  // 出现合法集之外的字符
     }
-    const bool hasAlpha = hasLower || hasUpper;  // 大小写统一算"字母类"
-    const int categoryCount = (hasDigit ? 1 : 0) + (hasAlpha ? 1 : 0) + (hasSymbol ? 1 : 0);
+    // 把"命中了哪些种类"压成 4 位掩码：bit0 数字 / bit1 小写 / bit2 大写 / bit3 符号
+    int mask = 0;
+    if (hasDigit) mask |= 0x1;//按位或赋值
+    if (hasLower) mask |= 0x2;
+    if (hasUpper) mask |= 0x4;
+    if (hasSymbol) mask |= 0x8;
 
+    // 按掩码穷举分级：15 种非空组合全列出来，强度 = 命中的种类数，直接把规则看全
     int level = 0;
     QString color, text;
-    if (pwd.isEmpty()) {
-        level = 0;  // 未输入：全灭，无文字
-    } else if (hasDigit && hasAlpha && hasSymbol && hasLower && hasUpper) {
-        level = 4; color = "#4a90d9"; text = "极强";  // 蓝
-    } else if (hasDigit && hasAlpha && hasSymbol) {
-        level = 3; color = "#43a047"; text = "强";    // 绿
-    } else if (categoryCount == 2) {
-        level = 2; color = "#f0b429"; text = "中";    // 黄
-    } else {
+    switch (mask) {
+    // —— 命中 1 种：弱 ——
+    case 0x1: case 0x2: case 0x4: case 0x8:
         level = 1; color = "#e05b5b"; text = "弱";    // 红
+        break;
+    // —— 命中 2 种：中 ——
+    case 0x1|0x2: case 0x1|0x4: case 0x1|0x8:
+    case 0x2|0x4: case 0x2|0x8: case 0x4|0x8:
+        level = 2; color = "#f0b429"; text = "中";    // 黄
+        break;
+    // —— 命中 3 种：强 ——
+    case 0x1|0x2|0x4: case 0x1|0x2|0x8:
+    case 0x1|0x4|0x8: case 0x2|0x4|0x8:
+        level = 3; color = "#43a047"; text = "强";    // 绿
+        break;
+    // —— 4 种全中：极强 ——
+    case 0x1|0x2|0x4|0x8:
+        level = 4; color = "#4a90d9"; text = "极强";  // 蓝
+        break;
+    default:
+        // mask==0：密码非空但一个合法字符都没有（全是非法字符），按最弱红字提示
+        level = 1; color = "#e05b5b"; text = "弱";
+        break;
     }
 
     // 点亮前 level 根杠，其余保持极浅灰熄灭
@@ -468,13 +538,14 @@ void ForgotPasswordPage::updatePasswordStrength(const QString& pwd)
 }
 
 // 槽函数：刷新提交按钮可用性。
-// 启用条件 = 密码非空 + 确认框非空 + 无非法字符（m_hasIllegal 由 updatePasswordStrength 维护）。
+// 启用条件 = 密码非空 + 确认框非空 + 无非法字符（m_hasIllegal 由 updatePasswordStrength 维护）
+//            + 密码满 kMinPasswordLength 位（不足 5 位按钮保持置灰，点不动）。
 // 密码清空时 updatePasswordStrength 提前返回、m_hasIllegal 保留旧值，但"密码非空"
 // 这一条件本身就拦截了空密码提交，所以不影响正确性
 void ForgotPasswordPage::updateSubmitButtonState()
 {
     const bool bothFilled = !fNewPwdEdit->text().isEmpty() && !fConfirmEdit->text().isEmpty();
-    if(bothFilled && !m_hasIllegal)
+    if(bothFilled && !m_hasIllegal && fNewPwdEdit->text().length() >= kMinPasswordLength)
     {
       fSubmitBtn->setEnabled(true);
       fSubmitBtn->setStyleSheet(R"(
@@ -538,6 +609,11 @@ void ForgotPasswordPage::onSubmitClicked()
 // 动画结束时由 finished → updateSubmitButtonState 按当前输入状态复位按钮样式。
 void ForgotPasswordPage::triggerErrorFeedback(const QString& hint)
 {
+    // 错误提示行统一恢复红色样式：成功分支会把它改成绿色，
+    // 这里不还原的话，后面的错误（如两次密码不一致）会以绿字显示
+    m_pwdMismatchHint->setStyleSheet(
+        "QLabel { color: rgba(224, 91, 91, 0.6); font-size: 12px; font-weight: bold; }");
+
     // 按钮下一行显示红字（常驻占位行，不会引起布局跳动）
     m_pwdMismatchHint->setText(hint);
 
@@ -669,27 +745,62 @@ void ForgotPasswordPage::onModifyPwdTimeout()
             background-color: #2f70b5;
         }
     )");
+    triggerErrorFeedback("登录超时");
     updateSubmitButtonState();
 }
 
-// 修改密码成功（内容待实现：成功反馈 + 状态复位）
+// 修改密码成功：停等待动画 → 复位按钮 → 清空密码 → 绿色成功提示
 void ForgotPasswordPage::onModifyPwdSuccess()
 {
+    m_modifyPwdAnimTimer->stop();                 // 停掉"正在修改密码..."的加点动画
+    setInputsEnabled(true);                       // 解锁页面（内部会重算提交按钮状态）
+    fSubmitBtn->setText(m_originalSubmitText);    // 按钮文案恢复成"确认修改"
+
+    // 新密码已生效，两次输入留在框里没意义也不安全，直接清空。
+    // clear() 会触发 textChanged → 强度条自动收起、眼睛按钮自动隐藏、提交按钮自动置灰
+    fNewPwdEdit->clear();
+    fConfirmEdit->clear();
+
+    // 成功提示走 m_pwdMismatchHint 这一行（常驻占位不跳动），此次改为绿色与错误红字区分
+    // 注意：提示语必须在 clear() 之后设置——两个输入框的 textChanged 都连着 clear()，
+    // 先设置会被那两下清掉
+    m_pwdMismatchHint->setStyleSheet(
+        "QLabel { color: rgba(67, 160, 71, 0.9); font-size: 12px; font-weight: bold; }");
+    m_pwdMismatchHint->setText("密码修改成功，请返回登录使用新密码");
 }
 
-// 修改密码失败（内容待实现：错误反馈 + 状态复位）
+// 修改密码失败：停等待动画 → 复位按钮 → 复用统一错误反馈（红字 + 抖动）
 void ForgotPasswordPage::onModifyPwdFailed()
 {
+    m_modifyPwdAnimTimer->stop();
+    setInputsEnabled(true);
+    fSubmitBtn->setText(m_originalSubmitText);
+
+    // 服务器明确拒绝了这次修改（账号不存在等）。错误反馈不调用 updateSubmitButtonState，
+    // 让按钮的红色错误态保留到抖动结束——动画 finished 信号会自己把它复位成正常样式，
+    // 这里紧跟一次复位会把红框瞬间覆盖掉，用户根本看不见
+    triggerErrorFeedback("密码修改失败，请确认账号后重试");
+}
+
+// 修改密码时连不上服务器（开机但后端进程没跑、断网等）：收尾动作与失败分支相同，
+// 只有提示语必须区分开——否则用户会以为账号/密码有问题，对着正确的输入反复重试
+void ForgotPasswordPage::onModifyPwdNetworkError()
+{
+    m_modifyPwdAnimTimer->stop();
+    setInputsEnabled(true);
+    fSubmitBtn->setText(m_originalSubmitText);
+
+    triggerErrorFeedback("无法连接服务器，请检查网络或稍后再试");
 }
 
 void ForgotPasswordPage::updateSubmitButtonAnimation()
 {
-    m_dostcount=(m_dostcount+1)%4;
+    m_dostcount=(m_dostcount+1)%5;
     QString text="正在修改密码";
     for(int i=0;i<m_dostcount;i++)
     {
-        text+=".";
         fSubmitBtn->setText(text);
+          text+=".";
     }
 }
 
