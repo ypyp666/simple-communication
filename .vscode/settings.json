@@ -1,0 +1,26 @@
+{
+    "cmake.cmakePath": "C:/Qt/Tools/CMake_64/bin/cmake.exe",
+    "cmake.generator": "MinGW Makefiles",
+    "cmake.configureSettings": {
+        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.1/mingw_64"
+    },
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.debugConfig": {
+        "environment": [
+            {
+                "name": "PATH",
+                "value": "C:/Qt/6.11.1/mingw_64/bin;${env:PATH}"
+            }
+        ],
+        "miDebuggerPath": "C:/Qt/Tools/mingw1310_64/bin/gdb.exe",
+        "MIMode": "gdb",
+        "externalConsole": false,
+        "setupCommands": [
+            {
+                "description": "启用 STL 美化打印",
+                "text": "-enable-pretty-printing",
+                "ignoreFailures": true
+            }
+        ]
+    }
+}

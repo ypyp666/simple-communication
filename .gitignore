@@ -28,3 +28,12 @@ ChatPackage/
 # ===== 系统 / 个人临时文件 =====
 .DS_Store
 Thumbs.db
+
+# ===== 独立仓库目录（原 simplie-communication 子模块，已解除注册）=====
+simplie-communication/
+
+# ===== AI 编码约定文件（本地保留，不进公开仓库）=====
+/AGENTS.md
+
+# ===== Trae IDE 本地元数据 =====
+.trae/

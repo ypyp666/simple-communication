@@ -63,6 +63,19 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent)
         }
     )");
     
+    // ===== "输入框只向上扩"的机关，就在下面这两次 addWidget =====
+    // 目标效果：输入框长高时【顶边抬升、底边贴死窗口底】（整体向上长），而不是向下顶。
+    // 靠两件事，缺一不可：
+    //   ① 顺序：scrollArea 在前、chatInput 在最后
+    //      → chatInput 的底边锚在布局底部（= 窗口底），这个锚点不动
+    //   ② stretch：scrollArea = 1（弹性块）、chatInput = 0（刚性块，默认）
+    //      → 富余/紧张的空间都归 scrollArea 吸收
+    // 机制：输入框从 4 行变 8 行时，"想要"的高度 +N，而窗口总高固定，
+    //       这 N 只能从唯一弹性的 scrollArea 身上扣 → scrollArea 矮 N，
+    //       chatInput 顶边上移 N、底边不动 → 视觉上就是"只向上扩"。
+    // 反例：若把 chatInput 放在最前面（顶部），就变成"顶边不动、底边下移"= 向下扩。
+    // 配套（都在 ChatInput 内部）：setMaximumHeight(225) 是高度上限，到顶后改框内滚动；
+    //       框内三行的 rowStretch 保证只有输入框那行伸缩，上下两行不乱挤。
     mainLayout->addWidget(scrollArea, 1);
 
     messagesWidget = new QWidget();

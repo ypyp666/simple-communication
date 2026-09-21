@@ -163,7 +163,6 @@ void ChatWindow::onMessagesPageLoaded(const QString& contactId, int page,
     m_currentPage = page;
     m_hasMore = hasMore;   // 后端说没了就到头了，滚顶信号会被 onLoadOlderMessages 挡掉
 }
-
 // 聊天区滚到顶部 → 请求更早一页。
 // 三个前置条件：有联系人、首屏已经加载过（m_hasMore 才有效）、历史还没翻到底
 void ChatWindow::onLoadOlderMessages()
@@ -175,17 +174,20 @@ void ChatWindow::onLoadOlderMessages()
     chatArea->setLoadingOlder(true);
     backend->loadMessages(currentContactId, m_currentPage + 1);
 }
-
 void ChatWindow::onContactSelected(const QString& contactId, const QString& contactName)
 {
-    // 切换前保存当前联系人的输入内容
+    // 切换前保存「即将离开的那个联系人」的输入内容。
+    // 注意此刻 currentContactId 还没被下面的赋值覆盖，指向的仍是上一个联系人，
+    // 所以 saveInputContent 存的是旧联系人（切走的那个）的草稿，不是新选中联系人的。
+    // 顺序不能调换：一旦先把 currentContactId 换成新 ID，这里就会把内容存到新联系人的
+    // key 上，旧联系人的草稿将直接丢失
     if (!currentContactId.isEmpty()) {
         QString inputContent = chatArea->getInputContent();
         backend->saveInputContent(currentContactId, inputContent);
     }
     
-    currentContactId = contactId;//保存当前好友ID
-    currentContactName = contactName;//保存当前好友名称
+    currentContactId = contactId;//用新选中的好友ID覆盖旧值（执行完这句，currentContactId 才指向新联系人）
+    currentContactName = contactName;//同上，覆盖为新的好友名称
     chatArea->setContactName(contactName);//设置到聊天区域控件
     chatArea->setInputVisible(true);  // 选择联系人后显示输入框
     

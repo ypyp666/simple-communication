@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "enabled": true,
+  "rules": {
+    "keep_chinese_comments": true
+  },
+  "description": "项目级记忆配置。核心学习笔记约束(保留中文教学式注释,勿删勿改)见 AGENTS.md 与 Trae 记忆系统 project_memory.md。"
+}
