@@ -12,7 +12,7 @@ struct MessageInfo {
     uint32_t messageId;   // 消息ID
     uint32_t senderId;    // 发送者ID
     uint32_t targetId;    // 目标ID
-    std::string sendtime; // 发送时间
+    std::string sendTime;  // 发送时间
     std::string content;  //文本内容
 };
 
@@ -45,13 +45,22 @@ public:
     //对外接口6
     bool callLoginFunc(int account,  std::string& pwd, int& retCode);
 
-    //对外接口7数据库消息存储
+    //对外接口7：修改密码数据库过程
+    bool callModifyPwd(uint32_t account, const std::string& pwd, int& retCode);
+
+    //对外接口8：注册数据库过程占位
+    bool callRegister(uint32_t account, const std::string& pwd);
+
+    //对外接口9：获取注册账号数据库函数占位
+    bool callGetAccount(uint32_t& newAccount);
+
+    //对外接口10数据库消息存储
     bool callMessage(nlohmann::json& rsp, uint32_t& outMessageId);
 
-    //对外接口8删除消息缓存
+    //对外接口11删除消息缓存
     bool callDeleteMessage(unsigned int messageId);
 
-    //对外接口9加载消息缓存（retcode为过程返回码，消息数据通过outMessages带回）
+    //对外接口12加载消息缓存（retcode为过程返回码，消息数据通过outMessages带回）
     bool callLoadMessage(int targetID, std::vector<MessageInfo>& outMessages, int& retcode);
 
 };

@@ -17,6 +17,7 @@ enum class  CmdType {
     Unknown,//未知错误
     Pull,//消息拉取
     Receive,//接收消息确认
+    GetAccount,//注册页面拿到新账号
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -31,8 +32,9 @@ enum class  CmdType {
     std::string HandlePull(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleRepost(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleReceiveACK(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleGetAccount(const json& req, mysqlconn& conn, SessionPtr session);
 
-inline std::unordered_map<CmdType, CmdHandler> cmd_table=
+inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
     {CmdType::Login,HandleLogin},
     {CmdType::Register, HandleRegister},
@@ -42,6 +44,7 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table=
     {CmdType::Unknown, HandleUnknown},
     {CmdType::Repost, HandleRepost},
     {CmdType::Receive,HandleReceiveACK},
+    {CmdType::GetAccount, HandleGetAccount},
 
 };
 
