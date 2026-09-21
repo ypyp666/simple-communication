@@ -30,11 +30,41 @@
 
 ## 界面截图
 
-![登录](screenshots/login.png)
+### 登录与账号
 
-![聊天](screenshots/chat.png)
+**登录页** — 账号 / 密码登录，二者均非空时才可点击登录按钮
 
-> 截图说明：`screenshots/` 目录下放对应命名截图即可，缺失时不影响本文档渲染布局。
+![登录页](screenshots/login.png)
+
+**登录中** — 异步 TCP 登录 + 动态等待动画，30 秒无响应触发超时检测
+
+![登录中](screenshots/logining.png)
+
+**注册页**
+
+![注册页](screenshots/regist.png)
+
+**修改密码页**
+
+![修改密码页](screenshots/modifyPwd.png)
+
+### 消息收发
+
+**消息气泡** — 接收（左）/ 发送（右）分列显示，带时间戳；会话列表显示未读红点
+
+![消息气泡](screenshots/message1.png)
+
+**会话消息记录** — 切换联系人后各自的独立记录，输入内容按联系人分别记忆
+
+![会话消息记录](screenshots/message2.png)
+
+**双端互通 · 发送** — 两个客户端同时在线，一端发送
+
+![双端发送](screenshots/send1.png)
+
+**双端互通 · 接收** — 另一端实时收到，消息落库后可回看
+
+![双端接收](screenshots/send2.png)
 
 ---
 
