@@ -186,6 +186,8 @@ void* TcpServer::ClientWork(void* arg) {
                 std::cout << "[" << ip << "] 完整JSON: " << single_json << std::endl;
                 std::string rsp = single_json + "\n";
                 std::string reply = JsonParsing(rsp, mysqlconnect,sess);
+                // 打印真正发出去的报文（reply 末尾自带换行，这里不再额外补）
+                std::cout << "[" << ip << "] 发送JSON: " << reply;
                 if (!SendAll(fd, reply))
                 {
                     std::cout<<'\n'<<std::endl;

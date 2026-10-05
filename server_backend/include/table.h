@@ -18,6 +18,16 @@ enum class  CmdType {
     Pull,//消息拉取
     Receive,//接收消息确认
     GetAccount,//注册页面拿到新账号
+    FriendRequest,//发起好友申请
+    PullFriendRequest,//拉取待处理好友申请
+    AcceptFriendRequest,//同意好友申请
+    RejectFriendRequest,//拒绝好友申请
+    DeleteFriend,//删除好友
+    SetRemark,//修改好友备注
+    PullServerContacts,//拉取全部好友
+    SearchRequest,//搜索用户
+    PullDelFriendCache,//上线拉取离线删除好友墓碑
+    AckDelFriendCache,//回执并清除已同步的删除墓碑
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -33,6 +43,18 @@ enum class  CmdType {
     std::string HandleRepost(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleReceiveACK(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleGetAccount(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleModifyNam(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleFriendRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandlePullFriendRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAcceptFriendRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleRejectFriendRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleDeleteFriend(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleSetRemark(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandlePullServerContacts(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleSearchRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandlePullDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
+    
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
@@ -45,6 +67,17 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::Repost, HandleRepost},
     {CmdType::Receive,HandleReceiveACK},
     {CmdType::GetAccount, HandleGetAccount},
+    {CmdType::FriendRequest, HandleFriendRequest},
+    {CmdType::PullFriendRequest, HandlePullFriendRequest},
+    {CmdType::AcceptFriendRequest, HandleAcceptFriendRequest},
+    {CmdType::RejectFriendRequest, HandleRejectFriendRequest},
+    {CmdType::DeleteFriend, HandleDeleteFriend},
+    {CmdType::SetRemark, HandleSetRemark},
+    {CmdType::PullServerContacts, HandlePullServerContacts},
+    {CmdType::SearchRequest, HandleSearchRequest},
+    {CmdType::ModifyNam, HandleModifyNam},
+    {CmdType::PullDelFriendCache, HandlePullDelFriendCache},
+    {CmdType::AckDelFriendCache, HandleAckDelFriendCache},
 
 };
 

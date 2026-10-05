@@ -165,6 +165,104 @@ bool mysqlconn::callLoginFunc(int account, std::string& pwd, int& retCode)
     return true;
 }
 
+bool mysqlconn::callModifyPwd(uint32_t account, const std::string& pwd, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0 || pwd.empty() || pwd.size() > 15)
+    {
+        std::cerr << "修改密码参数无效" << std::endl;
+        return false;
+    }
+
+    // 密码来自客户端，进入SQL前必须转义，不能依赖前端校验。
+    std::string escapedPwd(pwd.size() * 2 + 1, '\0');
+    const unsigned long escapedLength = mysql_real_escape_string(
+        mysql, escapedPwd.data(), pwd.data(), static_cast<unsigned long>(pwd.size()));
+    escapedPwd.resize(escapedLength);
+
+    const std::string sql = "CALL ModifyPwd(" + std::to_string(account)
+                          + ", '" + escapedPwd + "', @retcode)";
+    std::cout << "执行修改密码存储过程，account=" << account << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用修改密码过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    // CALL可能返回多个结果集，必须全部消费后才能查询OUT参数。
+    int nextResult = 0;
+    do
+    {
+        MYSQL_RES* callResult = mysql_store_result(mysql);
+        if (callResult != nullptr)
+        {
+            mysql_free_result(callResult);
+        }
+        nextResult = mysql_next_result(mysql);
+    } while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "清理修改密码过程结果失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (mysql_query(mysql, "SELECT @retcode") != 0)
+    {
+        std::cerr << "读取修改密码结果失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result == nullptr)
+    {
+        std::cerr << "读取修改密码结果集失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    MYSQL_ROW resultRow = mysql_fetch_row(result);
+    if (resultRow == nullptr)
+    {
+        std::cerr << "[ModifyPwd] OUT结果集没有数据行" << std::endl;
+        mysql_free_result(result);
+        return false;
+    }
+    if (resultRow[0] == nullptr)
+    {
+        // @retcode 为 NULL 说明过程没有执行到任何 SET retcode 的分支，
+        // 属于异常情况，不能当成默认值 -1 静默放过
+        std::cerr << "[ModifyPwd] @retcode为NULL，过程未设置返回码" << std::endl;
+        mysql_free_result(result);
+        return false;
+    }
+
+    std::cout << "[ModifyPwd] 原始返回码=" << resultRow[0] << std::endl;
+    try
+    {
+        retCode = std::stoi(resultRow[0]);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[ModifyPwd] 返回码格式错误: " << e.what() << std::endl;
+        mysql_free_result(result);
+        return false;
+    }
+    mysql_free_result(result);
+
+    std::cout << "[ModifyPwd] 解析后 retCode=" << retCode << std::endl;
+    // 只要成功读到返回码就算调用成功，业务结果交给 retCode 表达，
+    // 否则上层按 retCode 分支的判断会失效（0=账号不存在永远走不到）
+    return true;
+}
+
+
+
 bool mysqlconn::callMessage(nlohmann::json& rsp, uint32_t& outMessageId)
 {
     outMessageId = 0;
@@ -461,6 +559,221 @@ bool mysqlconn::callLoadMessage(int targetID, std::vector<MessageInfo>& outMessa
     return retcode == 1;
 }
 
+bool mysqlconn::callGetAccount(uint32_t& newAccount)
+{
+    newAccount = 0;
+    std::cout << "[GetAccount] 开始调用，mysql句柄=" << mysql << std::endl;
+    if (!mysql)
+    {
+        std::cerr << "[GetAccount] 数据库未连接" << std::endl;
+        return false;
+    }
+
+    // GetAccount 是带两个 OUT 参数的存储过程，必须使用 CALL 调用
+    const std::string sql = "CALL GetAccount(@out_account, @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;   // 调试用，发布时建议去掉
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "[GetAccount] CALL执行失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+    std::cout << "[GetAccount] CALL执行成功，初始字段数="
+              << mysql_field_count(mysql) << std::endl;
+
+    // CALL 的全部结果集必须清空，之后才能查询 OUT 参数
+    int nextResult = 0;
+    int resultSetCount = 0;
+    do
+    {
+        MYSQL_RES* callResult = mysql_store_result(mysql);
+        if (callResult != nullptr)
+        {
+            ++resultSetCount;
+            std::cout << "[GetAccount] 清理第" << resultSetCount
+                      << "个CALL结果集，列数=" << mysql_num_fields(callResult)
+                      << ", 行数=" << mysql_num_rows(callResult) << std::endl;
+            mysql_free_result(callResult);
+        }
+        else if (mysql_field_count(mysql) != 0)
+        {
+            std::cerr << "[GetAccount] CALL结果集读取失败: "
+                      << mysql_error(mysql) << std::endl;
+        }
+        nextResult = mysql_next_result(mysql);
+        std::cout << "[GetAccount] mysql_next_result返回=" << nextResult << std::endl;
+    } while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "[GetAccount] 清理CALL结果失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    std::cout << "[GetAccount] CALL结果清理完成，共" << resultSetCount
+              << "个结果集，开始读取OUT变量" << std::endl;
+    if (mysql_query(mysql, "SELECT @out_account, @retcode") != 0)
+    {
+        std::cerr << "[GetAccount] SELECT OUT变量失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+    std::cout << "[GetAccount] SELECT OUT变量执行成功，字段数="
+              << mysql_field_count(mysql) << std::endl;
+
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result == nullptr)
+    {
+        std::cerr << "[GetAccount] OUT变量结果集为空或读取失败: "
+                  << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    bool success = false;
+    std::cout << "[GetAccount] OUT结果集列数=" << mysql_num_fields(result)
+              << ", 行数=" << mysql_num_rows(result) << std::endl;
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (row == nullptr)
+    {
+        std::cerr << "[GetAccount] OUT结果集没有数据行" << std::endl;
+    }
+    else
+    {
+        std::cout << "[GetAccount] 原始返回值: out_account="
+                  << (row[0] != nullptr ? row[0] : "NULL")
+                  << ", retcode=" << (row[1] != nullptr ? row[1] : "NULL")
+                  << std::endl;
+    }
+
+    if (row != nullptr && row[0] != nullptr && row[1] != nullptr)
+    {
+        try
+        {
+            const int retcode = std::stoi(row[1]);
+            std::cout << "[GetAccount] 解析 retcode=" << retcode << std::endl;
+            if (retcode == 1)
+            {
+                const unsigned long long account = std::stoull(row[0]);
+                std::cout << "[GetAccount] 解析 account=" << account << std::endl;
+                if (account > 0 && account <= std::numeric_limits<uint32_t>::max())
+                {
+                    newAccount = static_cast<uint32_t>(account);
+                    success = true;
+                }
+                else
+                {
+                    std::cerr << "[GetAccount] account无效或超出uint32_t范围" << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "[GetAccount] 数据库过程返回失败码 retcode="
+                          << retcode << std::endl;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "[GetAccount] 返回值格式错误: " << e.what() << std::endl;
+        }
+    }
+    mysql_free_result(result);
+
+    std::cout << "[GetAccount] 最终结果: success=" << std::boolalpha << success
+              << ", newAccount=" << newAccount << std::noboolalpha << std::endl;
+    return success;
+}
+
+bool mysqlconn::callRegister(uint32_t account, const std::string& pwd)
+{
+    if(!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+
+    if (account == 0 || pwd.empty())
+    {
+        std::cerr << "[Register] 参数无效" << std::endl;
+        return false;
+    }
+
+    // 密码是用户输入，进SQL前必须转义防注入，不能依赖前端校验
+    std::string escapedPwd(pwd.size() * 2 + 1, '\0');
+
+    const unsigned long escapedLength = mysql_real_escape_string(
+    mysql,
+    escapedPwd.data(),
+    pwd.data(),
+    static_cast<unsigned long>(pwd.size()));
+
+    escapedPwd.resize(escapedLength);
+
+    // 字符串参数必须用单引号包裹：反引号是标识符(字段名)语法，写反引号会报Unknown column
+    const std::string sql = "CALL Register(" + std::to_string(account)
+                          + ", '" + escapedPwd + "', @retcode)";
+    std::cout << "执行注册存储过程，account=" << account << std::endl;   // 不打印密码
+
+     if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "[Register] CALL执行失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    int nextResult = 0;
+    do
+    {
+        MYSQL_RES* callResult = mysql_store_result(mysql);
+        if (callResult != nullptr)
+        {
+            mysql_free_result(callResult);
+        }
+        nextResult = mysql_next_result(mysql);
+    } while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "[Register] 清理CALL结果失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+ 
+    if (mysql_query(mysql, "SELECT  @retcode") != 0)
+    {
+        std::cerr << "Register SELECT OUT变量失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+     MYSQL_RES* result = mysql_store_result(mysql);
+    if (result == nullptr)
+    {
+        std::cerr << "[Register] OUT变量结果集为空或读取失败: "
+                  << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    int retcode=0;
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (row == nullptr || row[0] == nullptr)
+    {
+        std::cerr << "[Register] OUT结果集没有数据行" << std::endl;
+    }
+    else
+    {
+        try
+        {
+            // retcode必须从结果集解析，否则永远是初始值0，注册会被误判为失败
+            retcode = std::stoi(row[0]);
+            std::cout << "[Register] 解析 retcode=" << retcode << std::endl;
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "[Register] 返回值格式错误: " << e.what() << std::endl;
+        }
+    }
+    mysql_free_result(result);   // 无论成功失败都只释放一次，避免内存泄漏
+
+    return retcode == 1;
+}
+
+
 void mysqlconn::close(mysqlconn& conn)
 {
     conn.freeResult();
@@ -470,3 +783,727 @@ void mysqlconn::close(mysqlconn& conn)
         conn.mysql = nullptr;
     }
 }
+
+// ============================================================================
+// 好友/联系人功能：公共辅助
+// ============================================================================
+
+// 排空CALL产生的全部结果集：MySQL协议要求消费完上一条命令的所有数据包，
+// 连接才会变为空闲，否则后续SELECT @变量会报 Commands out of sync
+bool mysqlconn::drainCallResults()
+{
+    int nextResult = 0;
+    do
+    {
+        MYSQL_RES* callResult = mysql_store_result(mysql);
+        if (callResult != nullptr)
+        {
+            mysql_free_result(callResult);
+        }
+        nextResult = mysql_next_result(mysql);
+    } while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "清理CALL结果集失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// 读取OUT会话变量并解析为int，任何一步异常都返回false，避免上层误判成功
+bool mysqlconn::fetchOutParameter(const std::string& varName, int& outValue)
+{
+    outValue = 0;
+    const std::string sql = "SELECT " + varName;
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "读取会话变量失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result == nullptr)
+    {
+        std::cerr << "读取会话变量结果集失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    MYSQL_ROW resultRow = mysql_fetch_row(result);
+    if (resultRow == nullptr || resultRow[0] == nullptr)
+    {
+        // 会话变量为NULL说明过程没有走到任何SET retcode分支，属于异常情况
+        std::cerr << "会话变量 " << varName << " 为NULL" << std::endl;
+        mysql_free_result(result);
+        return false;
+    }
+
+    try
+    {
+        outValue = std::stoi(resultRow[0]);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "会话变量 " << varName << " 格式错误: " << e.what() << std::endl;
+        mysql_free_result(result);
+        return false;
+    }
+    mysql_free_result(result);
+    return true;
+}
+
+// ============================================================================
+// 好友/联系人功能：数据库过程调用
+// ============================================================================
+
+bool mysqlconn::callAddFriend(uint32_t applyId, uint32_t targetId, const std::string& applyMsg,
+                              int& retCode, uint32_t& outRequestId, std::string& outApplyName)
+{
+    retCode = -1;
+    outRequestId = 0;
+    outApplyName.clear();
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (applyId == 0 || targetId == 0)
+    {
+        std::cerr << "好友申请参数无效" << std::endl;
+        return false;
+    }
+
+    // applyMsg 是客户端传入的申请留言，属于用户输入，进SQL前必须转义防注入
+    std::string escapedMsg(applyMsg.size() * 2 + 1, '\0');
+    const unsigned long escapedLength = mysql_real_escape_string(
+        mysql, escapedMsg.data(), applyMsg.data(), static_cast<unsigned long>(applyMsg.size()));
+    escapedMsg.resize(escapedLength);
+
+    const std::string sql = "CALL AddFriend(" + std::to_string(applyId)
+                          + ", " + std::to_string(targetId)
+                          + ", '" + escapedMsg + "', @retcode)";
+    // 打印完整语句，可直接复制到 mysql 客户端里逐步排查
+    std::cout << "[AddFriend] 执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用好友申请过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[AddFriend] 失败SQL: " << sql << std::endl;
+        return false;
+    }
+
+    // 逐个消费结果集：AddFriend只往contact_cache写申请，过程默认不回吐结果集。
+    // 若将来给AddFriend补上联表user的 SELECT user_id, user_name，这里会自动取到申请人昵称；
+    // 在补之前 outApplyName 保持为空串，实时推送的name字段就是空的。
+    bool captured = false;
+    int nextResult = 0;
+    int resultIndex = 0;
+    do
+    {
+        MYSQL_RES* result = mysql_store_result(mysql);
+        if (result != nullptr)
+        {
+            const unsigned int fieldCount = mysql_num_fields(result);
+            MYSQL_FIELD* fields = mysql_fetch_fields(result);
+            std::cout << "[AddFriend] 结果集#" << resultIndex << " 列数=" << fieldCount << " 列名=";
+            for (unsigned int i = 0; i < fieldCount; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << fields[i].name;
+            }
+            std::cout << std::endl;
+
+            if (!captured && fieldCount >= 2)
+            {
+                MYSQL_ROW row = mysql_fetch_row(result);
+                if (row != nullptr)
+                {
+                    outApplyName = (row[1] != nullptr) ? row[1] : "";
+                    captured = true;
+                    std::cout << "[AddFriend] 取到申请人昵称: " << outApplyName << std::endl;
+                }
+            }
+            mysql_free_result(result);
+            ++resultIndex;
+        }
+        nextResult = mysql_next_result(mysql);
+    }
+    while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "好友申请过程结果集消费失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+    std::cout << "[AddFriend] @retcode=" << retCode << std::endl;
+
+    // AddFriend只有OUT retcode，没有返回新申请ID，成功时用同连接的LAST_INSERT_ID取
+    if (retCode == 1)
+    {
+        if (mysql_query(mysql, "SELECT LAST_INSERT_ID()") != 0)
+        {
+            std::cerr << "读取好友申请ID失败: " << mysql_error(mysql) << std::endl;
+            return false;
+        }
+        MYSQL_RES* idResult = mysql_store_result(mysql);
+        if (idResult != nullptr)
+        {
+            MYSQL_ROW idRow = mysql_fetch_row(idResult);
+            if (idRow != nullptr && idRow[0] != nullptr)
+            {
+                outRequestId = static_cast<uint32_t>(std::stoul(idRow[0]));
+            }
+            mysql_free_result(idResult);
+        }
+        std::cout << "[AddFriend] LAST_INSERT_ID=" << outRequestId << std::endl;
+    }
+
+    std::cout << "[AddFriend] 汇总 applyId=" << applyId
+              << ", targetId=" << targetId
+              << ", retCode=" << retCode
+              << ", requestId=" << outRequestId
+              << ", applyName=" << outApplyName << std::endl;
+    return true;
+}
+
+bool mysqlconn::callLoadNewFriend(uint32_t account, std::vector<FriendApplyInfo>& outApplies, int& retCode)
+{
+    outApplies.clear();
+    retCode = 0;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0)
+    {
+        std::cerr << "查询好友申请失败：账号无效" << std::endl;
+        return false;
+    }
+
+    const std::string sql = "CALL LoadNewFriend(" + std::to_string(account) + ", @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用加载好友申请过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    // 结果集列顺序：request_id, account_id, target_id, a_user_name, t_user_name, send_time, status, apply_msg
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result != nullptr)
+    {
+        const unsigned int fieldCount = mysql_num_fields(result);
+        if (fieldCount < 8)
+        {
+            std::cerr << "加载好友申请结果集列数异常: " << fieldCount << "（期望8列）" << std::endl;
+            mysql_free_result(result);
+            return false;
+        }
+        MYSQL_ROW row = nullptr;
+        while ((row = mysql_fetch_row(result)) != nullptr)
+        {
+            FriendApplyInfo info;
+            info.requestId  = (row[0] != nullptr) ? static_cast<uint32_t>(std::stoul(row[0])) : 0;
+            info.applyId    = (row[1] != nullptr) ? static_cast<uint32_t>(std::stoul(row[1])) : 0;
+            info.targetId   = (row[2] != nullptr) ? static_cast<uint32_t>(std::stoul(row[2])) : 0;
+            info.applyName  = (row[3] != nullptr) ? row[3] : "";
+            info.targetName = (row[4] != nullptr) ? row[4] : "";
+            info.sendTime   = (row[5] != nullptr) ? row[5] : "";
+            info.status     = (row[6] != nullptr) ? std::stoi(row[6]) : 0;
+            info.applyMsg   = (row[7] != nullptr) ? row[7] : "";
+            outApplies.push_back(info);
+        }
+        mysql_free_result(result);
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    // retcode 1=查到申请 2=无待处理申请，两者都算调用成功
+    return retCode == 1 || retCode == 2;
+}
+
+bool mysqlconn::callAcceptFriend(uint32_t requestId, uint32_t account, int& retCode,
+                                 FriendBriefInfo& outFriend)
+{
+    retCode = -1;
+    outFriend = FriendBriefInfo{};
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (requestId == 0 || account == 0)
+    {
+        std::cerr << "同意好友申请参数无效" << std::endl;
+        return false;
+    }
+
+    // 过程名为AgreeRequest；成功路径末尾回吐一条2列结果集：user_id, user_name
+    // （新好友刚建立关系，mark 必为''，所以过程不带 remark，这里也留空）
+    const std::string sql = "CALL AgreeRequest(" + std::to_string(requestId)
+                          + ", " + std::to_string(account) + ", @retcode)";
+    // 打印完整语句，可直接复制到 mysql 客户端里逐步排查
+    std::cout << "[AgreeRequest] 执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用同意好友申请过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[AgreeRequest] 失败SQL: " << sql << std::endl;
+        return false;
+    }
+
+    // 失败路径过程直接LEAVE，不产生任何结果集；成功路径才有那一条结果集，
+    // 所以这里逐个消费结果集，遇到带资料的就取走，不能假定结果集一定存在
+    bool captured = false;
+    int nextResult = 0;
+    int resultIndex = 0;
+    do
+    {
+        MYSQL_RES* result = mysql_store_result(mysql);
+        if (result != nullptr)
+        {
+            const unsigned int fieldCount = mysql_num_fields(result);
+            MYSQL_FIELD* fields = mysql_fetch_fields(result);
+            std::cout << "[AgreeRequest] 结果集#" << resultIndex << " 列数=" << fieldCount << " 列名=";
+            for (unsigned int i = 0; i < fieldCount; ++i)
+            {
+                std::cout << (i == 0 ? "" : ",") << fields[i].name;
+            }
+            std::cout << std::endl;
+
+            // 逐行打印，把过程实际吐出来的数据全部暴露出来（便于比对列序与取值）
+            MYSQL_ROW row = nullptr;
+            int rowIndex = 0;
+            while ((row = mysql_fetch_row(result)) != nullptr)
+            {
+                std::cout << "[AgreeRequest] 结果集#" << resultIndex << " 行#" << rowIndex << " : ";
+                for (unsigned int i = 0; i < fieldCount; ++i)
+                {
+                    std::cout << fields[i].name << "="
+                              << (row[i] != nullptr ? row[i] : "NULL") << (i + 1 < fieldCount ? ", " : "");
+                }
+                std::cout << std::endl;
+                ++rowIndex;
+            }
+            // mysql_fetch_row 已把游标走到末尾，需要把结果集内部指针重置后再取第一行
+            mysql_data_seek(result, 0);
+
+            // 过程返回 user_id, user_name 两列；若将来补了 remark 成三列也能兼容
+            if (!captured && fieldCount >= 2)
+            {
+                row = mysql_fetch_row(result);
+                if (row != nullptr)
+                {
+                    outFriend.accountId = (row[0] != nullptr) ? static_cast<uint32_t>(std::stoul(row[0])) : 0;
+                    outFriend.name      = (row[1] != nullptr) ? row[1] : "";
+                    outFriend.remark    = (fieldCount >= 3 && row[2] != nullptr) ? row[2] : "";
+                    captured = true;
+                    std::cout << "[AgreeRequest] 捕获新好友: accountId=" << outFriend.accountId
+                              << ", name=" << outFriend.name
+                              << ", remark=" << outFriend.remark << std::endl;
+                }
+            }
+            else if (!captured)
+            {
+                std::cerr << "[AgreeRequest] 结果集列数不足2列(" << fieldCount
+                          << ")，无法取出新好友资料" << std::endl;
+            }
+            mysql_free_result(result);
+            ++resultIndex;
+        }
+        nextResult = mysql_next_result(mysql);
+    }
+    while (nextResult == 0);
+
+    if (nextResult > 0)
+    {
+        std::cerr << "同意好友申请过程结果集消费失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[AgreeRequest] @retcode=" << retCode << std::endl;
+    if (!captured)
+    {
+        std::cout << "[AgreeRequest] 本次无结果集（多为失败路径或用例无数据）" << std::endl;
+    }
+    std::cout << "[AgreeRequest] 汇总 requestId=" << requestId
+              << ", account=" << account
+              << ", retCode=" << retCode
+              << ", friendId=" << outFriend.accountId
+              << ", friendName=" << outFriend.name
+              << ", remark=" << outFriend.remark << std::endl;
+    return true;
+}
+
+bool mysqlconn::callRejectFriend(uint32_t requestId, uint32_t account, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (requestId == 0 || account == 0)
+    {
+        std::cerr << "拒绝好友申请参数无效" << std::endl;
+        return false;
+    }
+
+    // 过程名为RejectRequest；retcode 1=拒绝成功 2=申请不存在/已处理/无权处理 -1=过程异常
+    const std::string sql = "CALL RejectRequest(" + std::to_string(requestId)
+                          + ", " + std::to_string(account) + ", @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用拒绝好友申请过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[RejectRequest] retCode=" << retCode << std::endl;
+    return true;
+}
+
+bool mysqlconn::callDeleteFriend(uint32_t ownId, uint32_t targetId, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (ownId == 0 || targetId == 0)
+    {
+        std::cerr << "删除好友参数无效" << std::endl;
+        return false;
+    }
+
+    const std::string sql = "CALL DeleteFriend(" + std::to_string(ownId)
+                          + ", " + std::to_string(targetId) + ", @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用删除好友过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[DeleteFriend] retCode=" << retCode << std::endl;
+    return true;
+}
+
+bool mysqlconn::callModifyMark(uint32_t account, uint32_t targetId, const std::string& newMark, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0 || targetId == 0)
+    {
+        std::cerr << "修改备注参数无效" << std::endl;
+        return false;
+    }
+
+    // 备注是用户输入，进SQL前必须转义防注入，不能依赖前端校验
+    std::string escapedMark(newMark.size() * 2 + 1, '\0');
+    const unsigned long escapedLength = mysql_real_escape_string(
+        mysql, escapedMark.data(), newMark.data(), static_cast<unsigned long>(newMark.size()));
+    escapedMark.resize(escapedLength);
+
+    const std::string sql = "CALL ModifyMark(" + std::to_string(account)
+                          + ", " + std::to_string(targetId)
+                          + ", '" + escapedMark + "', @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用修改备注过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[ModifyMark] retCode=" << retCode << std::endl;
+    return true;
+}
+
+bool mysqlconn::callLoadOldFriend(uint32_t account, std::vector<FriendBriefInfo>& outContacts, int& retCode)
+{
+    outContacts.clear();
+    retCode = 0;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0)
+    {
+        std::cerr << "查询好友列表失败：账号无效" << std::endl;
+        return false;
+    }
+
+    const std::string sql = "CALL LoadOldFriend(" + std::to_string(account) + ", @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用加载好友列表过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    // 结果集列顺序：account_id, name, remark, create_time
+    // 昵称与备注都由过程联表user直接带出，dbuser没有SELECT权限，必须依赖过程
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result != nullptr)
+    {
+        const unsigned int fieldCount = mysql_num_fields(result);
+        if (fieldCount < 4)
+        {
+            std::cerr << "加载好友列表结果集列数异常: " << fieldCount << std::endl;
+            mysql_free_result(result);
+            return false;
+        }
+        MYSQL_ROW row = nullptr;
+        while ((row = mysql_fetch_row(result)) != nullptr)
+        {
+            FriendBriefInfo info;
+            info.accountId  = (row[0] != nullptr) ? static_cast<uint32_t>(std::stoul(row[0])) : 0;
+            info.name       = (row[1] != nullptr) ? row[1] : "";
+            info.remark     = (row[2] != nullptr) ? row[2] : "";
+            info.createTime = (row[3] != nullptr) ? row[3] : "";
+            outContacts.push_back(info);
+        }
+        mysql_free_result(result);
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    // retcode 1=查到好友 2=无好友，两者都算调用成功
+    return retCode == 1 || retCode == 2;
+}
+
+bool mysqlconn::callSearchUser(uint32_t account, std::vector<UserBriefInfo>& outUsers, int& retCode)
+{
+    outUsers.clear();
+    retCode = 0;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0)
+    {
+        std::cerr << "搜索用户失败：账号无效" << std::endl;
+        return false;
+    }
+
+    const std::string sql = "CALL SearchUser(" + std::to_string(account) + ", @retcode)";
+    std::cout << "执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用搜索用户过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    // 第一个结果集列顺序：user_id, user_name, create_time
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result != nullptr)
+    {
+        const unsigned int fieldCount = mysql_num_fields(result);
+        if (fieldCount < 3)
+        {
+            std::cerr << "搜索用户结果集列数异常: " << fieldCount << std::endl;
+            mysql_free_result(result);
+            return false;
+        }
+        MYSQL_ROW row = nullptr;
+        while ((row = mysql_fetch_row(result)) != nullptr)
+        {
+            UserBriefInfo info;
+            info.userId     = (row[0] != nullptr) ? static_cast<uint32_t>(std::stoul(row[0])) : 0;
+            info.userName   = (row[1] != nullptr) ? row[1] : "";
+            info.createTime = (row[2] != nullptr) ? row[2] : "";
+            outUsers.push_back(info);
+        }
+        mysql_free_result(result);
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    // retcode 1=查到用户 2=未找到，两者都算调用成功
+    return retCode == 1 || retCode == 2;
+}
+
+bool mysqlconn::callModifyName(uint32_t account, const std::string& newName, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (account == 0)
+    {
+        std::cerr << "修改用户名参数无效" << std::endl;
+        return false;
+    }
+
+    // 用户名是用户输入，进SQL前必须转义防注入
+    std::string escapedName(newName.size() * 2 + 1, '\0');
+    const unsigned long escapedLength = mysql_real_escape_string(
+        mysql, escapedName.data(), newName.data(), static_cast<unsigned long>(newName.size()));
+    escapedName.resize(escapedLength);
+
+    const std::string sql = "CALL ModifyName(" + std::to_string(account)
+                          + ", '" + escapedName + "', @retcode)";
+    std::cout << "执行修改用户名存储过程, account=" << account << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用修改用户名过程失败: " << mysql_error(mysql) << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[ModifyName] retCode=" << retCode << std::endl;
+    return true;
+}
+
+bool mysqlconn::callLoadDelFriendEvent(uint32_t userId, std::vector<DelFriendEventInfo>& outEvents, int& retCode)
+{
+    outEvents.clear();
+    retCode = 0;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (userId == 0)
+    {
+        std::cerr << "拉取删除墓碑失败：账号无效" << std::endl;
+        return false;
+    }
+
+    // 入参是"当前登录账号"，过程内部是 WHERE target_id = user_id，
+    // 即查出所有"别人删掉了我"的事件，返回该事件的删除者(send_id)
+    const std::string sql = "CALL LoadDelFriendEvent(" + std::to_string(userId) + ", @retcode)";
+    std::cout << "[LoadDelFriendEvent] 执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用加载删除墓碑过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[LoadDelFriendEvent] 失败SQL: " << sql << std::endl;
+        return false;
+    }
+
+    // 结果集列顺序：send_id, target_id
+    MYSQL_RES* result = mysql_store_result(mysql);
+    if (result != nullptr)
+    {
+        const unsigned int fieldCount = mysql_num_fields(result);
+        if (fieldCount < 2)
+        {
+            std::cerr << "加载删除墓碑结果集列数异常: " << fieldCount << "（期望2列）" << std::endl;
+            mysql_free_result(result);
+            return false;
+        }
+        MYSQL_ROW row = nullptr;
+        while ((row = mysql_fetch_row(result)) != nullptr)
+        {
+            DelFriendEventInfo info;
+            info.sendId   = (row[0] != nullptr) ? static_cast<uint32_t>(std::stoul(row[0])) : 0;
+            info.targetId = (row[1] != nullptr) ? static_cast<uint32_t>(std::stoul(row[1])) : 0;
+            outEvents.push_back(info);
+        }
+        mysql_free_result(result);
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[LoadDelFriendEvent] account=" << userId
+              << ", 墓碑数=" << outEvents.size()
+              << ", retCode=" << retCode << std::endl;
+    return true;
+}
+
+bool mysqlconn::callClearDeleteCache(uint32_t sendId, uint32_t targetId, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (sendId == 0 || targetId == 0)
+    {
+        std::cerr << "清除删除墓碑失败：参数无效" << std::endl;
+        return false;
+    }
+
+    // 过程一次只清一条，入参顺序是 (发起删除的人, 被删的人)，
+    // 所以第一个传墓碑里的发起者 sendId，第二个传本人账号 targetId
+    const std::string sql = "CALL Clear_delete_cache(" + std::to_string(sendId)
+                          + ", " + std::to_string(targetId) + ", @retcode)";
+    std::cout << "[Clear_delete_cache] 执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用清除删除墓碑过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[Clear_delete_cache] 失败SQL: " << sql << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[Clear_delete_cache] sendId=" << sendId
+              << ", targetId=" << targetId
+              << ", retCode=" << retCode << std::endl;
+    return true;
+}
+
