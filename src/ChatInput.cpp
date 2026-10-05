@@ -8,6 +8,8 @@ ChatInput::ChatInput(QWidget *parent) : QWidget(parent)
 {
     // 外层只放一个 FrameBox：功能按钮行 + 输入框 + 发送按钮行 三块全在框里，
     // 输入框长高时是这个框整体向上长（顶边抬升、底边贴死窗口底），不是各块各自挤
+    // （"向上长"的机关不在本文件，在父布局 ChatArea::mainLayout：scrollArea stretch=1 在前、
+    //   chatInput stretch=0 在最后 → 底边锚死窗口底不动，详见 ChatArea.cpp）
     QVBoxLayout* outerLayout = new QVBoxLayout(this);
     outerLayout->setContentsMargins(15, 0, 15, 15);   // 左右和底部留边，顶部贴着聊天记录区
     outerLayout->setSpacing(0);
@@ -218,14 +220,14 @@ bool ChatInput::eventFilter(QObject* watched, QEvent* event)
     if (event->type() == QEvent::InputMethod) {
         QInputMethodEvent* imeEvent = static_cast<QInputMethodEvent*>(event);//把event向下转型
         m_imeComposing = !imeEvent->preeditString().isEmpty();//判断是不是在组字，`preeditString()` 返回 当前还没上屏的组字内
-        return QWidget::eventFilter(watched, event);
+        return QWidget::eventFilter(watched, event);//调用父类的事件Filter方法，放行事件
     }
 
     if (event->type() != QEvent::KeyPress) {
         return QWidget::eventFilter(watched, event);
     }
 
-    QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
+    QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);//把event向下转型
 
     // 主键盘的回车是 Key_Return、小键盘的回车是 Key_Enter，两个都得认
     const bool isEnterKey = keyEvent->key() == Qt::Key_Return
@@ -240,11 +242,79 @@ bool ChatInput::eventFilter(QObject* watched, QEvent* event)
     }
 
     // 2) 长按回车不重复发送，否则按住不放会刷出一串消息
-    if (keyEvent->isAutoRepeat()) {
+    if (keyEvent->isAutoRepeat()) //判断是不是重复发的
+    {
         return true;
     }
 
     // 3) Shift + 回车 = 换行：放行，QTextEdit 自己会插入一个换行
+    //补一个知识点:每次键盘按下按键时，会触发一个事件，这个事件包含"主键是谁(key)"和"当时按着哪些修饰键(modifiers)"两个信息
+    //修饰键（Shift/Ctrl/Alt）是"状态键"：按住期间系统一直维护它的状态；再按另一个键时会产生新事件，事件 = 主键 + 当时的修饰键状态快照
+    //所以 Shift+回车 一共两个事件：事件1的主键是 Shift，事件2的主键是回车(带 Shift 状态)；我们处理的是事件2
+    /*
+     * ── 知识点总结：组合键 / modifiers / 位掩码 ───────────────────────────
+     *
+     * 【一、键盘事件的机制】
+     *  1. 每个物理键按下都会产生一个独立的 KeyPress 事件（Shift 自己也有事件），
+     *     并不是"组合键只发一个事件"。
+     *  2. 修饰键（Shift / Ctrl / Alt）特殊在它是"状态键"：从按下到松开这段时间，
+     *     系统一直维护着"它是按下"这个状态（跟按得久不久无关，是"按住期间"）。
+     *  3. 每当产生一个按键事件，系统都会把"此刻的修饰键状态快照"一起打包发出。
+     *  4. 所以 Shift+回车 物理上是两个事件：
+     *       事件1：key=Key_Shift,  modifiers=ShiftModifier   （Shift 自己的事件）
+     *       事件2：key=Key_Return, modifiers=ShiftModifier   （回车事件，带上了 Shift 状态）
+     *     我们真正要处理的是事件2，它才是"回车"。
+     *
+     * 【二、modifiers() 是位掩码】
+     *  QKeyEvent 里两个字段互不相关：
+     *       key()       → 这次按的主键是谁（Key_Return / Key_A ...）
+     *       modifiers() → 当时按住了哪些修饰键（一个位掩码）
+     *  修饰键的值都是 2 的幂，一位一个键，互不重叠：
+     *       ShiftModifier   = 0x02000000（第25位）
+     *       ControlModifier = 0x04000000（第26位）
+     *       AltModifier     = 0x08000000（第27位）
+     *  同时按多个就是把对应的位"或"起来，例如 Shift+Ctrl = 0x06000000。
+     *  用位掩码的原因：修饰键能同时按好几个，普通单值枚举表示不了组合。
+     *
+     * 【三、为什么用 & 而不是 ==】
+     *  & 是"按位与"：只保留两个数同为 1 的位 —— 用来"筛出某一位有没有置上"。
+     *       0x06000000 & 0x02000000 = 0x02000000  非0 → 按了 Shift ✅
+     *       0x04000000 & 0x02000000 = 0x00000000  为0  → 没按 Shift ❌
+     *  if() 里非 0 即 true，所以：
+     *       if (keyEvent->modifiers() & Qt::ShiftModifier)   // 含 Shift 即命中
+     *  ⚠ 绝不能用 ==：== 要求"不多不少正好相等"。
+     *     一旦多按了别的键（如 Shift+Ctrl+回车），modifiers 变成 0x06000000，
+     *     此时 == Qt::ShiftModifier 为 false → 换行失效，回车被误当成发送。
+     *  规则：判断修饰键一律用 &，永远不用 ==。
+     *
+     * 【四、主键 vs 修饰键：看"角色"，不看"按下先后"】
+     *  主键   = 这次按键操作的【目标键】，自身带动作（打字 / 发送 / 换行）
+     *  修饰键 = 【专门用来修饰别人的键】，自身无动作，只为改变主键的含义
+     *  ⚠ 按下先后 ≠ 主次！Shift 总是先按，但它只是"服务角色"：
+     *     单按 Shift 不打字、不发送、不换行，它存在的意义就是"给下一个键贴标签"。
+     *     类比"红色的苹果"：'红色的'先说出口，但中心词是'苹果'。
+     *  注意：每个事件各有自己的主键：
+     *     按 Shift 产生【事件1】：主键 = Shift（key=Key_Shift）
+     *        —— 但它 key 不是回车，在第一关就被放行，我们不处理它
+     *     按 Enter 产生【事件2】：主键 = Enter（key=Key_Return），Shift 降级为 modifiers 标记
+     *        —— 这才是我们要处理的事件
+     *  所以代码"先判 key() 再判 modifiers()" = 先确认主键是回车，再问它带不带 Shift 标记。
+     *
+     * 【五、放行 ≠ 换行】
+     *  eventFilter 里的 `return QWidget::eventFilter(...)`（false）只表示"不拦截"，
+     *  它本身【不会】产生 '\n'。换行是控件的"原本事件函数"干的：
+     *      QTextEdit 自带 keyPressEvent：收到回车 → 往文档里插入一个 '\n'
+     *  两个函数的分工：
+     *      ChatInput::eventFilter（我们写的，外挂过滤器）→ 先跑，只决定"拦 / 放"
+     *      QTextEdit::keyPressEvent（Qt 自带，控件本能）→ 后跑，按事件类型处理：
+     *          收到【回车事件】  → 插入 '\n'（换行）
+     *          收到【输入法事件】→ 更新预编辑串（候选），与 '\n' 无关
+     *  所以同样是"放行"，结果不同 —— 取决于放行过去的是什么事件。
+     *  本段代码正是靠这个分工：
+     *      普通回车   → return true  【抢过来】当发送（QTextEdit 收不到，故不插 '\n'）
+     *      Shift+回车 → return false 【不抢】还给 QTextEdit，保持它天性的换行
+     *  一句话：Shift+回车能换行，本质是"没有去抢 QTextEdit 的默认行为"。
+     */
     if (keyEvent->modifiers() & Qt::ShiftModifier) {
         return QWidget::eventFilter(watched, event);
     }
@@ -302,3 +372,4 @@ void ChatInput::adjustHeight()
     heightAnimMin->start();
     heightAnimMax->start();
 }
+

@@ -82,6 +82,7 @@ void ContactList::setContacts(const QList<ContactInfo>& contacts)//把后端给�
     {
         QListWidgetItem* item = new QListWidgetItem(listWidget);
         item->setData(Qt::UserRole, contact.id);//给这一行藏一个好友 ID点击这一行时，就能知道是哪个联系人。
+        // UserRole : 是槽位编号
         item->setSizeHint(QSize(0, 62));
 
         QWidget* container = new QWidget();//创建一个容器，用来装所有的子控件
@@ -184,7 +185,18 @@ void ContactList::onItemClicked(QListWidgetItem* item)//用户点击了列表里
 {
     QString contactId = item->data(Qt::UserRole).toString();//获取点击的项的用户角色数据(联系人ID)
     
+    
     QWidget* widget = listWidget->itemWidget(item);//获取点击的项对应的 QWidget
+    // 先判空：itemWidget() 在「这一行没调过 setItemWidget」时会返回 nullptr，
+    // 而下一行的 widget->layout() 会直接解引用它 —— 空指针解引用当场崩溃。
+    // 注意 qobject_cast 救不了这种情况：函数参数要先求值，轮到它时已经崩了
+    if (!widget) {
+        return;
+    }
+    // 再校验布局。为什么非要运行时查：onItemClicked 是信号槽回调，item 由 Qt 运行时递进来，
+    // 编译期管不了它的内部结构；而下面的代码是「盲走下标」(itemAt(1)/itemAt(0))，
+    // 一旦结构不符合 setContacts 里造的约定，itemAt 越界只返回 nullptr 而不抛异常，
+    // 紧接着 ->widget() 就又是空指针解引用 → 崩溃。所以校验和取下标必须成对写
     QHBoxLayout* hLayout = qobject_cast<QHBoxLayout*>(widget->layout());//获取 QWidget 的水平布局
     if (!hLayout) {
         return;
