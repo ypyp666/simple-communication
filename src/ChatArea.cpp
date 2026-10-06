@@ -100,7 +100,7 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent)
     // m_loadingOlder 防重复：一次翻页期间滚动条可能多次停在顶上（插入前内容少时本来就在顶），
     // 不挡的话同一页会连发好几遍请求
     connect(scrollArea->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
-        if (value <= 0 && !m_loadingOlder) {
+        if (value <= 0 && !m_loadingOlder) {//value小于等于0就是说明已经顶到顶了
             emit loadOlderMessages();
         }
     });
@@ -108,7 +108,7 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent)
 
 // 单条消息 → [气泡+时间标签] 对。追加（atTop=false，插在 stretch 前）和
 // 前插（atTop=true，插在布局最前面）共用这一份，时间标签保持在气泡下方，顺序与原来一致
-void ChatArea::appendMessageWidgets(const MessageInfo& message, bool atTop)
+void ChatArea::appendMessageWidgets(const MessageInfo& message, bool atTop, int& frontIndex)
 {
     MessageItem* item = new MessageItem(message, this);
     m_messageItems.insert(message.id, item);  // 记录 消息ID→Item，供发送状态切换使用
@@ -120,20 +120,23 @@ void ChatArea::appendMessageWidgets(const MessageInfo& message, bool atTop)
     timeLabel->setAlignment(Qt::AlignCenter);
 
     if (atTop) {
-        // 前插：先插气泡到 index 0，再插时间标签到 index 1（时间在气泡下方），
+        // 前插：气泡插到本页的当前位置，时间标签紧跟其后（在气泡下方），页内按旧→新往后排，
         // 布局末尾的 stretch 不受影响，原有内容整体顺延
-        messagesLayout->insertWidget(0, item);
-        messagesLayout->insertWidget(1, timeLabel);
-    } else {
-        // 追加：都插在 stretch 之前（count()-1 是 stretch 的位置）
-        messagesLayout->insertWidget(messagesLayout->count() - 1, item);
-        messagesLayout->insertWidget(messagesLayout->count() - 1, timeLabel);
+        messagesLayout->insertWidget(frontIndex, item);
+        messagesLayout->insertWidget(frontIndex + 1, timeLabel);
+        frontIndex += 2;  // 直接改调用方那个变量：气泡+时间标签占两个坑，下一对往后排
+        return;
     }
+
+    // 追加：都插在 stretch 之前（count()-1 是 stretch 的位置），追加到最新消息后面
+    messagesLayout->insertWidget(messagesLayout->count() - 1, item);
+    messagesLayout->insertWidget(messagesLayout->count() - 1, timeLabel);
 }
 
 void ChatArea::addMessage(const MessageInfo& message, bool scrollToBottom)
 {
-    appendMessageWidgets(message, false);
+    int frontIndex = 0;  // 追加路径不走 frontIndex，占位传入
+    appendMessageWidgets(message, false, frontIndex);
 
     if (!scrollToBottom) {
         return;  // 前插历史消息时不滚底（prependMessages 自己维护滚动位置）
@@ -154,12 +157,19 @@ void ChatArea::addMessage(const MessageInfo& message, bool scrollToBottom)
 // 用户视觉上原地不动——否则插完会直接跳到新插入的内容上，像被人拽着往上翻
 void ChatArea::prependMessages(const QList<MessageInfo>& messages)
 {
-    QScrollBar* scrollBar = scrollArea->verticalScrollBar();
+    //QcrollBar的value: 滚动条当前位置视口顶边距离内容顶边的像素数
+//value概念解释：视口是可视区域，内容是所有消息是一个超长的列表，滚动条值是视口顶部距离内容顶部的像素数，value=0是视口顶部在内容顶部,value=80是视口顶部距离内容顶部向下偏移了80像素
+//maximum: 滚动条最大值，滚动条最大值是内容高度减去视口高度，就是可以向下滚动的最大值
+//maximum是派生出来的每次布局都会重新计算,value是自由值是我们自己设置的
+    QScrollBar* scrollBar = scrollArea->verticalScrollBar();//
     const int oldMax = scrollBar ? scrollBar->maximum() : 0;
     const int oldValue = scrollBar ? scrollBar->value() : 0;
 
+    // 前插位置下标：放在"页"这一层（本函数一次调用 = 一页），局部变量天然每页从 0 开始，
+    // 页内按旧→新依次往后排；跨页不会残留——若做成成员变量，第 3 页会被插到第 2 页块的下方，顺序反而全反了
+    int frontIndex = 0;
     for (const auto& msg : messages) {
-        appendMessageWidgets(msg, true);
+        appendMessageWidgets(msg, true, frontIndex);
     }
 
     if (scrollBar) {

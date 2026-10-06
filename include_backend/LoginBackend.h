@@ -12,9 +12,20 @@ class LoginBackend : public QObject
 public:
     explicit LoginBackend(QObject* parent = nullptr, TcpClient* tcpclient = nullptr);
     ~LoginBackend();
+    // 登录成功后由主后端同步当前登录账号（与 ChatBackend / ContactBackend 同一套规则：
+    // 各功能后端各留一份自己的账号，谁要用谁直接用，不再跨层去问主后端）
+    void setUserId(const QString& userId);
+    // 登出：把本后端存的当前账号清成空白（预留的口，真正登出流程接入时由主后端调用）
+    void clearUserId();
     void onTcpDataReceived(const QByteArray& data);
     void startLogin(const QString& accountId, const QString& password);
     void ModifyPwdAquird(const QString& account, const QString& newPassword);
+    // 手里有没有会话令牌（登录成功时服务器下发的）。MainBackend 在重连后
+    // 靠它决定"还能不能把会话补回来"——没有令牌就没得补，只能请用户重新登录
+    bool hasToken() const { return !m_token.isEmpty(); }
+    // 断线重连登录：连接恢复后把令牌发给服务器换回登录态（不发账号密码——
+    // 令牌才是"这次会话"的凭据）。结果走 reconnectLoginSuccess / reconnectLoginFailed
+    void sendReconnectLoginRequest();
     // 注册第一段：注册页一显示就发起 TCP 连接，向服务器索取账号 ID（这就是"注册请求/取号"）。
     // 此时用户还没填密码，提交请求发不出去，所以这里只负责把连接拉起来
     void connectForRegister();
@@ -47,6 +58,10 @@ signals:
     void loginNetworkError(const QString& reason);  // 网络层连不上（连接被拒/断网等），与密码错误分开提示
     void loginWaiting();
     void loginTimeout();
+    // 断线重连登录的结果（重连成功后自动走，不经过用户）：
+    // 成功 = 会话恢复，主后端接着补拉数据；失败 = 令牌失效，请用户重新登录
+    void reconnectLoginSuccess();
+    void reconnectLoginFailed();
     void connectForRegisterSuccess(const QString& account);  // 注册取号连接成功，服务器下发的账号 ID 随信号带回
     void connectForRegisterFailed();
     void connectForRegisterTimeout();
@@ -82,6 +97,9 @@ private:
     void stopResponseTimer();
 
     TcpClient* m_tcpClient;
+    QString m_userid;       // 当前登录账号 ID（登录成功后由主后端写入，登出清空）
+    QString m_token;        // 会话令牌：登录响应下发，断线重连时用它换回登录态。
+                            // 只存内存、不落盘（用户拍板）——程序重启就等于重新登录
     QString m_accountId;
     QString m_password;
     QString m_newPassword;  // 修改密码时的新密码（登录密码用 m_password，二者分开存）

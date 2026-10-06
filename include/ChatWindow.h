@@ -9,7 +9,7 @@
 #include <QHBoxLayout>//提供一个水平布局管理器
 #include <QVBoxLayout>//提供一个垂直布局管理器
 #include <QMap>
-#include "ContactList.h"
+#include "MessageList.h"
 #include "ChatArea.h"
 
 class MainBackend;//前置声明：头文件只需指针，无需完整定义
@@ -23,12 +23,26 @@ public:
     //parent 是父类指针，QWidget是ChatWindow的父类，QWidget的构造函数的参数是parent指针，用于设置子类的父类
     //不设置的话会报错
     ~ChatWindow();
+
+    // 会话列表控件（左侧那一栏）。对外只暴露指针：MainWindow 拿到通讯录数据后，
+    // 顺手把"ID→名字"喂给它做兜底显示（会话表的名字靠 LEFT JOIN contacts 补，
+    // 库里查不到名字时用这份内存名字顶上），不额外查一次库
+    MessageList* conversationList() const { return messageList; }
+
+public slots:
+    // 从联系人页双击 / 右键"打开会话"进来：切到该联系人的会话。
+    // 声明为 slot（而非普通成员函数）：MainWindow 通过信号连过来，
+    // 跨页面只走信号槽，不做"A 页面直接调 B 页面方法"的抄近路
+    void openConversation(const QString& contactId, const QString& contactName);
+    // 会话列表右键"删除会话"：删本地会话快照（聊天记录保留）；删的若是当前打开的会话，聊天区一并收尾。
+    // 声明为 public slot（同 openConversation）：主界面在"删好友成功"时也连到这里复用同一套收尾逻辑
+    void onDeleteConversation(const QString& contactId);
 //qt里最重要的就是槽机制其直观表现就是信号函数被signal宏定义，槽函数被slot宏定义
 //信号函数可以被多个槽函数连接，槽函数也可以被多个信号函数连接,相当于广播机制
 //信号函数发出广播后，所有连接的槽函数都会被调用，每个槽函数可以处理信号的参数，这个依赖于Qt的元对象管理器QMetaObject
 //纯g++编译器看不懂必须借助Qt的元对象管理器QMetaObject来处理信号槽机制，还要通过MOC这个Qt自带的元对象编译器翻译成C++的语法
 private slots://slots声明的函数可以接受其他对象发出的信号
-    void onContactsLoaded(const QList<ContactInfo>& contacts);//联系人列表加载完成后，更新左侧界面
+    void onConversationsLoaded(const QList<ConversationInfo>& conversations);//会话列表加载完成后，更新左侧界面
     // 分页查询结果到达：page==1 清空重放（刚点开联系人），page>1 前插（翻更早历史）
     void onMessagesPageLoaded(const QString& contactId, int page,
                               const QList<MessageInfo>& messages, bool hasMore);
@@ -51,7 +65,7 @@ private slots://slots声明的函数可以接受其他对象发出的信号
 
 private:
     QHBoxLayout* mainLayout;//左右分栏的大布局
-    ContactList* contactList;//联系人列表
+    MessageList* messageList;//会话列表（头像+最后消息+未读数，数据是 ConversationInfo）
     QWidget* chatPanel;//聊天面板
     QVBoxLayout* chatPanelLayout;//聊天面板的垂直布局
     ChatArea* chatArea;//聊天区域（包含输入框）

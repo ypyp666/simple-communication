@@ -33,16 +33,16 @@ ChatWindow::ChatWindow(QWidget *parent, MainBackend* backendPtr) : QWidget(paren
     mainLayout->setContentsMargins(0, 0, 0, 0);//设置布局的内边距上下左右为0
     mainLayout->setSpacing(0);
 
-    contactList = new ContactList(this);
-    contactList->setFixedWidth(280);
-    contactList->setStyleSheet(R"(/*用了R“()”后在括号内可以让你能够按照CSS/HTML一样写样式不用转义字符串*/
-    ContactList {
+    messageList = new MessageList(this);
+    messageList->setFixedWidth(280);
+    messageList->setStyleSheet(R"(/*用了R“()”后在括号内可以让你能够按照CSS/HTML一样写样式不用转义字符串*/
+    MessageList {
         background-color: rgba(245, 245, 245, 0.43);
         border-right: 1px solid rgba(224, 224, 224, 0.58);/*设置右边分割线*/
         border-radius: 0px;/*圆角*/
     }
 )");
-    mainLayout->addWidget(contactList);
+    mainLayout->addWidget(messageList);
 
     // QFrame：带边框/面板的基础容器（QWidget子类）
     // 核心用途：1. 给控件加边框/背景/3D效果；2. 视觉分组（包一组控件）；3. 快速做水平/垂直分隔线
@@ -95,8 +95,8 @@ ChatWindow::ChatWindow(QWidget *parent, MainBackend* backendPtr) : QWidget(paren
 //   3. 接口、函数、信号槽连接方式 100% 复用
 */
 
-// 1. 后端加载完联系人 → 主窗口显示联系人列表
-connect(backend, &MainBackend::contactsLoaded, this, &ChatWindow::onContactsLoaded);
+// 1. 后端加载完会话列表 → 主窗口显示到左侧 MessageList
+connect(backend, &MainBackend::conversationsLoaded, this, &ChatWindow::onConversationsLoaded);
 
 // 2. 后端分页查询完消息 → 主窗口显示聊天记录（page/hasMore 用于翻历史）
 connect(backend, &MainBackend::messagesPageLoaded, this, &ChatWindow::onMessagesPageLoaded);
@@ -105,7 +105,10 @@ connect(backend, &MainBackend::messagesPageLoaded, this, &ChatWindow::onMessages
 connect(chatArea, &ChatArea::loadOlderMessages, this, &ChatWindow::onLoadOlderMessages);
 
 // 3. 点击左侧联系人 → 主窗口切换当前聊天对象
-connect(contactList, &ContactList::contactSelected, this, &ChatWindow::onContactSelected);
+connect(messageList, &MessageList::contactSelected, this, &ChatWindow::onContactSelected);
+
+// 3.1 会话列表右键"删除会话" → 删本地会话快照并刷新列表
+connect(messageList, &MessageList::deleteConversationRequested, this, &ChatWindow::onDeleteConversation);
 
 // 4. 输入框发送消息 → 主窗口交给后端发送（通过ChatArea转发）
 connect(chatArea, &ChatArea::sendMessage, this, &ChatWindow::onSendMessage);
@@ -127,9 +130,19 @@ connect(backend, &MainBackend::messageSendSuccess, this, &ChatWindow::onMessageS
 connect(backend, &MainBackend::messageReceived, this, &ChatWindow::onMessageReceived);
 // 9. 后端接收失败 → 触发拉取，UI提示（可选）
 connect(backend, &MainBackend::messageReceiveFailed, this, &ChatWindow::onMessageReceiveFailed);
-// 程序启动 → 立即加载联系人列表
-backend->loadContacts();
+// 注：会话列表 / 通讯录的拉取已移到 MainWindow::initPages() 末尾统一触发。
+// 原因：数据是异步从本地库拉的，且 ContactWindow 比本窗口建得晚，
+// 在构造函数里拉会让联系人页收不到 contactsLoaded（列表空白）
 // ============================================================================
+}
+
+// 联系人页双击条目 / 右键"打开会话" → 切到该联系人的会话。
+// 复用 onContactSelected 的全部既有逻辑：草稿按联系人 ID 存取、聊天区标题、
+// 显示输入框、分页复位、拉最新一页消息 —— 行为与"手动点会话列表"完全一致
+void ChatWindow::openConversation(const QString& contactId, const QString& contactName)
+{
+    messageList->highlightContact(contactId);   // 先做视觉高亮（纯视觉，不发信号）
+    onContactSelected(contactId, contactName);
 }
 
 ChatWindow::~ChatWindow()
@@ -137,9 +150,15 @@ ChatWindow::~ChatWindow()
     // backend 由外部（main.cpp 全局实例）持有，此处不删除
 }
 
-void ChatWindow::onContactsLoaded(const QList<ContactInfo>& contacts)
+void ChatWindow::onConversationsLoaded(const QList<ConversationInfo>& conversations)
 {
-    contactList->setContacts(contacts);//槽函数接收到联系人列表，设置到联系人列表控件
+    messageList->setConversations(conversations);//槽函数接收到会话列表，设置到会话列表控件
+    // setConversations 是"清空重建"，选中的行会被一起清掉；而重拉列表现在很频繁
+    // （发消息、收消息、切会话都会重拉一次），不补这一步的话看起来就像"没选中任何会话"。
+    // 行位置按时间排过序会变，所以只能按 ID 把当前会话找回来，不能记行号
+    if (!currentContactId.isEmpty()) {
+        messageList->highlightContact(currentContactId);
+    }
 }
 
 void ChatWindow::onMessagesPageLoaded(const QString& contactId, int page,
@@ -148,6 +167,10 @@ void ChatWindow::onMessagesPageLoaded(const QString& contactId, int page,
     // 结果比对：查询是异步的，快速切换联系人时，上一个联系人的慢结果
     // 可能比新联系人的还晚回来——不是当前联系人的直接丢弃
     if (contactId != currentContactId) {
+        // 结果作废，但这次请求本身已经结束，必须复位"加载中"标志：
+        // 不复位它会永远停在 true，而 ChatArea 的滚顶防重复判断（!m_loadingOlder）
+        // 会一直挡住新请求 —— 切一次联系人，该联系人历史就再也翻不动了
+        chatArea->setLoadingOlder(false);
         return;
     }
 
@@ -185,21 +208,50 @@ void ChatWindow::onContactSelected(const QString& contactId, const QString& cont
         QString inputContent = chatArea->getInputContent();
         backend->saveInputContent(currentContactId, inputContent);
     }
-    
     currentContactId = contactId;//用新选中的好友ID覆盖旧值（执行完这句，currentContactId 才指向新联系人）
     currentContactName = contactName;//同上，覆盖为新的好友名称
     chatArea->setContactName(contactName);//设置到聊天区域控件
     chatArea->setInputVisible(true);  // 选择联系人后显示输入框
-    
-    // 恢复新联系人的输入内容
-    QString savedContent = backend->getInputContent(contactId);
-    chatArea->setInputContent(savedContent);
 
+    // 打开会话时刷新这条会话的快照：最后消息 / 时间对齐到 messages 里真正最新的那条，
+    // 没有历史记录就退回空摘要 + 当前时间；库里还没有这条会话，DB 层会自动补插一条。
+    // 交给 DB 用一条 SQL（相关子查询）算完，UI 不做"先查一次 messages 再拼快照"的两趟往返
+    backend->refreshConversationSnapshot(contactId);
+
+    // 恢复该联系人的输入草稿：输入内容是按联系人 ID 记忆的，与"有没有会话"无关
+    chatArea->setInputContent(backend->getInputContent(contactId));
+    // 打开就算读过了：把这条会话的未读清零（左侧列表那个红点数字随之消失）。
+    // 会话还不存在时这条 UPDATE 命中 0 行，等于空操作，无需先判断
+    backend->clearConversationUnread(contactId);
+
+    // 上面动了会话表（刷快照 / 清未读），重拉一次会话列表：
+    // setConversations 会按时间重排重建，新行出现、摘要与时间变正确、红点消失都靠它
+    backend->loadConversations();
+    
     // 分页状态复位：先关 m_hasMore 再发请求——切换瞬间聊天区内容被清空，
     // 滚动条归零会触发 loadOlderMessages，不关的话会拿新联系人的 ID 去翻旧页码
     m_currentPage = 1;
     m_hasMore = false;
     backend->loadMessages(contactId, 1);//加载该联系人最新一页消息（50条），翻历史由滚顶触发
+}
+
+// 会话列表右键"删除会话"：只删 conversations 表里那条"会话快照"，
+// messages 表里的聊天记录一律不动——与 QQ/微信一致：清掉列表里的这条对话，历史仍在
+void ChatWindow::onDeleteConversation(const QString& contactId)
+{
+    backend->deleteConversation(contactId);
+
+    // 删的正是当前打开的那个会话：聊天区一并收尾，别留着一个"左侧列表里已经没有"的对话。
+    // currentContactId 清空后回到"未选联系人"态，下次点会话会重新走 onContactSelected
+    if (currentContactId == contactId) {
+        currentContactId.clear();
+        currentContactName.clear();
+        chatArea->clearMessages();
+        chatArea->setInputVisible(false);   // 未选联系人时隐藏输入框（全局约定）
+    }
+
+    // 重拉会话列表：setConversations 是清空重建，删掉的那一行随之消失
+    backend->loadConversations();
 }
 
 void ChatWindow::onSendMessage(const QString& content)
@@ -223,6 +275,11 @@ void ChatWindow::onSendMessage(const QString& content)
     chatArea->addMessage(message);
     // 显示发送等待动画（气泡左侧旋转圆圈），后端超时/成功信号到达后再切换
     chatArea->setMessageStatus(message.id, MessageStatusIndicator::Sending);
+
+    // 会话快照跟着更新：最后消息 = 刚发的这条，时间 = 这条消息的时间。
+    // 自己发的不算未读，所以 increaseUnread=false —— 只改最后消息和时间，未读保持原样
+    backend->updateConversationMessage(currentContactId, content, message.sendTime, false);
+    backend->loadConversations();   // 重拉会话列表：摘要/时间/排序立刻跟上
 
        
     // 发送成功后清除记忆的输入内容
@@ -263,13 +320,18 @@ void ChatWindow::onMessageReceived(const MessageInfo& message)
 {
     // 拷贝一份，避免改 const 引用的原始数据；拷贝是值类型深拷贝，安全
     MessageInfo msg = message;
-    if (msg.contactId == currentContactId) {
+    const bool isCurrentConversation = (msg.contactId == currentContactId);
+    if (isCurrentConversation) {
         msg.isRead = true;          // 正在看当前联系人 → 标记已读
         chatArea->addMessage(msg);  // 显示气泡
     }
     // 当前联系人=已读(true)，非当前=未读(false)（留给未读计数用）
     // 用本地已读状态重新存库，覆盖 MainBackend 里 isRead=false 的那次
     backend->saveMessage(msg);
+    // 会话快照跟着更新：最后消息/时间照改；只有"不是当前正开着的会话"才把未读 +1
+    // （当前会话用户正看着，不累加红点）
+    backend->updateConversationMessage(msg.contactId, msg.content, msg.sendTime, !isCurrentConversation);
+    backend->loadConversations();   // 重拉会话列表：摘要/时间/排序/红点立刻跟上
 }
 
 // 后端接收失败 → 触发拉取，UI提示（可选，你来补具体提示）

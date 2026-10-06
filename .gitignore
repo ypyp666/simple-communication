@@ -29,8 +29,8 @@ ChatPackage/
 .DS_Store
 Thumbs.db
 
-# ===== 独立仓库目录（原 simplie-communication 子模块，已解除注册）=====
-simplie-communication/
+# ===== 独立仓库目录（原 simple-communication 子模块，已解除注册）=====
+simple-communication/
 
 # ===== AI 编码约定文件（本地保留，不进公开仓库）=====
 /AGENTS.md

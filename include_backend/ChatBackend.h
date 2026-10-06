@@ -9,7 +9,7 @@
 #include <QMap>
 #include <QSet>
 #include <QTimer>
-#include "FeatureStructs.h"  // 引入共享结构体：ContactInfo / MessageInfo / OutgoingMessage
+#include "FeatureStructs.h"  // 引入共享结构体：ConversationInfo / ContactInfo / MessageInfo / OutgoingMessage
 
 class ChatBackend : public QObject
 {
@@ -18,9 +18,10 @@ public:
     explicit ChatBackend(QObject *parent = nullptr,TcpClient* tcpclient = nullptr);
     // 登录成功后由主后端同步当前登录账号（拉取重试 onPullTimerTimeout 需要用到 m_userid）
     void setUserId(const QString& userId);
+    // 登出：把本后端存的当前账号清成空白（预留的口，真正登出流程接入时由主后端调用）
+    void clearUserId();
 
 signals:
-    void contactsLoaded(const QList<ContactInfo>& contacts);
     void newMessageReceived(const MessageInfo& message);        // 接收成功（携带完整消息，UI显示+存库+回ACK）
     void messageReceiveFailed(const QString& serverId);         // 接收失败（携带服务器消息ID，回ACK让服务器重发）
     void contactStatusChanged(const QString& contactId, bool isOnline);
@@ -34,7 +35,6 @@ signals:
 
 
 public slots:
-    void loadContacts();
     void startSendMessage(const QString& contactId, const OutgoingMessage& message);
     void sendFile(const QString& contactId, const QString& filePath);
     void markMessagesAsRead(const QString& contactId);
