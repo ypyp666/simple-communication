@@ -154,7 +154,24 @@ void* TcpServer::ClientWork(void* arg) {
     sess->fd = fd;
 
     mysqlconn mysqlconnect;
-    mysqlconnect.connect("192.168.20.128", 3306, "dbuser", "My-dbuser-123", "User");
+    if (!mysqlconnect.connect("192.168.20.128", 3306, "dbuser", "My-dbuser-123", "User"))
+    {
+        // 连不上库（例如达到 dbuser 的 max_user_connections 上限）时绝对不能继续往下走：
+        // 此时句柄虽然非空但并没有真正连上，任何一次 mysql_real_escape_string / mysql_query
+        // 都会在 libmysqlclient 内部直接段错误，把整个服务进程连同其他在线用户一起带崩。
+        // 这里先回一个明确的错误包再断开，客户端才不会只看到连接被神秘掐断。
+        std::cerr << "[数据库] 连接失败，拒绝该客户端 IP: " << ip << std::endl;
+        const std::string busy = nlohmann::json{
+            {"type", "error_response"},
+            {"code", 503},
+            {"message", "服务器繁忙，请稍后重试"},
+            {"success", false}
+        }.dump() + "\n";
+        SendAll(fd, busy);
+        close(fd);
+        delete data;
+        return nullptr;
+    }
 
     constexpr int BUF_MAX = 4096;
     constexpr int CACHE_LIMIT = 4096;
@@ -201,9 +218,12 @@ void* TcpServer::ClientWork(void* arg) {
         }
     }
 
-    // 下线时把会话从在线列表移除
+    // 下线：先摘掉本连接的登录态，再按连接校验从在线列表移除。
+    sess->login_state = false;
     if (!sess->account.empty()) {
-        OnlineSessionManager::Instance().removeSession(sess->account);
+        // 带连接校验：若该账号已经在新连接上重登/重连，字典里存的已不是本连接，
+        // 这次清理就不该动它，否则会把刚接上来的新会话误删。
+        OnlineSessionManager::Instance().removeSession(sess->account, sess);
     }
     std::cout << "[客户端下线] IP: " << ip << std::endl;
     close(fd);

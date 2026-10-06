@@ -15,15 +15,15 @@ find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MYSQL REQUIRED mysqlclient)
 
-# 生成可执行程序，目标名 backend
-add_executable(untitled
-        scr/main.cpp
-        scr/mysql.cpp
-        scr/json_shift.cpp
-        scr/table.cpp
-        scr/FunctionalFunction.cpp
-        scr/tcp_server.cpp
-        scr/OnlineSessionManager.cpp
+# 生成即时通信服务器可执行程序
+add_executable(im_server
+        src/main.cpp
+        src/mysql.cpp
+        src/json_shift.cpp
+        src/table.cpp
+        src/FunctionalFunction.cpp
+        src/tcp_server.cpp
+        src/OnlineSessionManager.cpp
 
         include/mysql.h
         include/json_shift.h
@@ -40,11 +40,11 @@ add_executable(untitled
 )
 
 # 链接库统一写在一条，更整洁
-target_link_libraries(untitled PRIVATE
+target_link_libraries(im_server PRIVATE
         ${MYSQL_LIBRARIES}
         Threads::Threads
 )
 
 # MySQL头文件、库目录保留不变
-target_include_directories(untitled PRIVATE ${MYSQL_INCLUDE_DIRS})
-target_link_directories(untitled PRIVATE ${MYSQL_LIBRARY_DIRS})
+target_include_directories(im_server PRIVATE ${MYSQL_INCLUDE_DIRS})
+target_link_directories(im_server PRIVATE ${MYSQL_LIBRARY_DIRS})

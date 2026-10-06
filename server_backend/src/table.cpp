@@ -66,10 +66,25 @@ namespace
         rsp["success"] = false;
         return rsp.dump();
     }
+
+    // 全业务统一的登录态校验（除 登录/断线重连/注册/获取账号/修改密码 外，其余一律先过这一关）：
+    // 第一道，看本连接自己记的 login_state；
+    // 第二道，再回服务端会话字典确认"该账号当前登记的连接就是本连接"——
+    // 同账号在新连接上重登/重连后，旧连接手里那个 session 的 login_state 会被置回 false，
+    // 就算没置，字典里也已经换了人，旧连接不会还能接着操作。
+    bool IsLoggedIn(const SessionPtr& session)
+    {
+        if (!session || !session->login_state)
+        {
+            return false;
+        }
+        return OnlineSessionManager::Instance().isCurrentSession(session->account, session);
+    }
 }
 
 CmdType JsonToCmdType(std::string type) {
     if (type=="login") return CmdType::Login;
+    if (type=="reconnect_login") return CmdType::ReconnectLogin;
     if (type=="logout") return CmdType::Logout;
     if (type=="modify_password") return CmdType::ModifyPwd;
     if (type=="modify_name") return CmdType::ModifyNam;
@@ -89,6 +104,7 @@ CmdType JsonToCmdType(std::string type) {
     if (type=="search_request") return CmdType::SearchRequest;
     if (type=="pull_delete_friend_cache") return CmdType::PullDelFriendCache;
     if (type=="ack_delete_friend_cache") return CmdType::AckDelFriendCache;
+    if (type=="examine") return CmdType::Examine;
 
     return CmdType::Unknown;
 }
@@ -109,8 +125,11 @@ std::string HandleLogin(const json& req, mysqlconn& conn, SessionPtr session)
         // 登录成功后登记在线会话并标记登录状态
         if (rsp.value<bool>("success", false)) {
             session->account = account;
-            session->state = true;
+            session->login_state = true;
             OnlineSessionManager::Instance().addSession(account, session);
+            // 正常登录：签发一个全新的16位临时令牌（同账号旧令牌立即作废，键存在即覆盖、不存在即新建），
+            // 随登录响应一起下发给客户端
+            rsp["token"] = OnlineSessionManager::Instance().issueNewToken(account);
         }
 
     }
@@ -136,13 +155,59 @@ std::string HandleLogin(const json& req, mysqlconn& conn, SessionPtr session)
     return rsp.dump();
 }
 
+// 断线重连登录：与普通登录的区别在于三点——
+// 1) 响应类型是 reconnect_login_response，客户端据此走"续接会话"分支；
+// 2) 只校验令牌，不查库、不签新令牌：客户端掉线重连时手里就只剩令牌；
+// 3) 回包内容只有"成功与否"（success + 失败原因 message）——
+//    重连本来就不换令牌，不回 token，客户端手里那份继续用。
+std::string HandleReconnectLogin(const json& req, mysqlconn&, SessionPtr session)
+{
+    const auto account = req.value<std::string>("account", "");
+    const auto token = req.value<std::string>("token", "");
+    std::cout << "断线重连登录，账号:" << account
+              << " 令牌长度:" << token.size() << std::endl;
+
+    json rsp;
+    rsp["type"] = "reconnect_login_response";
+    rsp["success"] = false;
+    rsp["message"] = "";
+
+    // 账号必须是纯数字：它既是会话字典的键，也是令牌表的键，格式错了一律拒掉
+    uint32_t my_account = 0;
+    if (!ParseUint32(account, my_account))
+    {
+        rsp["message"] = "illegal account";
+        return rsp.dump();
+    }
+
+    // 重连只认令牌：与服务端令牌表里存的逐字比对。
+    // 表里没有该账号（服务重启过、或已经主动登出）或对不上，一律判失败，
+    // 交给客户端主后端把用户送回登录页重新走一次 login
+    const std::string stored = OnlineSessionManager::Instance().findToken(account);
+    const bool ok = (!stored.empty() && stored == token);
+    rsp["success"] = ok;
+    rsp["message"] = ok ? "" : "令牌无效或已过期, 请重新登录";
+
+    if (ok)
+    {
+        // 重连成功：新连接接管该账号（addSession 里会把旧连接的登录态作废），
+        // 令牌原样保留，不重新签发
+        session->account = account;
+        session->login_state = true;
+        OnlineSessionManager::Instance().addSession(account, session);
+    }
+
+    std::cout << rsp.dump();
+    return rsp.dump();
+}
+
 std::string HandleRepost(const json& req, mysqlconn& conn,SessionPtr session) {
     json rsp,message;
     message=req;
     auto targetID=req.value<std::string>("targetId", "");
     rsp["tempId"] = req.value<std::string>("tempId", "");
     rsp["serverId"] = "";
-    if(!session->state)
+    if(!IsLoggedIn(session))
     {
         rsp["type"] = "repost_response";
         rsp["code"] = 401;
@@ -175,6 +240,13 @@ std::string HandleRepost(const json& req, mysqlconn& conn,SessionPtr session) {
 std::string HandlePull(const json& req, mysqlconn& conn, SessionPtr session)
 {
     json rsp;
+    rsp["type"] = "pull_response";
+
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("pull_response");
+    }
+
     try
     {
         Pull(rsp, session, conn);
@@ -197,7 +269,7 @@ std::string HandleReceiveACK(const json& req, mysqlconn& conn, SessionPtr sessio
     rsp["type"] = "receive_ack";
     rsp["serverId"] = messageID;
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         rsp["code"] = 401;
         rsp["message"] = "当前登录状态异常请重新登录";
@@ -332,7 +404,29 @@ std::string HandleModifyPwd(const json& req, mysqlconn& conn, SessionPtr session
     return rsp.dump();
 }
 std::string HandleLogout(const json& req, mysqlconn& conn, SessionPtr session) {
-    return "0";
+    json rsp;
+    rsp["type"] = "logout_response";
+
+    // 登出本身就是在动登录态，所以得先确认当前确实是登录着的
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("logout_response");
+    }
+
+    // 主动登出三件事：作废临时令牌（否则旧令牌还能被拿来重连）、
+    // 从在线会话字典里摘掉本连接、清空本连接的登录态。
+    // 账号要先存一份，因为下面会把 session->account 清空。
+    const std::string account = session->account;
+    OnlineSessionManager::Instance().removeToken(account);
+    OnlineSessionManager::Instance().removeSession(account, session);
+    session->login_state = false;
+    session->account.clear();
+
+    rsp["code"] = 0;
+    rsp["message"] = "";
+    rsp["success"] = true;
+    std::cout << "[Logout] 账号" << account << "已登出，临时令牌已作废" << std::endl;
+    return rsp.dump();
 }
 std::string HandleUnknown(const json& req, mysqlconn& conn, SessionPtr session) {
     return json{
@@ -348,7 +442,7 @@ std::string HandleModifyNam(const json& req, mysqlconn& conn, SessionPtr session
     json rsp;
     rsp["type"] = "modify_name_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("modify_name_response");
     }
@@ -384,7 +478,7 @@ std::string HandleFriendRequest(const json& req, mysqlconn& conn, SessionPtr ses
     json rsp;
     rsp["type"] = "friend_request_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("friend_request_response");
     }
@@ -447,7 +541,7 @@ std::string HandlePullFriendRequest(const json& req, mysqlconn& conn, SessionPtr
     json rsp;
     rsp["type"] = "pull_friend_request_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("pull_friend_request_response");
     }
@@ -471,7 +565,7 @@ std::string HandleAcceptFriendRequest(const json& req, mysqlconn& conn, SessionP
     json rsp;
     rsp["type"] = "accept_friend_request_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("accept_friend_request_response");
     }
@@ -519,7 +613,7 @@ std::string HandleRejectFriendRequest(const json& req, mysqlconn& conn, SessionP
     json rsp;
     rsp["type"] = "reject_friend_request_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("reject_friend_request_response");
     }
@@ -561,7 +655,7 @@ std::string HandleDeleteFriend(const json& req, mysqlconn& conn, SessionPtr sess
     json rsp;
     rsp["type"] = "delete_friend_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("delete_friend_response");
     }
@@ -606,7 +700,7 @@ std::string HandleSetRemark(const json& req, mysqlconn& conn, SessionPtr session
     json rsp;
     rsp["type"] = "set_remark_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("set_remark_response");
     }
@@ -651,7 +745,7 @@ std::string HandlePullServerContacts(const json& req, mysqlconn& conn, SessionPt
     json rsp;
     rsp["type"] = "pull_server_contacts_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("pull_server_contacts_response");
     }
@@ -675,7 +769,7 @@ std::string HandleSearchRequest(const json& req, mysqlconn& conn, SessionPtr ses
     json rsp;
     rsp["type"] = "search_request_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("search_request_response");
     }
@@ -728,7 +822,7 @@ std::string HandlePullDelFriendCache(const json& req, mysqlconn& conn, SessionPt
     json rsp;
     rsp["type"] = "delete_friend_cache_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("delete_friend_cache_response");
     }
@@ -753,7 +847,7 @@ std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr
     json rsp;
     rsp["type"] = "ack_delete_friend_cache_response";
 
-    if (!session->state)
+    if (!IsLoggedIn(session))
     {
         return NotLoginResponse("ack_delete_friend_cache_response");
     }
@@ -801,5 +895,41 @@ std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr
         rsp["success"] = false;
         std::cerr << "清除删除墓碑处理异常: " << e.what() << std::endl;
     }
+    return rsp.dump();
+}
+
+// 心跳检验：客户端登录后每 3 秒发一次 {"type":"examine","examineId":n}，
+// 服务端把 examineId 原样回带，客户端据此确认链路还活着。
+// 不查库。但登录态要校验：心跳本身就是建立在"登录成功后的链路"上的，
+// 未登录 / 已被新连接顶号时回 401，客户端会当成异常走重连，这正是期望行为。
+std::string HandleExamine(const json& req, mysqlconn&, SessionPtr session)
+{
+    json rsp;
+    rsp["type"] = "examine_response";
+
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("examine_response");
+    }
+
+    // examineId 由客户端自己递增并用来和新旧回包配对，所以必须原样回带。
+    // 客户端用 QJsonObject 赋的是整数(number)，这里按原类型回带，
+    // 同时兼容字符串写法，避免客户端改动后取值时抛类型错误。
+    if (req.contains("examineId") &&
+        (req["examineId"].is_number() || req["examineId"].is_string()))
+    {
+        rsp["examineId"] = req["examineId"];
+    }
+    else
+    {
+        // 缺字段或类型不对时回 0，客户端会因为对不上号而算一次超时，属预期行为
+        rsp["examineId"] = 0;
+    }
+
+    rsp["code"] = 0;
+    rsp["message"] = "";
+    rsp["success"] = true;
+
+    std::cout << "[Examine心跳] 回带 examineId=" << rsp["examineId"].dump() << std::endl;
     return rsp.dump();
 }

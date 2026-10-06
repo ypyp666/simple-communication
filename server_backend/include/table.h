@@ -9,6 +9,7 @@
 
 enum class  CmdType {
     Login,//登录
+    ReconnectLogin,//断线重连登录（携带令牌续接会话，不重新签发令牌）
     Register,//注册
     Logout,//登出
     ModifyPwd,//修改密码
@@ -28,12 +29,14 @@ enum class  CmdType {
     SearchRequest,//搜索用户
     PullDelFriendCache,//上线拉取离线删除好友墓碑
     AckDelFriendCache,//回执并清除已同步的删除墓碑
+    Examine,//心跳检验（纯存活探测，不查库）
 };
 
     CmdType  JsonToCmdType(std::string type);
     using CmdHandler = std::string (*)(const json& req, mysqlconn& conn, SessionPtr session);//using X = 类型;：C++11 引入的类型别名（type alias），替代老式 typedef，可读性更强
 
     std::string HandleLogin(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleReconnectLogin(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleRegister(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleGetInfo(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleModifyPwd(const json& req, mysqlconn& conn, SessionPtr session);
@@ -54,11 +57,13 @@ enum class  CmdType {
     std::string HandleSearchRequest(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandlePullDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleExamine(const json& req, mysqlconn& conn, SessionPtr session);
     
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
     {CmdType::Login,HandleLogin},
+    {CmdType::ReconnectLogin, HandleReconnectLogin},
     {CmdType::Register, HandleRegister},
     {CmdType::ModifyPwd, HandleModifyPwd},
     {CmdType::Logout, HandleLogout},
@@ -78,6 +83,7 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::ModifyNam, HandleModifyNam},
     {CmdType::PullDelFriendCache, HandlePullDelFriendCache},
     {CmdType::AckDelFriendCache, HandleAckDelFriendCache},
+    {CmdType::Examine, HandleExamine},
 
 };
 

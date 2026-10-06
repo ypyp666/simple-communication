@@ -137,7 +137,7 @@ void Pull(json& res, SessionPtr session, mysqlconn& conn)
 {
     // 拉取人是自己，直接复用传入的会话对象，无需findSession
     res["type"] = "pull_response";
-    if (!session->state)
+    if (!session->login_state)
     {
         res["code"] = 401;
         res["message"] = "当前登录状态异常请重新登录";
