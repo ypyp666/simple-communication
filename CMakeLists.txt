@@ -78,9 +78,14 @@ add_executable(ChatUI
     src/SearchWindow.cpp         # 搜索窗口窗口实现
     src/AgentWindow.cpp          # 代理窗口窗口实现
     src/ContactWindow.cpp        # 联系人窗口实现
-    src/ContactList.cpp          # 联系人列表实现
+    src/ContactList.cpp          # 联系人列表（占位，真正的通讯录后续再补）
+    src/ContactDetailArea.cpp    # 右栏共用区域（好友详情 / 好友请求列表二选一）
+    src/FriendDetailPage.cpp     # 好友详情页（头像 + 用户名/ID/备注 + 发送消息/删除好友）
+    src/FriendRequestList.cpp    # 好友请求列表（QQ"好友通知"样式，数据只在内存、不落库）
+    src/SearchResultList.cpp     # 搜索结果列表（头像+用户名+ID+添加，数据只在内存、不落库）
+    src/AddFriendDialog.cpp      # "申请加好友"小弹窗（头像+名字+留言≤30字+发送/取消）
     src/ChatArea.cpp             # 聊天区域实现
-    src/MessageList.cpp          # 消息列表实现
+    src/MessageList.cpp          # 会话（消息）列表实现（原误叫 ContactList）
     src/MessageItem.cpp          # 消息项实现
     src/MessageStatusIndicator.cpp # 消息状态指示器实现（发送中旋转圆圈/失败感叹号）
     src/ChatInput.cpp            # 输入框实现
@@ -96,6 +101,8 @@ add_executable(ChatUI
     backend/DatabaseManager.cpp       # 数据库管理实现
     backend/ChatBackend.cpp          # 后端接口实现
     backend/TcpClient.cpp          # TCP客户端实现
+    backend/ContactBackend.cpp     # 联系人后端实现
+    backend/AgentBackend.cpp       # 智能体后端实现
     backend/LoginBackend.cpp       # 登录后端实现
 
 
@@ -104,6 +111,11 @@ add_executable(ChatUI
     include/SearchWindow.h
     include/ChatWindow.h
     include/ContactList.h
+    include/ContactDetailArea.h
+    include/FriendDetailPage.h
+    include/FriendRequestList.h
+    include/SearchResultList.h
+    include/AddFriendDialog.h
     include/ChatArea.h
     include/MessageList.h   
     include/MessageItem.h
@@ -126,6 +138,8 @@ add_executable(ChatUI
     include_backend/TcpClient.h
     include_backend/LoginBackend.h
     include_backend/FeatureStructs.h
+    include_backend/ContactBackend.h
+    include_backend/AgentBackend.h
 
     
   

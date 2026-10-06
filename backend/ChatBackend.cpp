@@ -21,30 +21,10 @@ void ChatBackend::setUserId(const QString& userId)
     m_userid = userId;
 }
 
-void ChatBackend::loadContacts()
+// 登出：把当前账号清成空白。预留的口，A 账号登出后 B 账号登录时不会拿旧账号去发拉取
+void ChatBackend::clearUserId()
 {
-    QList<ContactInfo> contacts;
-
-    ContactInfo c1;
-    c1.id = "12345";
-    c1.name = "张三";
-    c1.avatar = "";
-    c1.lastMessage = "明天一起吃饭？";
-    c1.lastTime = QDateTime::currentDateTime().addSecs(-15 * 60);
-    c1.isOnline = true;
-    c1.unreadCount = 2;
-    contacts.append(c1);
-
-    ContactInfo c2;
-    c2.id = "10010";
-    c2.name = "管理员大人";
-    c2.avatar = "";
-    c2.lastMessage = "你好，我是管理员";
-    c2.lastTime = QDateTime::currentDateTime().addSecs(-10 * 60);
-    c2.isOnline = false;
-    c2.unreadCount = 0;
-    contacts.append(c2);
-    emit contactsLoaded(contacts);
+    m_userid.clear();
 }
 
 void ChatBackend::startSendMessage(const QString& contactId, const OutgoingMessage& message)

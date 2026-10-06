@@ -240,6 +240,55 @@ bool DatabaseManager::createMessageTable()
     return true;
 }
 
+bool DatabaseManager::createContactTable()
+{
+    // 同在分库（m_messageDatabase）中创建。
+    // 这里不写 account_id：库文件本身就叫 messages_<account_id>.db，
+    // 一个账号一个文件，天然按账号隔离，列里再存一遍是冗余。
+    QSqlQuery query(m_messageDatabase);
+    QString sql = R"(
+        CREATE TABLE IF NOT EXISTS contacts (
+            contact_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            avatar TEXT,
+            remark TEXT
+        )
+    )";
+    // 注意：TEXT PRIMARY KEY 不自增，联系人 ID 由服务器下发或程序自己填
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to create contacts table:" << query.lastError().text();
+        return false;
+    }
+    query.exec("CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name)");
+    
+    return true;
+}
+
+bool DatabaseManager::createConversationTable()
+{
+    // 会话表：只存"这个对话最后一次长什么样"，真正的消息正文在 messages 表里。
+    // 拆出来是因为一个联系人只会有一行会话记录（主键即联系人），
+    // 查会话列表时不用去 messages 里按 contact_id 分组取最新一条，直接读这张表。
+    QSqlQuery query(m_messageDatabase);
+    QString sql = R"(
+        CREATE TABLE IF NOT EXISTS conversations (
+            contact_id TEXT PRIMARY KEY,
+            last_message TEXT,
+            last_time TEXT,
+            unread_count INTEGER DEFAULT 0,
+            is_online INTEGER DEFAULT 0
+        )
+    )";
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to create conversations table:" << query.lastError().text();
+        return false;
+    }
+    // 会话列表按最后消息时间倒序排，给 last_time 建索引
+    query.exec("CREATE INDEX IF NOT EXISTS idx_conversations_time ON conversations(last_time)");
+    
+    return true;
+}
+
 // ========== 消息库操作 ==========
 
 bool DatabaseManager::openMessageDatabase(const QString& accountId)
@@ -275,7 +324,14 @@ bool DatabaseManager::openMessageDatabase(const QString& accountId)
     }
     
     qDebug() << "Message database opened:" << dbPath;
-    return createMessageTable();
+    // 分库里的三张表在这里统一建好（都带 IF NOT EXISTS，重复执行无副作用）
+    if (!createMessageTable()) {
+        return false;
+    }
+    if (!createContactTable()) {
+        return false;
+    }
+    return createConversationTable();
 }
 
 void DatabaseManager::closeMessageDatabase()
@@ -730,6 +786,338 @@ void DatabaseManager::clearAllMessages()
     query.exec("DELETE FROM messages");
 }
 
+// ========== 会话操作（conversations 表：左侧会话列表的快照）==========
+
+QList<ConversationInfo> DatabaseManager::loadConversations()
+{
+    QList<ConversationInfo> conversations;
+    if (!m_messageDatabase.isOpen()) {
+        emit conversationsLoaded(conversations);   // 库没打开也要回一声，调用方不会空等
+        return conversations;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    // conversations 表只存"会话快照"（最后一条消息/时间/未读数/在线态），
+    // 名字和头像在 contacts 表里，用 LEFT JOIN 补齐（联系人可能还没入 contacts 表，
+    // 用 LEFT JOIN 而不是 INNER JOIN，避免那张表缺行时整条会话被丢掉）。
+    // 排序：最新消息在前，正好对上 UI 左侧列表从上到下的顺序
+    QString sql = R"(
+        SELECT c.contact_id, ct.name, ct.avatar,
+               c.last_message, c.last_time, c.unread_count, c.is_online
+        FROM conversations c
+        LEFT JOIN contacts ct ON ct.contact_id = c.contact_id
+        ORDER BY c.last_time DESC
+    )";
+
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to load conversations:" << query.lastError().text();
+        emit conversationsLoaded(conversations);
+        return conversations;
+    }
+
+    while (query.next()) {
+        ConversationInfo info;
+        info.id = query.value(0).toString();
+        info.name = query.value(1).toString();
+        info.avatar = query.value(2).toString();
+        info.lastMessage = query.value(3).toString();
+        info.lastTime = QDateTime::fromString(query.value(4).toString(), Qt::ISODate);
+        info.unreadCount = query.value(5).toInt();
+        info.isOnline = query.value(6).toInt() != 0;   // SQLite 无 bool，0/1 转回 bool
+        conversations.append(info);
+    }
+
+    emit conversationsLoaded(conversations);
+    return conversations;
+}
+
+bool DatabaseManager::saveConversation(const ConversationInfo& conversation)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    // contact_id 是主键：INSERT OR REPLACE 天然是"upsert"——
+    // 新会话 → 插入；已有会话 → 覆盖成最新快照（与会话列表"只保留最后一条"一致）
+    QString sql = R"(
+        INSERT OR REPLACE INTO conversations
+        (contact_id, last_message, last_time, unread_count, is_online)
+        VALUES (?, ?, ?, ?, ?)
+    )";
+
+    query.prepare(sql);
+    query.bindValue(0, conversation.id);
+    query.bindValue(1, conversation.lastMessage);
+    query.bindValue(2, conversation.lastTime.toString(Qt::ISODate));
+    query.bindValue(3, conversation.unreadCount);
+    query.bindValue(4, conversation.isOnline ? 1 : 0);
+
+    if (!query.exec()) {
+        qDebug() << "Failed to save conversation:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 只在不存在时插入一条会话（双击联系人页"新建会话"时用）。
+// INSERT OR IGNORE：contact_id 是主键，撞键就整条跳过——正是"有了就别动"的语义。
+// 这里刻意不用 saveConversation 的 INSERT OR REPLACE：UI 列表可能只是"还没加载出来"
+// （比如刚启动、列表还是空的），DB 里这条会话其实早就存在，
+// OR REPLACE 会把它的未读数、最后消息摘要一起冲成 0 / 空
+bool DatabaseManager::insertConversationIfAbsent(const ConversationInfo& conversation)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    QString sql = R"(
+        INSERT OR IGNORE INTO conversations
+        (contact_id, last_message, last_time, unread_count, is_online)
+        VALUES (?, ?, ?, ?, ?)
+    )";
+
+    query.prepare(sql);
+    query.bindValue(0, conversation.id);
+    query.bindValue(1, conversation.lastMessage);
+    query.bindValue(2, conversation.lastTime.toString(Qt::ISODate));
+    query.bindValue(3, conversation.unreadCount);
+    query.bindValue(4, conversation.isOnline ? 1 : 0);
+
+    if (!query.exec()) {
+        qDebug() << "Failed to insert conversation:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 收发消息后更新会话快照：最后消息 / 时间，必要时未读 +1。
+// 分两步而不是一条 UPSERT：先当"更新已有会话"试，一行都没改到，就说明表里还没有这条会话，再补插。
+// 未读数走 SQL 自增（unread_count + ?），不先查出来再写回——少一次查询，
+// 也不会因为中间还夹着别的写入而把计数覆盖丢
+bool DatabaseManager::updateConversationMessage(const QString& contactId, const QString& lastMessage,
+                                                const QDateTime& lastTime, bool increaseUnread)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    const QString timeStr = lastTime.toString(Qt::ISODate);
+
+    QSqlQuery update(m_messageDatabase);
+    update.prepare(R"(
+        UPDATE conversations
+        SET last_message = ?, last_time = ?, unread_count = unread_count + ?
+        WHERE contact_id = ?
+    )");
+    update.bindValue(0, lastMessage);
+    update.bindValue(1, timeStr);
+    update.bindValue(2, increaseUnread ? 1 : 0);
+    update.bindValue(3, contactId);
+
+    if (!update.exec()) {
+        qDebug() << "Failed to update conversation:" << update.lastError().text();
+        return false;
+    }
+
+    if (update.numRowsAffected() > 0) {
+        return true;   // 更新到已有会话了，收工
+    }
+
+    // 一行都没改到 → 表里还没有这条会话（这条消息就是它俩的第一条）：补插一条
+    QSqlQuery insert(m_messageDatabase);
+    insert.prepare(R"(
+        INSERT INTO conversations
+        (contact_id, last_message, last_time, unread_count, is_online)
+        VALUES (?, ?, ?, ?, 0)
+    )");
+    insert.bindValue(0, contactId);
+    insert.bindValue(1, lastMessage);
+    insert.bindValue(2, timeStr);
+    insert.bindValue(3, increaseUnread ? 1 : 0);
+
+    if (!insert.exec()) {
+        qDebug() << "Failed to insert conversation:" << insert.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 打开会话时刷新会话快照：把"最后一条消息"重新对齐到 messages 表里真正最新的那条。
+// 只写一条 UPDATE，最新消息用相关子查询现取；某条会话还没聊过时子查询返回 NULL，
+// 靠 COALESCE 退化成空摘要 / 当前时间（正好对上"有历史就取历史，没有就是当前时间"）。
+// 与 updateConversationMessage 同一套"先试 UPDATE，一行没改到再补插"的做法
+bool DatabaseManager::refreshConversationSnapshot(const QString& contactId)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    // 取"最新一条历史消息"的子查询：send_time 存的是 ISODate 文本，可以直接按字典序倒排；
+    // 同一时刻有多条时再按 rowid 兜底（后插入的算更新）
+    const QString latestContent = "SELECT content FROM messages WHERE contact_id = ? "
+                                  "ORDER BY send_time DESC, rowid DESC LIMIT 1";
+    const QString latestTime = "SELECT send_time FROM messages WHERE contact_id = ? "
+                               "ORDER BY send_time DESC, rowid DESC LIMIT 1";
+    const QString nowStr = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    QSqlQuery update(m_messageDatabase);
+    update.prepare(QString(R"(
+        UPDATE conversations
+        SET last_message = COALESCE((%1), ''),
+            last_time = COALESCE((%2), ?)
+        WHERE contact_id = ?
+    )").arg(latestContent, latestTime));
+    update.bindValue(0, contactId);   // 子查询：最新摘要
+    update.bindValue(1, contactId);   // 子查询：最新时间
+    update.bindValue(2, nowStr);      // 没有历史消息时的兜底时间
+    update.bindValue(3, contactId);   // WHERE
+
+    if (!update.exec()) {
+        qDebug() << "Failed to refresh conversation:" << update.lastError().text();
+        return false;
+    }
+
+    if (update.numRowsAffected() > 0) {
+        return true;   // 已有会话，快照已对齐，收工（未读数没动）
+    }
+
+    // 一行都没改到 → 表里还没有这条会话（第一次打开）：补插一条。
+    // 用 INSERT ... SELECT 让摘要/时间同样从 messages 现取，没有历史就是 空 / 当前时间，
+    // 避免"先查一次再拼参数"多跑一趟
+    QSqlQuery insert(m_messageDatabase);
+    insert.prepare(QString(R"(
+        INSERT INTO conversations
+        (contact_id, last_message, last_time, unread_count, is_online)
+        SELECT ?, COALESCE((%1), ''), COALESCE((%2), ?), 0, 0
+    )").arg(latestContent, latestTime));
+    insert.bindValue(0, contactId);
+    insert.bindValue(1, contactId);
+    insert.bindValue(2, contactId);
+    insert.bindValue(3, nowStr);
+
+    if (!insert.exec()) {
+        qDebug() << "Failed to insert conversation:" << insert.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 打开会话：未读清零。只改未读一列，最后消息和时间保持原样
+bool DatabaseManager::clearConversationUnread(const QString& contactId)
+{
+    if (!m_messageDatabase.isOpen()) {
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare("UPDATE conversations SET unread_count = 0 WHERE contact_id = ?");
+    query.bindValue(0, contactId);
+
+    return query.exec();
+}
+
+bool DatabaseManager::deleteConversation(const QString& conversationId)
+{
+    if (!m_messageDatabase.isOpen()) {
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare("DELETE FROM conversations WHERE contact_id = ?");
+    query.bindValue(0, conversationId);
+
+    return query.exec();
+}
+
+// ========== 联系人操作（contacts 表：通讯录好友资料）==========
+
+QList<ContactInfo> DatabaseManager::loadContacts()
+{
+    QList<ContactInfo> contacts;
+    if (!m_messageDatabase.isOpen()) {
+        emit contactsLoaded(contacts);   // 库没打开也要回一声，调用方不会空等
+        return contacts;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    // 通讯录按名字排序（会话列表才按时间，两者是两套数据）
+    QString sql = R"(
+        SELECT contact_id, name, avatar, remark
+        FROM contacts
+        ORDER BY name
+    )";
+
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to load contacts:" << query.lastError().text();
+        emit contactsLoaded(contacts);
+        return contacts;
+    }
+
+    while (query.next()) {
+        ContactInfo info;
+        info.id = query.value(0).toString();
+        info.name = query.value(1).toString();
+        info.avatar = query.value(2).toString();
+        info.remark = query.value(3).toString();
+        contacts.append(info);
+    }
+
+    emit contactsLoaded(contacts);
+    return contacts;
+}
+
+bool DatabaseManager::saveContact(const ContactInfo& contact)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    // 同上：contact_id 主键 + INSERT OR REPLACE = 新增或更新好友资料
+    QString sql = R"(
+        INSERT OR REPLACE INTO contacts
+        (contact_id, name, avatar, remark)
+        VALUES (?, ?, ?, ?)
+    )";
+
+    query.prepare(sql);
+    query.bindValue(0, contact.id);
+    query.bindValue(1, contact.name);
+    query.bindValue(2, contact.avatar);
+    query.bindValue(3, contact.remark);
+
+    if (!query.exec()) {
+        qDebug() << "Failed to save contact:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+bool DatabaseManager::deleteContact(const QString& contactId)
+{
+    if (!m_messageDatabase.isOpen()) {
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare("DELETE FROM contacts WHERE contact_id = ?");
+    query.bindValue(0, contactId);
+
+    return query.exec();
+}
+
 // ========== 联系人备注 ==========
 
 bool DatabaseManager::setContactRemark(const QString& contactId, const QString& remark)
@@ -738,9 +1126,12 @@ bool DatabaseManager::setContactRemark(const QString& contactId, const QString& 
         return false;
     }
     
+    // 注意表名是 contacts 不是 messages：备注是"好友资料"的一栏，
+    // loadContacts 正是从 contacts.remark 读出来显示的；写进 messages 表的话
+    // 下一次重载通讯录就读不到，等于白改
     QSqlQuery query(m_messageDatabase);
     query.prepare(R"(
-        UPDATE messages SET remark = ?
+        UPDATE contacts SET remark = ?
         WHERE contact_id = ?
     )");
     
@@ -756,9 +1147,10 @@ QString DatabaseManager::getContactRemark(const QString& contactId)
         return "";
     }
     
+    // 与 setContactRemark 同一个表：备注存在 contacts.remark（messages.remark 是消息自己的字段）
     QSqlQuery query(m_messageDatabase);
     query.prepare(R"(
-        SELECT remark FROM messages
+        SELECT remark FROM contacts
         WHERE contact_id = ? AND remark IS NOT NULL AND remark != ''
         LIMIT 1
     )");

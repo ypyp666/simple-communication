@@ -50,6 +50,10 @@ LoginWindow::LoginWindow(MainBackend* backend, QWidget *parent)
     });
     connect(m_loginPage, &LoginPage::forgotPasswordRequested, this, [=](const QString& account) {
         m_forgotPage->setAccount(account);          // 把登录页输入的账号带过去
+        // 真正的"切换/显示页面"只有 setCurrentIndex 这一句：决定 QStackedWidget 露出哪张卡片。
+        // 下面的 enterPage() 是我们自己定义的普通函数，跟"进入/显示页面"没有任何关系——
+        // 它只负责打扫卫生（清掉上一轮残留的密码、收回眼睛按钮）。
+        // 不调它页面照样显示，只是上一轮的残留不会被复位
         m_stackedWidget->setCurrentIndex(2);
         // 同注册页：切页后显式复位上一轮留下的输入。不能挂 showEvent——窗口最小化还原时
         // Qt 会补发 showEvent，把用户正输入的密码清掉

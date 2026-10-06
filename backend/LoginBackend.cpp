@@ -39,6 +39,20 @@ LoginBackend::~LoginBackend()
     }
 }
 
+// 登录成功后由主后端同步当前登录账号（与 ChatBackend / ContactBackend 同一套规则）
+void LoginBackend::setUserId(const QString& userId)
+{
+    m_userid = userId;
+}
+
+// 登出：把当前账号清成空白。预留的口，真正的登出流程（断开 TCP、回登录页）接入时由主后端调用
+void LoginBackend::clearUserId()
+{
+    m_userid.clear();
+    // 令牌随会话作废：登出 / 被踢之后它就再没有用途了
+    m_token.clear();
+}
+
 void LoginBackend::startLogin(const QString& accountId, const QString& password)
 {
     // 保存登录凭证
@@ -119,6 +133,24 @@ void LoginBackend::sendLoginRequest()
     // 请求发出去了：开表等 login_response。连上但服务器不回包时靠它兜底，
     // 否则 UI 会永远停在"正在登录..."（TcpClient 的连接超时表此时已经停了）
     startResponseTimer("login");
+}
+
+// 断线重连登录：连接恢复后把令牌发出去，服务器认了就恢复登录态。
+// 只发令牌、不发账号密码——重连不是"再登录一次"，这次会话的凭据是令牌
+void LoginBackend::sendReconnectLoginRequest()
+{
+    QJsonObject data;
+    data["type"] = "reconnect_login";
+    data["account"] = m_accountId;
+    data["token"] = m_token;
+
+    QByteArray packet = QJsonDocument(data).toJson(QJsonDocument::Compact) + '\n';
+    m_tcpClient->sendData(packet);
+    qDebug() << "发送重连登录请求（令牌）";
+
+    // 同登录：请求发出去了就开表等 reconnect_login_response，
+    // 服务器装死时靠它把流程从等待态里拽出来
+    startResponseTimer("reconnect_login");
 }
 
 void LoginBackend::sendModifyPwdRequest()
@@ -235,11 +267,25 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
         bool success = response["success"].toBool();
         if (success) {
             m_loginCompleted = true;
+            // 收下服务器下发的会话令牌（重连时用它换回登录态）。
+            // 只存内存：程序一退，令牌跟着没，下次启动老老实实重新登录
+            m_token = response["token"].toString();
             emit loginSuccess(m_accountId);
         } else {
             m_loginCompleted = true;
             qDebug() << "登录失败:" << response["message"].toString();
             emit loginFailed();
+        }
+    } else if (type == "reconnect_login_response") {
+        // 断线重连的补登录结果：令牌还有效 → 会话恢复；被拒（过期 / 服务器重启后
+        // 令牌表没了）→ 补不回来，交给主后端把用户送回登录页
+        stopResponseTimer();
+        if (response["success"].toBool()) {
+            qDebug() << "重连登录成功，会话已恢复";
+            emit reconnectLoginSuccess();
+        } else {
+            qDebug() << "重连登录失败:" << response["message"].toString();
+            emit reconnectLoginFailed();
         }
     } else if (type == "modify_password_response") {
         // 修改密码响应：服务器成功/失败只发对应信号，UI 据此提示并切页
@@ -365,6 +411,10 @@ void LoginBackend::onResponseTimeout()
         emit connectForRegisterTimeout();
     } else if (m_pendingRequest == "register") {
         emit registerTimeout();
+    } else if (m_pendingRequest == "reconnect_login") {
+        // 重连补登录等不到回包：当失败处理——会话补不回来，请用户重新登录。
+        // （链路本身若也断了，那是 TCP 层的事，退避重连照旧在跑）
+        emit reconnectLoginFailed();
     }
     m_pendingRequest.clear();
 }

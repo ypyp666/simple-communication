@@ -2,6 +2,8 @@
     <qresource prefix="/">
         <file>res/icon/application.png</file>
         <file>res/icon/arrow-down.svg</file>
+        <file>res/icon/delect.svg</file>
+        <file>res/icon/delect_clicked.svg</file>
         <file>res/icon/eyes_clicked.svg</file>
         <file>res/icon/eyes_show.svg</file>
         <file>res/icon/Message_show.svg</file>

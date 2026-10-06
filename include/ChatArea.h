@@ -41,8 +41,11 @@ signals:
     void loadOlderMessages();
 
 private:
-    // 单条消息 → [气泡+时间标签] 对，追加和前插共用，避免两份几乎一样的布局代码
-    void appendMessageWidgets(const MessageInfo& message, bool atTop);
+    // 单条消息 → [气泡+时间标签] 对，追加和前插共用，避免两份几乎一样的布局代码。
+    // frontIndex 用引用：直接改调用方那个变量，省掉"返回值再赋值回去"这一步。
+    // 前插时调用方按"页"维护它（prependMessages 每页从 0 开始），函数内每插一对 += 2；
+    // 追加路径不看这个值，随便传个 0 占位即可
+    void appendMessageWidgets(const MessageInfo& message, bool atTop, int& frontIndex);
 
     QVBoxLayout* mainLayout;
     QVBoxLayout* messagesLayout;

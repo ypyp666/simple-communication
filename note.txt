@@ -1,0 +1,97 @@
+UI的组成结构，整个程序的结构树（2026-09-18 核对源码后更新）
+
+程序有两扇窗口，先后出现：先弹出模态的 LoginWindow，登录成功后才创建 MainWindow。
+
+【一、LoginWindow —— 登录窗口（QDialog，400x500，模态）】
+LoginWindow
+└── rootLayout (垂直布局)
+    └── m_stackedWidget (QStackedWidget)  ← "一摞页面卡片"，同时只显示一页，setCurrentIndex 切换
+        ├── [0] LoginPage            登录页
+        ├── [1] RegisterPage         注册页
+        └── [2] ForgotPasswordPage   忘记密码页
+三个页面共享同一个窗口，页内互切；登录成功才 accept() 结束模态、放行主界面。
+
+【二、MainWindow —— 主窗口（QMainWindow）】
+MainWindow
+└── centralWidget
+    └── mainLayout (水平布局，边距/间距都为 0)
+        ├── StatusBar        左侧状态条，setFixedWidth(30)
+        └── pageStack (QStackedWidget)
+            └── [0] ChatWindow   聊天页（默认页；ContactWindow 已创建但还没加进来）
+
+【三、ChatWindow —— 聊天页】
+ChatWindow
+└── mainLayout (水平布局，边距/间距都为 0)
+    ├── contactList (ContactList)     左侧联系人列表，setFixedWidth(280)
+    ├── divider (QFrame)              垂直分隔线 setFrameShape(QFrame::VLine)
+    └── chatPanel (QWidget)           权重 1 → 自动拉伸，吃掉右侧剩余宽度
+        └── chatPanelLayout (垂直布局)
+            └── chatArea (ChatArea)
+
+【四、ChatArea —— 聊天区】
+ChatArea
+└── mainLayout (垂直布局)
+    ├── headerLabelWidget (QWidget)  顶部标题条
+    │   └── headerLayout (水平布局) → headerLabel (QLabel) "请选择一个联系人开始聊天"
+    ├── scrollArea (QScrollArea)     权重 1，消息滚动区
+    │   └── messagesWidget (QWidget)
+    │       └── messagesLayout (垂直布局) → [MessageItem…] + 末尾 addStretch(1)
+    └── chatInput (ChatInput)        底部输入框，默认 hide()，选中联系人后才显示
+
+布局口诀：固定宽度的放两边（280、30），其余给权重 1 自动拉伸。
+
+
+关于QFrame的一些笔记：
+QFrame 有两套东西：原生 frame + QSS border
+“border 不能完全消掉”，大多是原生 frame 没关干净，或者样式优先级、焦点、背景在捣乱
+QFrame 的 border（原生 frame）本质是：用来做分组、分割、3D 凸起 / 凹陷的 “系统级边框”，不是 CSS 那种装饰线
+下面拆开讲。
+一、QFrame 的 “border” 到底是啥？
+Qt 里 QFrame 说的 border，其实叫 frame（框架），由三样东西控制：
+frameShape：形状
+NoFrame：无边框（理论上）
+Box：矩形框
+Panel：面板
+HLine/VLine：分割线
+frameShadow：阴影效果（3D 感）
+Plain：平面
+Raised：凸起
+Sunken：凹陷
+lineWidth / midLineWidth：线宽、中线宽
+原生 frame 的作用：
+视觉分组（把一堆控件框在一起）
+做分割线（HLine/VLine）
+做 3D 凸起 / 凹陷面板（旧版 Qt 界面常用）
+一句话：它是 “系统自带的、带 3D 效果的分组框 / 分割线”，不是 CSS 那种细装饰线。
+QSS border 和原生 frame 冲突（"边框去不掉"的真正成因）
+注意：border: none; 本身是有效的，不需要写成 border: 0px solid transparent 才生效。
+真正导致"边框去不掉 / 样式不对"的是下面两种原因：
+
+原因一：native frame 和 QSS border 是两套独立的绘制系统。
+setFrameShape() / setFrameShadow() 画的是原生 frame，QSS 的 border 属性和它不是一回事，
+只写 QSS border: none 不会关掉原生 frame。
+要么二选一：纯用 QSS 就别调 setFrameStyle；
+要么都写上：QFrame { border: 0px solid transparent; outline: none; } 再配 setFrameShape(QFrame::NoFrame)。
+（本项目最终采用纯 QSS 方案，卡片不再调 setFrameStyle。）
+
+原因二：QSS 选择器没匹配上目标控件（最容易被忽略，见下面第二节）。
+
+二、血泪教训：QLabel 也是 QFrame 的子类
+写 QSS 选择器时，写 QFrame { ... } 会连带命中所有 QLabel！
+（继承链：QWidget → QFrame → QLabel）
+当时给卡片写 QFrame{ background:#cfd9ec; border-radius:8px; }，
+结果卡片里每个文字标签都被画上了圆角白底和边框，像给文字加了个框。
+正确写法：给容器 setObjectName("fCardFrame")，选择器写 #fCardFrame { ... }，
+用 ID 选择器锁死目标，不误伤子控件。
+
+三、卡片/容器被拉高、行距莫名其妙变大的坑
+QFrame 默认垂直方向可伸缩，窗口富余的高度会渗进卡片把它撑高，
+卡片一高，内部行与行的间距就被拉开，看着松松散散。
+解决：fCardFrame->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed); 垂直方向锁死，
+多余高度全部交给布局首尾的 addStretch() 去吸收。
+
+四、QGridLayout 保证多个输入框等长
+三个输入框各自用 QHBoxLayout 包一层再塞进布局，宽度各算各的，永远对不齐。
+正确做法：整张表单用 QGridLayout，列 0 = 标签（setFixedWidth 固定宽 + AlignRight 右对齐），
+列 1 = 输入框，三个输入框都 addWidget 到同一列 (row, 1)，
+等长由布局机制保证，标签的冒号也自然对齐在同一条竖线上。

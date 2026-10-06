@@ -1,6 +1,7 @@
 #include "StatusBar.h"
 #include <QVBoxLayout>
 #include <QButtonGroup>
+#include <QLabel>
 
 // 导航图标资源路径，顺序与 MainWindow 的页面栈保持一致：
 // 聊天(ChatWindow) → 联系人(ContactWindow) → 搜索(SearchWindow) → Agent(AgentWindow)
@@ -20,6 +21,8 @@ const NavIcon kNavIcons[] = {
 constexpr int kNavCount = sizeof(kNavIcons) / sizeof(kNavIcons[0]);
 constexpr int kButtonSize = 60;       // 导航按钮边长（正方形，等于状态栏可用宽度）
 constexpr int kBarBorderWidth = 1;    // 右侧 1px 分割线
+constexpr int kBadgeTopMargin = 10;    // 角标距按钮顶边的距离
+constexpr int kBadgeRightMargin = 12;  // 角标距按钮右边的距离
 }
 
 StatusBar::StatusBar(QWidget *parent) : QWidget(parent)
@@ -73,6 +76,27 @@ StatusBar::StatusBar(QWidget *parent) : QWidget(parent)
             }
         )");
 
+        // 角标：红底白字的圆角小标签，默认隐藏，数字由外部 setBadge() 灌进来
+        // 挂成按钮的子控件（而非 StatusBar 的），按钮是固定尺寸，角标位置直接算死、不用跟随布局
+        QLabel* badge = new QLabel(btn);
+        badge->setObjectName("navBadge");
+        badge->setStyleSheet(R"(
+            QLabel#navBadge {
+                background-color: #f56c6c;
+                color: white;
+                font-size: 10px;
+                font-weight: 600;
+                border-radius: 8px;
+                padding: 0px 4px;
+            }
+        )");
+        badge->setAlignment(Qt::AlignCenter);
+        badge->setFixedHeight(16);
+        badge->setMinimumWidth(16);  // 个位数也保持圆形；两位数以上由内容撑宽
+        badge->setAttribute(Qt::WA_TransparentForMouseEvents, true);  // 别把按钮的 hover/click 吞掉
+        badge->hide();
+        m_badges.append(badge);
+
         navGroup->addButton(btn, i);
         m_navButtons.append(btn);
         layout->addWidget(btn);
@@ -95,4 +119,29 @@ void StatusBar::setCurrentIndex(int index)
         m_navButtons[i]->setChecked(i == index);// 设置选中当前索引对应的按钮
         m_navButtons[i]->setIcon(QIcon(i == index ? kNavIcons[i].active : kNavIcons[i].normal));
     }
+    emit m_changePage(index);
+}
+
+void StatusBar::setBadge(int index, int count)
+{
+    if (index < 0 || index >= m_badges.size()) {
+        return;
+    }
+
+    QLabel* badge = m_badges[index];
+    if (count <= 0) {
+        badge->hide();   // 没有未读就完全不占视觉
+        return;
+    }
+
+    badge->setText(count > 99 ? QStringLiteral("99+") : QString::number(count));
+    badge->adjustSize();   // 位数变了要重算宽度，再跟着重新摆位
+
+    // 钉在按钮图标的右上角：按钮是固定尺寸的正方形，位置直接算出来即可，
+    // 不用重写 resizeEvent 去跟随
+    QPushButton* btn = m_navButtons[index];
+    const int x = btn->width() - badge->width() - kBadgeRightMargin;
+    badge->move(qMax(0, x), kBadgeTopMargin);
+    badge->show();
+    badge->raise();   // 压在图标上面
 }

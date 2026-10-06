@@ -16,6 +16,35 @@ struct ContactInfo {
     QString id;
     QString name;
     QString avatar;
+    QString remark;
+};
+
+// 好友申请记录结构体（服务器逐条下发的在线数据，本地不落库）
+// 与 ContactInfo 的区别：一条"申请"和一位"好友"不是一回事——
+//   申请有自己的服务器记录ID（同意 / 拒绝 / 撤回都拿它定位是哪一条）；
+// ContactInfo::id 存的是对方的账号ID，拿它当申请ID去同意，服务器认不出是哪条申请。
+// 服务器把"我发出的"和"别人发来的"放在同一张列表里返回，靠 accountId / targetId 区分方向：
+//   accountId == 当前登录账号 → 我发出的；targetId == 当前登录账号 → 别人发来的
+// 申请不做本地持久化：要看申请列表就向服务器拉一次（服务器有就有，没有就没有），
+// 这个结构体只是把服务器送来的那一条从 ContactBackend 带到 UI 的载体
+struct FriendRequestInfo {
+    QString requestId;  // 申请记录在服务器上的ID（服务器生成，同意时原样回传定位这条申请）
+    QString accountId;  // 申请人账号ID
+    QString targetId;   // 被申请人账号ID
+    // 目标方昵称（服务器附带）：name 是【申请人】的昵称，对"我发出的"申请来说那是我自己，
+    // 卡片要显示的是"对方"（=目标），所以得用这个字段；服务端没给时退回显示 targetId
+    QString targetName;
+    QString name;       // 对方昵称（服务器附带，方便直接渲染，不必再查一次资料）
+    QString avatar;     // 对方头像
+    QString remark;     // 申请附言（验证消息）
+    QString sendTime;   // 申请时间（ISODate 字符串，与各处时间字段同一格式）
+};
+
+// 消息会话结构体（左侧会话列表的数据源：头像 + 名字 + 最后一条消息 + 时间 + 未读数）
+struct ConversationInfo {
+    QString id;
+    QString name;
+    QString avatar;
     QString lastMessage;
     QDateTime lastTime;
     bool isOnline;
@@ -79,6 +108,8 @@ enum class LoginFeature {
 // 不加这个，后台线程发信号带 MessageInfo 会直接编译失败或运行时报错
 // =============================================================================
 Q_DECLARE_METATYPE(ContactInfo)
+Q_DECLARE_METATYPE(FriendRequestInfo)
+Q_DECLARE_METATYPE(ConversationInfo)
 Q_DECLARE_METATYPE(MessageInfo)
 Q_DECLARE_METATYPE(OutgoingMessage)
 
