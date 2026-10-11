@@ -127,6 +127,9 @@ std::string HandleLogin(const json& req, mysqlconn& conn, SessionPtr session)
             session->account = account;
             session->login_state = true;
             OnlineSessionManager::Instance().addSession(account, session);
+            // 登录成功即停止未登录计数：清空限流窗口
+            session->limit_time = 0;
+            session->unlogin_count = 0;
             // 正常登录：签发一个全新的16位临时令牌（同账号旧令牌立即作废，键存在即覆盖、不存在即新建），
             // 随登录响应一起下发给客户端
             rsp["token"] = OnlineSessionManager::Instance().issueNewToken(account);
@@ -195,6 +198,9 @@ std::string HandleReconnectLogin(const json& req, mysqlconn&, SessionPtr session
         session->account = account;
         session->login_state = true;
         OnlineSessionManager::Instance().addSession(account, session);
+        // 重连成功同样停止未登录计数
+        session->limit_time = 0;
+        session->unlogin_count = 0;
     }
 
     std::cout << rsp.dump();

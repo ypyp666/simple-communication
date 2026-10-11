@@ -4,6 +4,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -148,61 +149,37 @@ void* TcpServer::ClientWork(void* arg) {
     ClientArg* data = static_cast<ClientArg*>(arg);
     int fd = data->client_fd;
     std::string ip = data->client_ip;
-    std::queue<char>& cache = data->msg_cache;
     auto sess = std::make_shared<Session>();
     sess->clientIp= ip;
     sess->fd = fd;
 
     mysqlconn mysqlconnect;
-    if (!mysqlconnect.connect("192.168.20.128", 3306, "dbuser", "My-dbuser-123", "User"))
-    {
-        // 连不上库（例如达到 dbuser 的 max_user_connections 上限）时绝对不能继续往下走：
-        // 此时句柄虽然非空但并没有真正连上，任何一次 mysql_real_escape_string / mysql_query
-        // 都会在 libmysqlclient 内部直接段错误，把整个服务进程连同其他在线用户一起带崩。
-        // 这里先回一个明确的错误包再断开，客户端才不会只看到连接被神秘掐断。
-        std::cerr << "[数据库] 连接失败，拒绝该客户端 IP: " << ip << std::endl;
-        const std::string busy = nlohmann::json{
-            {"type", "error_response"},
-            {"code", 503},
-            {"message", "服务器繁忙，请稍后重试"},
-            {"success", false}
-        }.dump() + "\n";
-        SendAll(fd, busy);
-        close(fd);
-        delete data;
-        return nullptr;
-    }
+    mysqlconnect.connect("192.168.20.128", 3306, "dbuser", "My-dbuser-123", "User");
 
     constexpr int BUF_MAX = 4096;
-    constexpr int CACHE_LIMIT = 4096;
-    char recv_buf[BUF_MAX] = {0};
-    bool offline = false;
-    std::string single_json;
+    char recv_buf[BUF_MAX];
+    std::string single_json;   // 跨多次 recv 拼接的半包缓冲
 
     while (true) {
-        memset(recv_buf, 0, sizeof(recv_buf));
-        ssize_t recv_size = recv(fd, recv_buf, BUF_MAX, 0);
-        if (recv_size <= 0) {
-            offline = true;
+        // recv 是阻塞调用：没有数据时线程睡在内核等待队列里，不占 CPU，有数据才被唤醒
+        const ssize_t recv_size = recv(fd, recv_buf, BUF_MAX, 0);
+        if (recv_size < 0) {
+            if (errno == EINTR) {
+                continue;   // 被信号打断，不是断线，重试
+            }
             break;
         }
-
-        // 限流
-        while (cache.size() >= CACHE_LIMIT) {
-            usleep(1000); // 简单等待，避免空转
+        if (recv_size == 0) {
+            break;   // 对端关闭连接
         }
 
-        for (int i = 0; i < recv_size; ++i) {
-            cache.push(recv_buf[i]);
-        }
-
-        while (!cache.empty()) {
-            char ch = cache.front();
-            cache.pop();
+        // 直接在本次收到的字节上按 '\n' 拆包，不再绕 std::queue 缓存
+        bool offline = false;
+        for (ssize_t i = 0; i < recv_size; ++i) {
+            const char ch = recv_buf[i];
             if (ch == '\n') {
                 std::cout << "[" << ip << "] 完整JSON: " << single_json << std::endl;
-                std::string rsp = single_json + "\n";
-                std::string reply = JsonParsing(rsp, mysqlconnect,sess);
+                std::string reply = JsonParsing(single_json + "\n", mysqlconnect, sess);
                 // 打印真正发出去的报文（reply 末尾自带换行，这里不再额外补）
                 std::cout << "[" << ip << "] 发送JSON: " << reply;
                 if (!SendAll(fd, reply))
@@ -216,14 +193,14 @@ void* TcpServer::ClientWork(void* arg) {
                 single_json += ch;
             }
         }
+        if (offline) {
+            break;
+        }
     }
 
-    // 下线：先摘掉本连接的登录态，再按连接校验从在线列表移除。
-    sess->login_state = false;
+    // 下线时把会话从在线列表移除
     if (!sess->account.empty()) {
-        // 带连接校验：若该账号已经在新连接上重登/重连，字典里存的已不是本连接，
-        // 这次清理就不该动它，否则会把刚接上来的新会话误删。
-        OnlineSessionManager::Instance().removeSession(sess->account, sess);
+        OnlineSessionManager::Instance().removeSession(sess->account);
     }
     std::cout << "[客户端下线] IP: " << ip << std::endl;
     close(fd);
