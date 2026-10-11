@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <string>
 #include <memory>
+#include <ctime>
 
 struct Session
 {
@@ -13,6 +14,12 @@ struct Session
     // 除登录/断线重连/注册/获取账号/修改密码外，其余业务一律先看它。
     // 同账号被新连接顶替时，旧连接的它会立即被置回false。
     bool login_state=false;
+
+    // ===== 未登录操作限流（每个连接独立一份）=====
+    // limit_time：限流窗口的截止时间戳（秒），0 表示当前没有窗口
+    // unlogin_count：当前窗口内已发生的未登录操作次数
+    time_t limit_time = 0;
+    int    unlogin_count = 0;
 };
 using SessionPtr = std::shared_ptr<Session>;
 
