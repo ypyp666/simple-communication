@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <iostream>
 #include <cstring>
+#include <mutex>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -11,32 +12,6 @@
 #include "json_shift.h"   // 你的 JSON 解析和业务转发
 #include "mysql.h"        // 你的数据库连接
 #include "OnlineSessionManager.h"
-
-namespace
-{
-    bool SendAll(int fd, const std::string& data)
-    {
-        std::size_t sent = 0;
-        while (sent < data.size())
-        {
-            const ssize_t size = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
-            if (size < 0)
-            {
-                if (errno == EINTR)
-                {
-                    continue;
-                }
-                return false;
-            }
-            if (size == 0)
-            {
-                return false;
-            }
-            sent += static_cast<std::size_t>(size);
-        }
-        return true;
-    }
-}
 
 // ---------- 构造/析构 ----------
 TcpServer::TcpServer()
@@ -182,7 +157,9 @@ void* TcpServer::ClientWork(void* arg) {
                 std::string reply = JsonParsing(single_json + "\n", mysqlconnect, sess);
                 // 打印真正发出去的报文（reply 末尾自带换行，这里不再额外补）
                 std::cout << "[" << ip << "] 发送JSON: " << reply;
-                if (!SendAll(fd, reply))
+                // 统一走 Session::SendJson：内部持 sendMtx 并检查 closed，
+                // 这样智能体 worker 线程往同一个 fd 推送时不会和这里抢出半行 JSON
+                if (!sess->SendJson(reply))
                 {
                     std::cout<<'\n'<<std::endl;
                     offline = true;
@@ -202,8 +179,18 @@ void* TcpServer::ClientWork(void* arg) {
     if (!sess->account.empty()) {
         OnlineSessionManager::Instance().removeSession(sess->account);
     }
-    std::cout << "[客户端下线] IP: " << ip << std::endl;
+
+    // 关键顺序：先在锁里置 closed，再 close(fd)。
+    // 反过来的话，fd 号被内核回收给新客户端后，还没跑完的智能体 worker
+    // 仍可能拿着同一个号码把答案推给另一个用户。
+    {
+        std::lock_guard<std::mutex> lock(sess->sendMtx);
+        sess->closed = true;
+    }
     close(fd);
+    sess->fd = -1;
+
+    std::cout << "[客户端下线] IP: " << ip << std::endl;
     delete data;
     return nullptr;
 }

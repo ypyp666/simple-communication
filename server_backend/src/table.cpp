@@ -1,5 +1,6 @@
 #include "table.h"
 #include"FunctionalFunction.h"
+#include "agent_tcp.h"
 #include <limits>
 
 namespace
@@ -105,6 +106,7 @@ CmdType JsonToCmdType(std::string type) {
     if (type=="pull_delete_friend_cache") return CmdType::PullDelFriendCache;
     if (type=="ack_delete_friend_cache") return CmdType::AckDelFriendCache;
     if (type=="examine") return CmdType::Examine;
+    if (type=="agent_request") return CmdType::AgentRequest;
 
     return CmdType::Unknown;
 }
@@ -937,5 +939,74 @@ std::string HandleExamine(const json& req, mysqlconn&, SessionPtr session)
     rsp["success"] = true;
 
     std::cout << "[Examine心跳] 回带 examineId=" << rsp["examineId"].dump() << std::endl;
+    return rsp.dump();
+}
+
+// 智能体请求：前端发起一次对话。
+//
+// 关键点：这里绝不能在客户端线程里直接调智能体——那是至少几百毫秒、多则几十秒的阻塞，
+// 而客户端心跳是 3 秒一发、等 1 秒、连续超 3 次就断线重连，
+// 把调用写在返回路径上，用户一定会看到"发了条消息然后就掉线"。
+//
+// 所以这里只做三件事：校验 -> 入队 -> 立刻回 ack，
+// 真正的答案稍后由 worker 以 agent_response 推送回同一个连接。
+std::string HandleAgentRequest(const json& req, mysqlconn&, SessionPtr session)
+{
+    json rsp;
+
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("agent_response");
+    }
+
+    const std::string prompt = req.value<std::string>("prompt", "");
+    if (prompt.empty())
+    {
+        rsp["type"]    = "agent_response";
+        rsp["code"]    = 400;
+        rsp["message"] = "问题内容不能为空";
+        rsp["success"] = false;
+        return rsp.dump();
+    }
+
+    // 单条问题长度上限：防止一个请求就把队列内存吃掉一大块
+    if (prompt.size() > 4000)
+    {
+        rsp["type"]    = "agent_response";
+        rsp["code"]    = 413;
+        rsp["message"] = "问题内容过长";
+        rsp["success"] = false;
+        return rsp.dump();
+    }
+
+    AgentTask task;
+    task.account = session->account;
+    // 基础版先允许不传：一个用户后面会对应多个智能体，这里就是区分入口
+    task.agentId = req.value<std::string>("agentId", "default");
+    task.prompt  = prompt;
+    // 存 weak_ptr：worker 只在推送时短暂持有，不会拖住会话对象的生命周期
+    task.session = session;
+
+    uint64_t requestId = 0;
+    if (!agent_tcp::Instance().Submit(std::move(task), requestId))
+    {
+        // 队列已满 = 后端拒不住了，直接告诉客户端稍后再试（背压）
+        rsp["type"]    = "agent_response";
+        rsp["code"]    = 503;
+        rsp["message"] = "服务器繁忙，请稍后再试";
+        rsp["success"] = false;
+        return rsp.dump();
+    }
+
+    // 立即回执：客户端拿到 requestId 后先把"正在思考"的气泡挂上去，
+    // 真正的答案稍后以 agent_response 回来，两边靠 requestId 配对。
+    rsp["type"]      = "agent_ack";
+    rsp["requestId"] = std::to_string(requestId);
+    rsp["code"]      = 0;
+    rsp["message"]   = "已受理";
+    rsp["success"]   = true;
+
+    std::cout << "[agent] 已受理 requestId=" << requestId
+              << " account=" << session->account << std::endl;
     return rsp.dump();
 }

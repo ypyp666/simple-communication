@@ -5,6 +5,7 @@
 //网络编程里只用它两个核心功能close()：关闭文件描述符（socket 本质就是文件，客户端断开必须close(fd)）
 //进程休眠 sleep()、获取当前进程 ID getpid() 等系统工具函数
 #include <cstring>
+#include <cstdlib>//getenv：从环境变量读智能体地址
 #include <string>
 #include<queue>
 #include<pthread.h>
@@ -12,6 +13,7 @@
 #include"mysql.h"
 #include <csignal>
 #include"tcp_server.h"
+#include"agent_tcp.h"
 
 // 服务监听端口，和Windows UI统一
 constexpr int LISTEN_PORT = 8899;//constexpr编译期常量，性能更好
@@ -32,7 +34,35 @@ int main() {
     g_server = &server;
     signal(SIGINT, signal_handler);   // Ctrl+C
     signal(SIGTERM, signal_handler);  // kill
-    server.Start(8899);
+
+    // 智能体线程池必须在 server.Start() 之前拉起：
+    // Start() 一进去就阻塞在 accept 循环里，回不来了
+    // 地址/超时优先读环境变量，读不到就用默认值 —— 部署时改环境变量即可，不用重编译
+    AgentEndpoint endpoint;
+    endpoint.url               = "http://127.0.0.1:8000/chat";
+    endpoint.connectTimeoutSec = 5;
+    endpoint.totalTimeoutSec   = 60;
+    endpoint.mock              = false;//开关默认走http(false),如果要走本地模拟，部署时改环境变量即可，不用重编译
+
+    if (const char* url = std::getenv("IM_AGENT_URL"); url != nullptr && *url != '\0')//c++17新特性：if 语句里定义变量，作用域只在 if/else 内也就是if(变量定义,判断条件)
+    {
+        //url的判断条件是：url不为空指针且url指向的第一个字符不是空字符'\0'，也就是url字符串不为空
+        endpoint.url = url;//拿到系统变量后覆盖
+    }
+    if (const char* mock = std::getenv("IM_AGENT_MOCK"); mock != nullptr && *mock == '1')
+    {
+        endpoint.mock = true;
+    }
+
+    agent_tcp::Instance().Configure(endpoint);
+    agent_tcp::Instance().Start();
+
+    // Start 内部阻塞在 accept 循环里，只有监听起不来（端口被占、fd 耗尽等）才会立刻返回 false。
+    // 这种失败必须带非零退出码返回，否则 CLion / systemd / 启动脚本会把"没起来"当成"正常退出"
+    const bool started = server.Start(LISTEN_PORT);
+
+    // 退出前停掉线程池，等 worker 把手上那一轮跑完再走
+    agent_tcp::Instance().Stop();
     return 0;
 }
 
@@ -198,7 +228,7 @@ int main()
 
 
         // 启动子线程处理当前客户端
-        int ret = pthread_create(&tid, &attr, client_work, arg);//创建线程的系统调用函数
+        int ret = pthread_create(&tid, &attr, client_work, arg);//创建线程的系统调用函数,arg是线程函数传入的参数
         if (ret != 0)
         {
             perror("pthread_create 创建线程失败");
