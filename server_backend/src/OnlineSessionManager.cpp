@@ -77,30 +77,61 @@ bool Session::SendJson(const std::string& data)
 
 void OnlineSessionManager::addSession(const std::string& account, SessionPtr sess)
 {
-    std::lock_guard<std::mutex> lock(m_mtx);//构造对象 lock 的瞬间：调用 m_mtx.lock()
-    /*如果此时锁是空闲：把 m_mtx 设置为【已锁定】，当前线程拿到锁，代码继续往下跑。
-    如果锁已经被别的线程拿着：当前线程直接阻塞在这里，原地等待，直到别的线程解锁。
-    花括号 { } 就是锁的作用域。只要还在这个大括号里面，锁就保持持有。*/
+    // 被顶替的旧会话先存一份：通知必须在锁外发，见下面注释
+    SessionPtr kicked;
 
-    // 同一账号只允许一个有效会话：新连接登录/重连成功时，把旧连接的登录态直接作废。
-    // 之所以不直接 erase 旧项：断线重连时旧连接的线程往往还没退出，
-    // 它会在自己的收尾处调 removeSession，把新会话误删（详见 removeSession 重载）。
-    // 这里只把旧会话的 login_state 置回 false，旧连接再发任何业务都会被拦下。
-    auto old = m_onlineMap.find(account);
-    if (old != m_onlineMap.end() && old->second && old->second != sess)
     {
-        old->second->login_state = false;
-        std::cout << "[会话] 账号" << account << " 在新连接登录，旧连接的登录态已作废" << std::endl;
+        std::lock_guard<std::mutex> lock(m_mtx);//构造对象 lock 的瞬间：调用 m_mtx.lock()
+        /*如果此时锁是空闲：把 m_mtx 设置为【已锁定】，当前线程拿到锁，代码继续往下跑。
+        如果锁已经被别的线程拿着：当前线程直接阻塞在这里，原地等待，直到别的线程解锁。
+        花括号 { } 就是锁的作用域。只要还在这个大括号里面，锁就保持持有。*/
+
+        // 同一账号只允许一个有效会话：新连接登录/重连成功时，把旧连接的登录态直接作废。
+        // 之所以不直接 erase 旧项：断线重连时旧连接的线程往往还没退出，
+        // 它会在自己的收尾处调 removeSession，把新会话误删（详见 removeSession 重载）。
+        // 这里只把旧会话的 login_state 置回 false，旧连接再发任何业务都会被拦下。
+        auto old = m_onlineMap.find(account);
+        if (old != m_onlineMap.end() && old->second && old->second != sess)
+        {
+            old->second->login_state = false;
+            // 只有还活着的连接才值得通知：已经断开的没必要再写一次
+            if (!old->second->closed && old->second->fd >= 0)
+            {
+                kicked = old->second;
+            }
+            std::cout << "[会话] 账号" << account << " 在新连接登录，旧连接的登录态已作废" << std::endl;
+        }
+
+        m_onlineMap[account] = std::move(sess);
+        //如果容器里没有这个 account 键：operator[] 会就地默认构造一个空的 value 对象插入 map；
+    //步骤：
+    //1. m_onlineMap[account] → 找不到key就插入一个默认Session，拿到引用
+    //2. std::move(sess) 将sess转为右值
+    //3. 调用map里面那个元素的移动赋值，把sess内部资源（句柄、buffer、指针）掠夺过来
+    //4. 原来局部变量sess变成被移出后的空有效状态，不要再使用sess
+    /*move的作用：资源所有权转移，而不是复制资源。网络 Session 这种对象，本来就只应该有一个实例。如果不用move就会直接拷贝复制*/
     }
 
-    m_onlineMap[account] = std::move(sess);
-    //如果容器里没有这个 account 键：operator[] 会就地默认构造一个空的 value 对象插入 map；
-//步骤：
-//1. m_onlineMap[account] → 找不到key就插入一个默认Session，拿到引用
-//2. std::move(sess) 将sess转为右值
-//3. 调用map里面那个元素的移动赋值，把sess内部资源（句柄、buffer、指针）掠夺过来
-//4. 原来局部变量sess变成被移出后的空有效状态，不要再使用sess
-/*move的作用：资源所有权转移，而不是复制资源。网络 Session 这种对象，本来就只应该有一个实例。如果不用move就会直接拷贝复制*/
+    // 通知必须在锁外发。send 在对端接收窗口满时会阻塞（本服务没设 SO_SNDTIMEO），
+    // 若在 m_mtx 里做，一个卡死的旧连接就能把全服所有账号的登录/重连全部堵在这里。
+    //
+    // 只发通知、不在这里 close(fd)：那个 fd 归旧连接的 ClientWork 线程所有，
+    // 别的线程去关会和它的 close 撞车（fd 号被复用后会误关新连接）。
+    // 旧连接收到这条包后由它自己决定退出，服务端这边 login_state 已置 false，它再发什么都不放行。
+    if (kicked)
+    {
+        static const char kKickedJson[] =
+            R"({"type":"kicked","code":409,"message":"该账号已在其他设备登录，当前连接已下线","success":false})"
+            "\n";   // 协议要求每条消息以 '\n' 结尾
+        if (kicked->SendJson(kKickedJson))
+        {
+            std::cout << "[会话] 账号" << account << " 的旧连接已收到下线通知" << std::endl;
+        }
+        else
+        {
+            std::cout << "[会话] 账号" << account << " 的旧连接已不可写，通知未发出" << std::endl;
+        }
+    }
 }
 
 SessionPtr OnlineSessionManager::findSession(const std::string& account)

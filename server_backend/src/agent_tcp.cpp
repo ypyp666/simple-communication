@@ -24,6 +24,17 @@ namespace
         return total;   // 必须返回实际处理的字节数，返回少了 curl 会认为写失败
     }
 
+    // libcurl 的进度回调：传输过程中被 curl 反复调用（约每秒数次）。
+    // 返回非0 = 立刻中止本次传输，curl_easy_perform 会返回 CURLE_ABORTED_BY_CALLBACK。
+    //
+    // 只是读一个原子bool，绝不能在这里做耗时操作或加锁：
+    // 这个回调跑在 curl 自己的传输循环里，卡住它等于卡住整个 worker。
+    int OnCancelCheck(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+    {
+        const auto* flag = static_cast<const std::atomic<bool>*>(userdata);
+        return flag->load(std::memory_order_relaxed) ? 1 : 0;
+    }
+
     // ===== SSE 解析结果 =====
     struct SseResult
     {
@@ -207,6 +218,7 @@ void agent_tcp::Stop()
         std::lock_guard<std::mutex> lock(m_mtx);
         m_queue.clear();
         m_inFlight.clear();
+        m_cancel.clear();
     }
 
     // 所有 worker 都已 join，此时不会再有线程用 curl，可以安全清理
@@ -243,9 +255,92 @@ bool agent_tcp::Submit(AgentTask task, uint64_t& outRequestId)
     task.requestId = m_nextId.fetch_add(1, std::memory_order_relaxed);
     outRequestId = task.requestId;
 
+    // 取消位在入队前就登记好：用户在任务还没被 worker 取走时也可能点停止，
+    // 只登记"在途"的任务会漏掉排队中的那一轮
+    task.cancelled = std::make_shared<std::atomic<bool>>(false);
+    // 同一会话又来一轮就覆盖掉旧取消位：协议约定同一会话同时只有一轮回答，
+    // 覆盖不会误伤，反而让 agent_stop 永远能找到"最新的那一轮"
+    m_cancel[CancelKey(task.account, task.threadId)] = task.cancelled;
+
     m_queue.push_back(std::move(task));
     m_cv.notify_one();   // 只叫醒一个 worker：一个任务只需要一个人处理
 
+    return true;
+}
+
+std::string agent_tcp::CancelKey(const std::string& account, const std::string& threadId)
+{
+    // 用不可见分隔符拼接，避免账号 "1" + 会话 "23" 和账号 "12" + 会话 "3" 撞成同一个键
+    return account + '\x1f' + threadId;
+}
+
+bool agent_tcp::Cancel(const std::string& account, const std::string& threadId)
+{
+    std::lock_guard<std::mutex> lock(m_mtx);
+
+    const auto it = m_cancel.find(CancelKey(account, threadId));
+    if (it == m_cancel.end() || !it->second)
+    {
+        std::cout << "[agent] 取消请求未命中：account=" << account
+                  << " threadId=" << threadId << "（该会话没有在途回答）" << std::endl;
+        return false;
+    }
+
+    it->second->store(true, std::memory_order_relaxed);
+    std::cout << "[agent] 已置取消位：account=" << account
+              << " threadId=" << threadId << std::endl;
+    return true;
+}
+
+std::string agent_tcp::AllocateMessageId()
+{
+    // 序号只在同毫秒内起作用，取模 1000 保证不会把位宽拉长；
+    // 真凑到单毫秒 1000 条以上会回绕撞号，但那种量级已经远超当前单机承载
+    static std::atomic<uint64_t> seq{0};
+
+    const auto millis = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    const uint64_t tail = seq.fetch_add(1, std::memory_order_relaxed) % 1000;
+
+    // 序号补零对齐：不补零的话 "1699999999999" + "7" 和 "1699999999999" + "70"
+    // 只差一位，排序会把 7 排到 70 后面
+    std::string id = std::to_string(millis);
+    id += std::to_string(1000 + tail).substr(1);   // 1000+tail 必为 4 位，取后 3 位就是补零
+
+    return id;
+}
+
+std::string agent_tcp::MakeAgentThreadId(const std::string& threadId, const std::string& userId)
+{
+    // 任一端为空就不拼：拼出来形如 "12n" 或 "n10010"，智能体那边没意义，
+    // 我们拆回来也拿不到完整信息。这种情况属于上游参数出了问题，
+    // 原样透传比造一个半截的 key 好 —— 至少日志里能一眼看出是空的
+    if (threadId.empty() || userId.empty())
+    {
+        return threadId;
+    }
+
+    return threadId + kAgentThreadSep + userId;
+}
+
+bool agent_tcp::SplitAgentThreadId(const std::string& agentThreadId,
+                                   std::string& threadId, std::string& userId)
+{
+    // 用 find 取第一个 'n' 而不是 rfind：两边都是纯数字，
+    // 整串里只可能有这一个 'n'，第一个就是唯一分界点
+    const std::size_t pos = agentThreadId.find(kAgentThreadSep);
+
+    // pos == 0（以 'n' 开头）或 pos+1 >= size（以 'n' 结尾）都说明两段里有一段是空的，
+    // 不是我们拼出来的格式，直接判失败，不要返回半截结果
+    if (pos == std::string::npos || pos == 0 || pos + 1 >= agentThreadId.size())
+    {
+        return false;
+    }
+
+    threadId = agentThreadId.substr(0, pos);
+    userId   = agentThreadId.substr(pos + 1);
     return true;
 }
 
@@ -277,22 +372,128 @@ void agent_tcp::WorkerLoop()
             endpoint = m_endpoint;
         }
 
+        // 收尾：出在途表 + 摘掉取消位。
+        // 摘取消位必须校验是不是同一个 shared_ptr —— 同一会话可能已经提交了新一轮，
+        // 无脑 erase 会把新一轮的取消位一起抹掉，那一轮就再也 stop 不掉了
+        const auto finishTask = [this, &task]()
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            m_inFlight.erase(task.requestId);
+            const auto it = m_cancel.find(CancelKey(task.account, task.threadId));
+            if (it != m_cancel.end() && it->second == task.cancelled)
+            {
+                m_cancel.erase(it);
+            }
+        };
+
+        // 排队期间用户就点了停止：不必再打一次智能体，直接收尾。
+        // 这里不回包 —— 停止的回执已经由 HandleAgentStop 当场发走了，
+        // 再补一条只会让客户端收到两个 done
+        if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+        {
+            std::cout << "[agent] 任务出队前已被取消，直接丢弃 requestId=" << task.requestId
+                      << " threadId=" << task.threadId << std::endl;
+            finishTask();
+            continue;
+        }
+
         // ===== 干活区：阻塞时长完全取决于智能体，这里绝不能持有全局锁 =====
         std::cout << "[agent] 开始处理 requestId=" << task.requestId
                   << " account=" << task.account
+                  << " threadId=" << task.threadId
                   << " prompt=" << task.prompt << std::endl;
 
         std::string error;
-        std::string threadId = task.agentId;   // 客户端带来的会话标识，可以是空
-        const std::string answer = endpoint.mock
-            ? MockAgent(task.prompt, task.agentId)
-            : CallAgent(task.prompt, threadId, endpoint, error, &threadId);
+        // ===== 智能体侧的 thread_id 要拼接，不能直接用会话ID =====
+        // langchain 的 thread 是全局唯一的，而我们的会话ID 只是“账号内的编号”：
+        // 会话ID 由客户端生成，不同用户完全可能造出同一个号。
+        // 直接把会话ID 当 thread_id 发过去，两家的对话会落到同一条 thread 上，
+        // 上下文互相穿插 —— 甲用户能看到乙用户的提问，反过来乙的追问也被甲的上下文带偏。
+        // 所以按协议拼成 "会话ID + 'n' + 账号"：
+        //   • 账号只从登录会话取，客户端传什么都不采信，天然防冒用；
+        //   • 拼完之后 (会话, 账号) 这个联合主键就整体进了 thread_id，与库里的语义一致；
+        //   • 中间加 'n' 只是分隔符，两边都是纯数字，解包时取第一个 'n' 就够。
+        // 这里的拼接是确定性的：不存任何状态，每轮现算现用，
+        // 多设备重连、服务重启之后算出来还是同一个 thread，上下文不会断。
+        const std::string agentThread = MakeAgentThreadId(task.threadId, task.account);
 
-        if (!threadId.empty())
+        // 智能体可能回一个新的 thread_id（首次对话时），所以这里留一个可变副本
+        std::string agentThreadId = agentThread;
+        const std::string answer = endpoint.mock
+            ? MockAgent(task.prompt, agentThread)
+            : CallAgent(task.prompt, agentThread, endpoint, error,
+                        &agentThreadId, task.cancelled.get());
+
+        if (!agentThreadId.empty())
         {
-            // 第三步做会话持久化时，这里就是「把 thread_id 落库」的位置：
-            // 存下来，用户下次提问带上它，智能体才会有上下文
-            std::cout << "[agent] thread_id=" << threadId << std::endl;
+            // 日志里打的是拼好的全串，排查时直接拿去搜智能体那边的记录就能对上号
+            std::cout << "[agent] 智能体 thread_id=" << agentThreadId << std::endl;
+
+            // 智能体回传的值和我们发出去的不一样也不是错（它会补自己的后缀），
+            // 但只要拆得开就能确认“会话/账号”两段还在，拆不开说明上游改了格式，得早发现
+            std::string backThreadId;
+            std::string backUserId;
+            if (SplitAgentThreadId(agentThreadId, backThreadId, backUserId))
+            {
+                if (backThreadId != task.threadId || backUserId != task.account)
+                {
+                    std::cout << "[agent] 注意：智能体改写了 thread_id 的会话/账号段，"
+                              << "threadId=" << backThreadId
+                              << " account=" << backUserId << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "[agent] 警告：智能体回传的 thread_id 无法解包="
+                          << agentThreadId << std::endl;
+            }
+        }
+
+        // 被 agent_stop 打断的那一轮不再回包：停止回执已由 Handler 发过，
+        // 再推一条迟到的答案会把用户已经停掉的气泡又改回去
+        if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+        {
+            std::cout << "[agent] 本轮已被取消，丢弃结果 requestId=" << task.requestId
+                      << " threadId=" << task.threadId << std::endl;
+            finishTask();
+            continue;
+        }
+
+        // ===== ack 门 =====
+        // agent_response 和 agent_request_ack 是两条独立路径写 socket 的：
+        // ack 在 handle 线程、response 在 worker 线程。handle 那边 Submit 之后还要回包、
+        // 再交给 ClientWork 写出去，而 worker 一被 notify 就能跑 —— 两边没有任何先后保证，
+        // mock 这个分支又特别快，几乎必然抢在 ack 前面。
+        // 客户端靠 ack 启动看门狗、靠 response 关看门狗，顺序反了就会把回答当成过期包。
+        // 所以这里先卡住，等 handle 把 ack 真正写进 socket 后再继续。
+        // 上限 3 秒只是兜底：万一对端已经断线、ack 根本发不出去，worker 不能被永久卡住白占线程。
+        if (task.ackSent)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!task.ackSent->load(std::memory_order_acquire))
+            {
+                // 等闸门期间用户又点了停止，就没必要再等了
+                if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+                {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    std::cout << "[agent] 等待 ack 超时（3s），仍继续推送 requestId="
+                              << task.requestId << std::endl;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        // 等闸门期间用户可能又点了停止，推包前再确认一次
+        if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+        {
+            std::cout << "[agent] 本轮在等 ack 期间被取消，丢弃结果 requestId="
+                      << task.requestId << " threadId=" << task.threadId << std::endl;
+            finishTask();
+            continue;
         }
 
         // ===== 推送结果 =====
@@ -302,29 +503,46 @@ void agent_tcp::WorkerLoop()
             nlohmann::json rsp;
             // 失败也走同一个包类型，只看 success/code/message，
             // 客户端就不用为"出错"再多写一条分支
-            rsp["type"]      = "agent_response";
-            // 按项目约定：ID 一律用 JSON 字符串下发，客户端不用区分 int/string
+            rsp["type"] = "agent_response";
+
+            // 会话ID / 消息ID 一律原样回显：客户端靠它们把答案挂回正确的会话和气泡。
+            // threadId 是客户端生成的，serverId 是 agent_message_create 里服务器发的，
+            // 两个值服务器都不解析、不改写。改名 serverId 是为了对齐协议表
+            rsp["threadId"] = task.threadId;
+            rsp["serverId"] = task.messageId;
+            // 服务器内部编号，只供日志排查，客户端可以忽略
             rsp["requestId"] = std::to_string(task.requestId);
 
-            if (answer.empty() && !error.empty())
+            // done 每轮都必须为 true —— 客户端靠它结束“回答中”状态。
+            // 漏掉这一条，该会话就会永久锁在“回答中”，只能靠用户手动重开会话。
+            // 成功和失败都要带，所以放在分支外面统一设置；finished 是旧名字，一并带上做兼容
+            rsp["done"]     = true;
+            rsp["finished"] = true;
+
+            if (answer.empty())
             {
+                // answer 和 error 同时为空（智能体返回 200 但内容里没有可用文本）
+                // 也是异常，不能当成功推一个空回答回去
                 rsp["code"]    = 502;
-                rsp["message"] = error;
+                rsp["message"] = error.empty() ? "智能体没有返回任何内容" : error;
                 rsp["success"] = false;
+                rsp["answer"]  = "";
             }
             else
             {
                 rsp["code"]    = 0;
                 rsp["message"] = "";
                 rsp["success"] = true;
-                rsp["data"]["answer"] = answer;
+                // 顶层 answer 才是协议字段（兼容 content），不要再套一层 data
+                rsp["answer"] = answer;
             }
 
             // SendJson 内部持 sendMtx 并检查 closed，
             // 保证不会和该连接自己的心跳应答交错拼出半行 JSON
             if (sess->SendJson(rsp.dump() + "\n"))
             {
-                std::cout << "[agent] 已推送 requestId=" << task.requestId << std::endl;
+                std::cout << "[agent] 已推送 requestId=" << task.requestId
+                          << " threadId=" << task.threadId << std::endl;
             }
             else
             {
@@ -336,10 +554,7 @@ void agent_tcp::WorkerLoop()
             std::cout << "[agent] 用户已下线，丢弃结果 requestId=" << task.requestId << std::endl;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(m_mtx);
-            m_inFlight.erase(task.requestId);   // 本轮任务结束，出在途表
-        }
+        finishTask();
     }
 }
 
@@ -347,7 +562,8 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
                                  const std::string& threadId,
                                  const AgentEndpoint& endpoint,
                                  std::string& outError,
-                                 std::string* outThreadId)
+                                 std::string* outThreadId,
+                                 const std::atomic<bool>* cancel)
 {
     outError.clear();
 
@@ -421,6 +637,17 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // 智能体通常要求 HTTP/1.1，显式指定避免协商到服务端不支持的版本
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
 
+    // 中途取消（agent_stop）：默认 curl 会把进度回调关掉（NOPROGRESS=1），
+    // 必须先显式打开，XFERINFOFUNCTION 才会被调用。
+    // 回调返回非0 时 curl_easy_perform 立刻收手并返回 CURLE_ABORTED_BY_CALLBACK，
+    // 这是唯一能提前打断"已连上、正在收流"的请求的办法（超时只能干等）。
+    if (cancel != nullptr)
+    {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, OnCancelCheck);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
+    }
+
     // ===== 3. 真的发出去（阻塞当前 worker，但只阻塞它自己）=====
     const CURLcode code = curl_easy_perform(curl);//内部封装了全套的等待、接收、事件回调循环
 
@@ -450,6 +677,10 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
             break;
         case CURLE_COULDNT_RESOLVE_HOST:
             outError = "智能体服务地址无法解析";
+            break;
+        case CURLE_ABORTED_BY_CALLBACK:
+            // 我们自己置的取消位把它打断的，和网络故障无关，必须单独区分
+            outError = "本轮回答已按用户请求停止";
             break;
         case CURLE_GOT_NOTHING:
             outError = "智能体服务未返回任何内容";

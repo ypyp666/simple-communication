@@ -121,7 +121,12 @@ std::string JsonParsing(std::string input,mysqlconn &conn,SessionPtr m_session)
         if(it != cmd_table.end())
         {
             CmdHandler hander = it->second;
-            rsp = hander(msg, conn, m_session) + '\n';
+            // 处理函数返回空串 = 这一条请求按协议不需要任何应答（agent_stop 就是这种，
+            // 客户端发出即自行解锁，不等回执）。
+            // 这里绝对不能无脑补 '\n'：否则对端会收到一行空数据，
+            // 它的逐行 JSON 解析会直接报错，反而显得"发完就出问题"
+            std::string body = hander(msg, conn, m_session);
+            rsp = body.empty() ? std::string() : body + '\n';
         }
         else
         {

@@ -901,3 +901,275 @@ void AckDeleteFriendCache(json& res, SessionPtr session, const std::vector<uint3
 }
 
 
+
+// ============================================================================
+// 智能体会话管理（thread 表）业务层
+// ============================================================================
+// 三条共同约定：
+//   1) 会话ID 由客户端生成，服务器只负责存储，回包必须原样回显；
+//   2) agent_session_response 即使是失败包也要带 sessionId —— 客户端拿它认领
+//      这次操作，收到不带ID的包会直接丢弃，表现成"5秒后超时失败"；
+//   3) 数据库过程的 retcode：1=成功 2=业务性失败（已存在/不存在）-1=过程内部异常。
+//      业务性失败不能回 500，要让客户端知道"确实是这个会话有问题"，而不是服务器抽风。
+
+namespace
+{
+    // 会话名兜底：客户端可能传空串，库里是 VARCHAR 非空列，
+    // 存进空串会让界面上出现一条没有名字的会话，点进去都不知道是哪个话题
+    std::string NormalizeThreadTitle(const std::string& title)
+    {
+        return title.empty() ? std::string("新会话") : title;
+    }
+
+    // 会话三件套的失败回包（op = create / rename / delete）
+    void FillSessionFail(json& res, const std::string& op, const std::string& sessionId,
+                         int code, const std::string& message)
+    {
+        res["type"]      = "agent_session_response";
+        res["op"]        = op;
+        res["sessionId"] = sessionId;   // 失败也必须回显，否则客户端无法认领这次操作
+        res["code"]      = code;
+        res["message"]   = message;
+        res["success"]   = false;
+    }
+
+    // 会话三件套的成功回包
+    void FillSessionOk(json& res, const std::string& op, const std::string& sessionId)
+    {
+        res["type"]      = "agent_session_response";
+        res["op"]        = op;
+        res["sessionId"] = sessionId;
+        res["code"]      = 0;
+        res["message"]   = "";
+        res["success"]   = true;
+    }
+
+    // 会话ID：协议层传下来的是一串字符串（客户端生成的原串，要原样回显），
+    // 但库里 thread 表的主键是 INT，进 SQL 前必须转成整数。
+    // 转不了就直接判非法参数（回 400），绝不能静默当成 0 ——
+    // 那样所有非法 ID 都会折到同一行上，改一个会话名能改掉别人的。
+    bool ParseSessionId(const std::string& sessionId, uint32_t& out)
+    {
+        if (sessionId.empty() || sessionId.size() > 10)
+        {
+            return false;
+        }
+
+        uint64_t value = 0;
+        for (const char ch : sessionId)
+        {
+            if (ch < '0' || ch > '9')
+            {
+                return false;
+            }
+            value = value * 10 + static_cast<uint64_t>(ch - '0');
+            if (value > 0xFFFFFFFFULL)
+            {
+                return false;
+            }
+        }
+
+        // 0 在库里当“无效ID”用，不允许对外出现
+        if (value == 0)
+        {
+            return false;
+        }
+
+        out = static_cast<uint32_t>(value);
+        return true;
+    }
+}
+
+void CreateAgentSession(json& res, uint32_t userId, const std::string& sessionId,
+                        const std::string& title, mysqlconn& conn)
+{
+    // 会话ID 在协议层是字符串（还得原样回显给客户端），进库前必须先转成 INT，
+    // 转不了就是客户端给错了，属于参数问题（400）而不是服务器故障（500）
+    uint32_t threadId = 0;
+    if (userId == 0 || !ParseSessionId(sessionId, threadId))
+    {
+        FillSessionFail(res, "create", sessionId, 400, "会话参数非法");
+        return;
+    }
+
+    const std::string threadName = NormalizeThreadTitle(title);
+
+    int retCode = -1;
+    if (!conn.callAddThread(userId, threadId, threadName, retCode))
+    {
+        FillSessionFail(res, "create", sessionId, 500, "服务器异常，新建会话失败");
+        return;
+    }
+
+    switch (retCode)
+    {
+        case 1:
+            FillSessionOk(res, "create", sessionId);
+            break;
+        case 2:
+            // 客户端生成的ID撞车：只在同一账号于两台设备上同时新建时才会出现。
+            // 属于业务性失败，客户端应换个ID重试，而不是弹"服务器错误"
+            FillSessionFail(res, "create", sessionId, 409, "会话已存在");
+            break;
+        default:
+            FillSessionFail(res, "create", sessionId, 500,
+                            "服务器异常，retcode=" + std::to_string(retCode));
+            break;
+    }
+
+    std::cout << "[CreateAgentSession业务] userId=" << userId
+              << ", sessionId=" << sessionId
+              << ", title=" << threadName
+              << ", retCode=" << retCode << std::endl;
+}
+
+void RenameAgentSession(json& res, uint32_t userId, const std::string& sessionId,
+                        const std::string& title, mysqlconn& conn)
+{
+    // 会话ID 在协议层是字符串（还得原样回显给客户端），进库前必须先转成 INT，
+    // 转不了就是客户端给错了，属于参数问题（400）而不是服务器故障（500）
+    uint32_t threadId = 0;
+    if (userId == 0 || !ParseSessionId(sessionId, threadId))
+    {
+        FillSessionFail(res, "rename", sessionId, 400, "会话参数非法");
+        return;
+    }
+
+    const std::string threadName = NormalizeThreadTitle(title);
+
+    int retCode = -1;
+    if (!conn.callChangeThreadName(userId, threadId, threadName, retCode))
+    {
+        FillSessionFail(res, "rename", sessionId, 500, "服务器异常，重命名会话失败");
+        return;
+    }
+
+    switch (retCode)
+    {
+        case 1:
+            FillSessionOk(res, "rename", sessionId);
+            break;
+        case 2:
+            // 会话不存在：多半是本地已经删了、服务器上也被别的设备删了，
+            // 客户端收到后应该把这条本地记录一并清掉
+            FillSessionFail(res, "rename", sessionId, 404, "会话不存在");
+            break;
+        default:
+            FillSessionFail(res, "rename", sessionId, 500,
+                            "服务器异常，retcode=" + std::to_string(retCode));
+            break;
+    }
+
+    std::cout << "[RenameAgentSession业务] userId=" << userId
+              << ", sessionId=" << sessionId
+              << ", title=" << threadName
+              << ", retCode=" << retCode << std::endl;
+}
+
+void DeleteAgentSession(json& res, uint32_t userId, const std::string& sessionId, mysqlconn& conn)
+{
+    // 会话ID 在协议层是字符串（还得原样回显给客户端），进库前必须先转成 INT，
+    // 转不了就是客户端给错了，属于参数问题（400）而不是服务器故障（500）
+    uint32_t threadId = 0;
+    if (userId == 0 || !ParseSessionId(sessionId, threadId))
+    {
+        FillSessionFail(res, "delete", sessionId, 400, "会话参数非法");
+        return;
+    }
+
+    int retCode = -1;
+    // 连带消息：协议要求"删会话连带删掉它的消息"，但库里目前只有 Delete_thread
+    // 这一个过程，没有删智能体消息的接口。现在的做法只能是靠消息表对 thread 表
+    // 的外键 ON DELETE CASCADE 自动清；
+    // 如果那张表没有建这个外键，就得补一个 Delete_thread_message 之类的过程，
+    // 在这里 callDeleteThread 之前先调一次，别指望业务层能替数据库删数据
+    if (!conn.callDeleteThread(userId, threadId, retCode))
+    {
+        FillSessionFail(res, "delete", sessionId, 500, "服务器异常，删除会话失败");
+        return;
+    }
+
+    switch (retCode)
+    {
+        case 1:
+            FillSessionOk(res, "delete", sessionId);
+            break;
+        case 2:
+            // 本来就不存在：对"删掉它"这个目标来说结果是一样的，
+            // 但仍然回 success=false 让客户端知道服务器上没这条记录，好顺手清本地残留
+            FillSessionFail(res, "delete", sessionId, 404, "会话不存在");
+            break;
+        default:
+            FillSessionFail(res, "delete", sessionId, 500,
+                            "服务器异常，retcode=" + std::to_string(retCode));
+            break;
+    }
+
+    std::cout << "[DeleteAgentSession业务] userId=" << userId
+              << ", sessionId=" << sessionId
+              << ", retCode=" << retCode << std::endl;
+}
+
+void LoadAgentSessions(json& res, uint32_t userId, mysqlconn& conn)
+{
+    res["type"] = "agent_sessions_list";
+
+    if (userId == 0)
+    {
+        res["code"]    = 400;
+        res["message"] = "账号格式非法";
+        res["success"] = false;
+        return;
+    }
+
+    std::vector<AgentThreadInfo> threads;
+    int retCode = 0;
+    if (!conn.callLoadThreads(userId, threads, retCode))
+    {
+        // 关键：查库失败绝不能回空数组。
+        // 客户端把这份列表当成"服务器上到底有哪些会话"的唯一权威，
+        // 一旦收到空列表就会把本地会话全部删掉 —— 一次抖动就能清空用户历史。
+        // 所以失败时连 sessions 字段都不给，只给 success=false 让它跳过对齐
+        res["code"]    = 500;
+        res["message"] = "服务器异常，加载会话列表失败";
+        res["success"] = false;
+        std::cout << "[LoadAgentSessions业务] 加载失败 userId=" << userId
+                  << ", retCode=" << retCode << std::endl;
+        return;
+    }
+
+    // retcode 契约：1=有会话，2=无会话，其余（0 / -1）都是过程内部抛异常。
+    // 这一道必须卡死，理由同上：过程报错时结果集是空的，如果当成"没有会话"回
+    // success=true + []，客户端会照样清空本地历史 —— 等于把库侧故障放大成用户数据丢失
+    if (retCode != 1 && retCode != 2)
+    {
+        res["code"]    = 500;
+        res["message"] = "服务器异常，加载会话列表失败";
+        res["success"] = false;
+        std::cout << "[LoadAgentSessions业务] 过程异常 userId=" << userId
+                  << ", retCode=" << retCode << std::endl;
+        return;
+    }
+
+    json list = json::array();
+    for (const auto& info : threads)
+    {
+        // 会话项只下发客户端需要的两个字段：ID 和 名称。
+        // 库里的 threadId 是 uint32，而协议约定所有ID都以字符串形式走网，
+        // 所以这里必须显式转成字符串；直接塞数字客户端会当成 number 解析失败。
+        // 另外不能用花括号初始列表直接 push_back：nlohmann 不认那种写法
+        json item;
+        item["sessionId"] = std::to_string(info.threadId);
+        item["title"]     = info.threadName;
+        list.push_back(item);
+    }
+
+    res["code"]     = 0;
+    res["message"]  = threads.empty() ? "暂无会话" : "";
+    res["success"]  = true;
+    res["sessions"] = list;
+
+    std::cout << "[LoadAgentSessions业务] userId=" << userId
+              << ", 会话数=" << threads.size()
+              << ", retCode=" << retCode << std::endl;
+}

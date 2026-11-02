@@ -31,6 +31,12 @@ enum class  CmdType {
     AckDelFriendCache,//回执并清除已同步的删除墓碑
     Examine,//心跳检验（纯存活探测，不查库）
     AgentRequest,//智能体请求，前端申请调用智能体服务，后端转发给智能体服务端
+    AgentMessageCreate,//建消息行：服务器先分配正式消息ID回给客户端，客户端再带着它发 agent_request
+    AgentStop,//中断某条会话正在进行的智能体回答（流程结束或用户中途点停止）
+    AgentSessionCreate,//新建智能体会话（会话ID由客户端生成，服务器只按它建行）
+    AgentSessionRename,//智能体会话改名
+    AgentSessionDelete,//删除智能体会话
+    AgentSessionsList,//登录后拉取本账号的全部智能体会话（请求叫 pull，响应包叫 list）
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -60,6 +66,12 @@ enum class  CmdType {
     std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleExamine(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAgentRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentMessageCreate(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentStop(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionCreate(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionRename(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionDelete(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionsList(const json& req, mysqlconn& conn, SessionPtr session);
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
@@ -86,6 +98,14 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::AckDelFriendCache, HandleAckDelFriendCache},
     {CmdType::Examine, HandleExamine},
     {CmdType::AgentRequest, HandleAgentRequest},
+    // 注意：枚举值和处理器必须成对登记。漏登记的话 message 会在 cmd_table.find() 里
+    // 落到 end()，客户端只能收到一个空包，看起来就是"请求石沉大海"
+    {CmdType::AgentMessageCreate, HandleAgentMessageCreate},
+    {CmdType::AgentStop, HandleAgentStop},
+    {CmdType::AgentSessionCreate, HandleAgentSessionCreate},
+    {CmdType::AgentSessionRename, HandleAgentSessionRename},
+    {CmdType::AgentSessionDelete, HandleAgentSessionDelete},
+    {CmdType::AgentSessionsList, HandleAgentSessionsList},
 };
 
 #endif //UNTITLED_TABLE_H

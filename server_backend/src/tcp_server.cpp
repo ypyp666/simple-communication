@@ -51,6 +51,7 @@ bool TcpServer::InitSocket() {
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
         perror("socket 创建失败");
+        listen_fd_ = -1;
         return false;
     }
 
@@ -63,15 +64,20 @@ bool TcpServer::InitSocket() {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port_);
 
+    // 下面每个失败分支 close 完都必须把 listen_fd_ 置回 -1：
+    // 否则析构 -> Stop() 会拿着这个已经释放的编号再 close 一次，
+    // 万一该编号已被别的线程新开的 fd（比如某个客户端的 mysql fd）复用，就会误关别人的连接
     if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         perror("bind 失败");
         close(listen_fd_);
+        listen_fd_ = -1;
         return false;
     }
 
     if (listen(listen_fd_, backlog_) < 0) {
         perror("listen 失败");
         close(listen_fd_);
+        listen_fd_ = -1;
         return false;
     }
 
@@ -155,15 +161,20 @@ void* TcpServer::ClientWork(void* arg) {
             if (ch == '\n') {
                 std::cout << "[" << ip << "] 完整JSON: " << single_json << std::endl;
                 std::string reply = JsonParsing(single_json + "\n", mysqlconnect, sess);
-                // 打印真正发出去的报文（reply 末尾自带换行，这里不再额外补）
-                std::cout << "[" << ip << "] 发送JSON: " << reply;
-                // 统一走 Session::SendJson：内部持 sendMtx 并检查 closed，
-                // 这样智能体 worker 线程往同一个 fd 推送时不会和这里抢出半行 JSON
-                if (!sess->SendJson(reply))
+                // 空回包 = 这条请求按协议不需要应答（agent_stop），直接跳过发送。
+                // 补一个 '\n' 发出去对端会收到一行空数据，解析直接失败
+                if (!reply.empty())
                 {
-                    std::cout<<'\n'<<std::endl;
-                    offline = true;
-                    break;
+                    // 打印真正发出去的报文（reply 末尾自带换行，这里不再额外补）
+                    std::cout << "[" << ip << "] 发送JSON: " << reply;
+                    // 统一走 Session::SendJson：内部持 sendMtx 并检查 closed，
+                    // 这样智能体 worker 线程往同一个 fd 推送时不会和这里抢出半行 JSON
+                    if (!sess->SendJson(reply))
+                    {
+                        std::cout<<'\n'<<std::endl;
+                        offline = true;
+                        break;
+                    }
                 }
                 single_json.clear();
             } else {

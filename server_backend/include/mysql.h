@@ -58,6 +58,17 @@ struct DelFriendEventInfo {
     uint32_t targetId; // 被删除者；等于发起拉取的账号本人
 };
 
+// 智能体会话记录，供 callLoadThreads 返回结果集用（对应 thread 表）
+// 结果集列顺序固定为：thread_id, thread_name（Load_thread 内部临时表的列序）
+//
+// 注意：thread.local_thread_id 以及四个过程的 in_thread_id 都是 INT，
+// 所以这里必须是整数。客户端协议里会话ID是字符串，由 table.cpp 解析后传进来，
+// 回包时再把客户端给的原串原样回显，两边不做改写。
+struct AgentThreadInfo {
+    uint32_t threadId;      // 会话ID（thread.local_thread_id）
+    std::string threadName; // 会话标题（thread.thread_name）
+};
+
 
 class mysqlconn {
 private:
@@ -148,6 +159,31 @@ public:
     //带 target_id 就保证了只能清掉自己的墓碑
     //retcode：1=删除成功，2=没有匹配记录(重复回执或已清理过)，-1=过程内部异常
     bool callClearDeleteCache(uint32_t sendId, uint32_t targetId, int& retCode);
+
+    // ===== 智能体会话管理相关数据库过程 =====
+    // 四个过程的会话ID参数都是 IN INT，对应 thread.local_thread_id。
+    // 主键是 (userId, threadId)：会话ID由客户端生成，服务器不生成、不改写，
+    // 只负责按这两个字段建行 / 改行 / 删行 / 读行。
+
+    //对外接口24：新建会话（过程Add_thread）
+    //retcode：1=添加成功，2=会话已存在(重复添加)，-1=过程内部异常
+    //threadName 是用户输入（会话标题），进SQL前必须转义
+    bool callAddThread(uint32_t userId, uint32_t threadId, const std::string& threadName, int& retCode);
+
+    //对外接口25：会话改名（过程Change_thread_name）
+    //retcode：1=修改成功，2=会话不存在，-1=过程内部异常
+    bool callChangeThreadName(uint32_t userId, uint32_t threadId, const std::string& threadName, int& retCode);
+
+    //对外接口26：删除会话（过程Delete_thread）
+    //retcode：1=删除成功，2=会话不存在，-1=过程内部异常
+    //注意：过程体内只有 DELETE FROM thread，没有连带删消息，
+    //所以"删会话"只删会话记录本身，聊天记录不在它的职责内
+    bool callDeleteThread(uint32_t userId, uint32_t threadId, int& retCode);
+
+    //对外接口27：拉取账号的全部会话（过程Load_thread）
+    //retcode：1=存在会话，2=无会话记录，-1=过程内部异常
+    //结果集列顺序：thread_id, thread_name（过程内按 thread_id 升序输出）
+    bool callLoadThreads(uint32_t userId, std::vector<AgentThreadInfo>& outThreads, int& retCode);
 
     //注意：本类不做任何直接SELECT。数据库账号dbuser只有EXECUTE权限，
     //直接查表会报ERROR 1142，所有读操作必须走存储过程，因此没有"按账号查昵称"的接口。
