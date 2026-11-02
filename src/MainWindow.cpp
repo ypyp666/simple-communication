@@ -57,7 +57,7 @@ void MainWindow::initPages()
     m_contactWindow = new ContactWindow(this);
     SearchWindow* searchWindow = new SearchWindow(this);
     m_searchWindow = searchWindow;   // 页面栈里的指针之外再留一份成员：切页面时要清它的搜索框
-    AgentWindow* agentWindow = new AgentWindow(this);
+    AgentWindow* agentWindow = new AgentWindow(this, m_backend);
     pageStack->addWidget(m_chatWindow);
     pageStack->addWidget(m_contactWindow);
     pageStack->addWidget(searchWindow);

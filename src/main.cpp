@@ -1,6 +1,9 @@
 #include <QApplication>
 #include <QIcon>
 #include <QEventLoop>
+#include <QToolTip>
+#include <QPalette>
+#include <QColor>
 #include "MainWindow.h"
 #include "LoginWindow.h"
 
@@ -12,6 +15,15 @@ int main(int argc, char *argv[])
     app.setApplicationName("CCEarth");//设置应用名称
     app.setOrganizationName("CCEarth");//设置组织名称
     app.setApplicationVersion("1.0");//设置应用版本
+
+    // 工具提示框的配色：悬停在"重命名 / 删除"这类纯图标按钮上时靠它说明用途。
+    // 默认吃系统调色板，深色主题下会出现"黑底黑字"，提示完全看不清（截图里的黑块就是它）。
+    // 只改 QToolTip 自己的调色板，不动其它任何控件的外观
+    QPalette toolTipPalette = QToolTip::palette();
+    toolTipPalette.setColor(QPalette::ToolTipBase, QColor("#ffffff"));
+    toolTipPalette.setColor(QPalette::ToolTipText, QColor("#333333"));
+    QToolTip::setPalette(toolTipPalette);
+
     MainBackend mainBackend; // 主后端实例
 
     // 退出时机完全由本函数说了算：关掉最后一个窗口不自动退出。

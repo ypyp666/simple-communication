@@ -280,6 +280,12 @@ void LoginPage::setupUI()
         stopLoginAnimation();
         showLoginError("账号或密码错误");
     });
+    // 被服务器限流（code=429：未登录点得太频繁）：既不是密码错也不是网络问题，
+    // 提示"稍后再试"——否则用户对着正确密码反复点，越点越被限
+    connect(m_backend, &MainBackend::loginRateLimited, this, [=](){
+        stopLoginAnimation();
+        showLoginError("操作过于频繁，请稍后再试");
+    });
     // 网络层连不上（服务器没开进程/断网等）：提示语必须和"密码错误"区分开，
     // 否则用户会对着正确的密码反复重试
     connect(m_backend, &MainBackend::loginNetworkError, this, [=](){

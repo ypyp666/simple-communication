@@ -5,10 +5,12 @@
 #include <QString>
 #include <QStringList>
 #include <QThread>
+#include <QHash>
 #include <qstringview.h>
 #include "LoginBackend.h"
 #include "ChatBackend.h"
 #include "ContactBackend.h"
+#include "AgentBackend.h"
 #include "DatabaseManager.h"
 #include "TcpClient.h"
 #include "FeatureStructs.h"  // 共享结构体：ConversationInfo / ContactInfo / MessageInfo / OutgoingMessage
@@ -39,6 +41,7 @@ public:
 signals:
     void loginSuccess(const QString& accountId);
     void loginFailed();
+    void loginRateLimited();  // 登录被服务器限流（code=429）：未登录点得太频繁，与"密码错误"分开提示
     void loginNetworkError(const QString& reason);  // 网络层连不上（服务器没跑/断网），与密码错误分开
     void loginWaiting();  // 登录等待中信号
     void loginTimeout();  // 登录连接超时信号
@@ -47,15 +50,18 @@ signals:
     void sessionKicked();
     void registerSuccess();
     void registerFailed();
+    void registerRateLimited();  // 注册被服务器限流（code=429）：点得太频繁
     void registerNetworkError(const QString& reason);  // 注册时网络层连不上（服务器没跑/断网），与服务器拒绝分开
     void registerWaiting();  // 注册等待中信号
     void registerTimeout();  // 注册连接超时
     void connectForRegisterSuccess(const QString& account);  // 注册取号连接成功，服务器下发的账号 ID 随信号带回
     void connectForRegisterFailed();
+    void connectForRegisterRateLimited();  // 取号被服务器限流（code=429）：点得太频繁
     void connectForRegisterTimeout();
     void connectForRegisterWaiting();
     void modifyPwdSuccess();  // 修改密码成功（忘记密码页提交后服务器确认）
     void modifyPwdFailed();   // 修改密码失败（仅服务器明确拒绝，如账号不存在）
+    void modifyPwdRateLimited();  // 修改密码被服务器限流（code=429）：点得太频繁
     void modifyPwdNetworkError(const QString& reason);  // 修改密码时网络层连不上（服务器没跑/断网），与服务器拒绝分开
     void modifyPwdTimeout();  // 修改密码连接超时
     void modifyPwdWaiting();  // 修改密码等待中信号
@@ -119,6 +125,25 @@ signals:
     void messageReceived(const MessageInfo& message);                // 接收成功（对方发来的新消息，UI显示+存库+回ACK）
     void messageReceiveFailed(const QString& serverId);              // 接收失败（携带服务器消息ID，回ACK让服务器重发）
 
+    // === 智能体信号 ===
+    // 本地库读：智能体会话列表（喂 AgentWindow 抽屉的 MessageList）
+    void agentSessionsLoaded(const QList<ConversationInfo>& sessions);
+    // 某个智能体会话的历史消息回读结果（DB 层已把分块拼成完整内容，按时间正序）
+    void agentMessagesLoaded(const QString& sessionId, const QList<AgentMessageInfo>& messages);
+    // 服务器逐段推回的回答（finished=true 表示本轮结束），UI 负责拼接进同一个气泡
+    void agentMessageReceived(const QString& sessionId, const QString& content, bool finished);
+    void agentRequestFailed(const QString& sessionId, const QString& message);
+
+    // === 智能体会话增删改的结果（服务器说了算，三件统一"先服务器、成功才动本地"）===
+    // 新建：成功 → 本地已落库，界面进新会话页；失败/超时 → 本地没写过东西，留在原页面 + 提示
+    void agentSessionCreateSucceeded(const QString& sessionId, const QString& title);
+    void agentSessionCreateFailed(const QString& message);
+    // 改名：服务器确认后才写本地；失败 → UI 把行上的名字回滚成旧值 + 提示
+    void agentSessionRenameFailed(const QString& sessionId, const QString& message);
+    // 删除：服务器确认后才删本地；失败 → 本地一行不动，只提示
+    void agentSessionDeleteSucceeded(const QString& sessionId);
+    void agentSessionDeleteFailed(const QString& sessionId, const QString& message);
+
     // === 数据库异步请求信号（主线程发出 → 后台DB线程执行）===
     void dbSaveMessageRequested(const MessageInfo& message);
     void dbSetAccountRequested(const QString& accountId);
@@ -148,6 +173,23 @@ signals:
     void dbSaveContactRequested(const ContactInfo& contact);
     void dbDeleteContactRequested(const QString& contactId);
     void dbSetContactRemarkRequested(const QString& contactId, const QString& remark);
+    // 智能体会话 / 用户消息（主线程发出 → 后台 DB 线程执行）
+    void dbLoadAgentSessionsRequested();
+    void dbCreateAgentSessionRequested(const QString& sessionId, const QString& title,
+                                       const QDateTime& createdAt);
+    void dbSaveAgentMessageRequested(const QString& sessionId, const QString& messageId,
+                                     const QString& content, const QDateTime& createdAt);
+    // AI 回答的一段（同一回答共用一个 messageId，分块序号由 DB 层自增）
+    void dbSaveAgentMessageChunkRequested(const QString& sessionId, const QString& messageId,
+                                          const QString& content, const QDateTime& createdAt);
+    // 回读某个会话的历史消息（最近 N 条）
+    void dbLoadAgentMessagesRequested(const QString& sessionId);
+    // 登录后拉到的服务器会话列表 → 交给 DB 层核对本地（服务器有本地没有就插、
+    // 本地有服务器没有就删）。纯转发，没有主线程侧的副作用
+    void dbSyncAgentSessionsRequested(const QList<ConversationInfo>& sessions);
+    // 智能体会话的改 / 删（同样排队到后台 DB 线程执行，UI 不等 SQL）
+    void dbRenameAgentSessionRequested(const QString& sessionId, const QString& title);
+    void dbDeleteAgentSessionRequested(const QString& sessionId);
 
     // === 数据库结果信号（后台DB线程回传 → 主线程）===
     void messageSaved(bool success);
@@ -206,6 +248,22 @@ public slots:
     void clearInputContent(const QString& contactId);
     // 断开会话：直接关闭当前 TCP 连接（转发到 TcpClient）
     void disconnectSession();
+    // === 智能体接口 ===
+    // 拉智能体会话列表（喂 AgentWindow 抽屉）
+    void loadAgentSessions();
+    // 新建一个智能体会话：写库后立刻重拉列表（"写后必读"，抽屉马上出现新行）
+    void createAgentSession(const QString& sessionId, const QString& title);
+    // 发一条用户消息：先向服务器要消息 ID → 落库成功 → 才发 agent_request。
+    // UI 只给会话 ID 和内容，消息 ID 统一由服务器分配
+    void sendAgentMessage(const QString& sessionId, const QString& content);
+    // 回读某个会话的历史消息（最近 50 条），结果由 agentMessagesLoaded 回传
+    void loadAgentMessages(const QString& sessionId);
+    // 停止当前会话正在回答的那一轮：发 agent_stop，并把这轮落库用的消息 ID 清掉
+    void stopAgentMessage(const QString& sessionId);
+    // 重命名智能体会话：写库后重拉列表
+    void renameAgentSession(const QString& sessionId, const QString& title);
+    // 删除智能体会话：连同该会话的全部消息一起删（后台 DB 线程执行，UI 不会卡）
+    void deleteAgentSession(const QString& sessionId);
     // 登出：预留的口。当前登录账号作废，通知各功能后端把自己那份 ID 清成空白。
     // 真正的登出流程（断开 TCP、回登录页）还没接，这里只负责"清账号"这一件事
     void logout();
@@ -244,6 +302,27 @@ private slots:
     // 合并节流后真正去拉会话列表（见 MainBackend::loadConversations 的说明）
     void onCoalescedLoadConversations();
     void onDbContactsLoaded(const QList<ContactInfo>& contacts);
+    // 服务器逐段推回 AI 回答（在主线程执行）：先把这一段落库（分块），再原样转发给界面。
+    // 落库放在这里而不是 UI 层：用户切到别的会话后界面会忽略这段内容，但数据仍要进库
+    void onAgentMessageReceived(const QString& sessionId, const QString& content, bool finished);
+
+    // === 提问三段式（在主线程串起来）===
+    // ① 服务器分配了消息 ID → 让后台 DB 线程按这个 ID 存用户消息
+    void onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId);
+    // ①' 申请 ID 失败（未连接 / 服务器拒绝）→ 取消这一轮，把发送状态还给界面
+    void onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message);
+    // ② 落库结果：成功才发 agent_request（带消息ID / 会话ID / 用户ID / 问题）
+    void onAgentMessageSaved(const QString& sessionId, const QString& messageId, bool success);
+
+    // 会话三件套的服务器回执（在主线程执行）：这里是本地库唯一的"写入口"——
+    // 三件都是服务器确认成功后才动本地，失败时本地什么都不用回滚。
+    // 六条槽一一对应 AgentBackend 的六条信号，不做"按 op 分发"的合并写法
+    void onAgentSessionCreated(const QString& sessionId, const QString& title);
+    void onAgentSessionCreateFailed(const QString& sessionId, const QString& message);
+    void onAgentSessionRenamed(const QString& sessionId, const QString& title);
+    void onAgentSessionRenameFailed(const QString& sessionId, const QString& message);
+    void onAgentSessionDeleted(const QString& sessionId);
+    void onAgentSessionDeleteFailed(const QString& sessionId, const QString& message);
     void onDbInitialized(bool success);
     // 服务器确认删好友成功：本地这时才真删（删库 + 重拉通讯录刷新列表），再上抛 friendDeleted
     void onFriendDeleteSuccess(const QString& targetId);
@@ -286,7 +365,14 @@ private:
     LoginBackend* m_loginBackend;
     ChatBackend* m_chatBackend;
     ContactBackend* m_contactBackend;
+    AgentBackend* m_agentBackend;
     QThread* m_dbThread;  // 后台数据库线程
+    // 每个会话"当前正在流式输出的 AI 回答"的 messageId（会话ID → 消息ID）。
+    // 第一段到达时生成 UUID，finished 后清掉；同一回答的所有分块靠它归组
+    QHash<QString, QString> m_agentReplyIds;
+    // 提问在"申请 ID → 落库 → 发对话请求"之间要暂存的用户问题（会话ID → 问题）。
+    // 落库成功、真正发出去后清掉；申请 ID 失败也清掉
+    QHash<QString, QString> m_pendingPrompts;
 
     // 注册登录后端（登录/修改密码）的信号连接，从构造函数抽出，避免构造函数越堆越长
     void setupLoginConnections();

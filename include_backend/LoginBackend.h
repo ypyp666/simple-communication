@@ -55,6 +55,9 @@ public:
 signals:
     void loginSuccess(const QString& accountId);
     void loginFailed();        // 仅"服务器明确拒绝"（login_response success=false），即账号不存在/密码错误
+    // 服务器限流（code=429）：未登录状态下点得太频繁，服务器拒的不是账号密码。
+    // 与 loginFailed 分开，UI 提示"稍后再试"而不是"账号或密码错误"
+    void loginRateLimited();
     void loginNetworkError(const QString& reason);  // 网络层连不上（连接被拒/断网等），与密码错误分开提示
     void loginWaiting();
     void loginTimeout();
@@ -64,15 +67,18 @@ signals:
     void reconnectLoginFailed();
     void connectForRegisterSuccess(const QString& account);  // 注册取号连接成功，服务器下发的账号 ID 随信号带回
     void connectForRegisterFailed();
+    void connectForRegisterRateLimited();  // 服务器限流（code=429）：取号点得太频繁
     void connectForRegisterTimeout();
     void connectForRegisterWaiting();
     void registerSuccess();    // 注册成功
     void registerFailed();     // 仅"服务器明确拒绝"（register_response success=false），如账号已存在
+    void registerRateLimited();  // 服务器限流（code=429）：注册提交点得太频繁
     void registerNetworkError(const QString& reason);  // 网络层连不上（连接被拒/断网等），与服务器拒绝分开提示
     void registerWaiting();    // 注册等待中信号
     void registerTimeout();    // 注册连接超时
     void modifyPwdSuccess();   // 修改密码成功
     void modifyPwdFailed();    // 仅"服务器明确拒绝"（modify_password_response success=false），如账号不存在
+    void modifyPwdRateLimited();  // 服务器限流（code=429）：修改密码点得太频繁
     void modifyPwdNetworkError(const QString& reason);  // 网络层连不上（连接被拒/断网等），与服务器拒绝分开提示
     void modifyPwdTimeout();   // 修改密码连接超时
     void modifyPwdWaiting();   // 修改密码等待中信号

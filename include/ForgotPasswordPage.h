@@ -59,6 +59,8 @@ private:
     void onModifyPwdSuccess();
     //槽函数：修改密码失败信号
     void onModifyPwdFailed();
+    //槽函数：修改密码被服务器限流（code=429），点得太频繁
+    void onModifyPwdRateLimited();
     //槽函数：修改密码时网络层连不上（服务器没跑/断网），与服务器拒绝分开提示
     void onModifyPwdNetworkError();
     //槽函数：修改密码连接超时信号

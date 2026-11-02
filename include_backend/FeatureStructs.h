@@ -82,6 +82,14 @@ struct OutgoingMessage {
     QString tempId;        //临时ID
 };
 
+// 智能体会话的一条消息（回读历史用：数据库里的分块已被拼成完整内容）
+struct AgentMessageInfo {
+    QString id;            // 消息ID（分块按它归组）
+    QString content;       // 拼好的完整内容
+    bool isSelf;           // true=用户提问，false=智能体回答
+    QDateTime createdAt;   // 该消息第一块的落库时间
+};
+
 // =============================================================================
 // 功能标识枚举（登录 / 注册 / 修改密码 / 消息发送）
 // 登录、注册和"忘记密码（修改密码）"都发生在未登录阶段，都要走同一条共享 TcpClient，
@@ -112,5 +120,6 @@ Q_DECLARE_METATYPE(FriendRequestInfo)
 Q_DECLARE_METATYPE(ConversationInfo)
 Q_DECLARE_METATYPE(MessageInfo)
 Q_DECLARE_METATYPE(OutgoingMessage)
+Q_DECLARE_METATYPE(AgentMessageInfo)
 
 #endif // FEATURESTRUCTS_H

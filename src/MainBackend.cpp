@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QTimer>
+#include <QUuid>
 #include <qstringview.h>
 
 
@@ -23,6 +24,9 @@ MainBackend::MainBackend(QObject* parent)
     // 单条也要注册
     qRegisterMetaType<ContactInfo>();
     qRegisterMetaType<ConversationInfo>();
+    // 智能体历史消息回读：DB 线程查完带 QList<AgentMessageInfo> 回主线程，同样要注册
+    qRegisterMetaType<AgentMessageInfo>();
+    qRegisterMetaType<QList<AgentMessageInfo>>();
 
     
     // 1. 创建后台数据库线程
@@ -73,6 +77,24 @@ MainBackend::MainBackend(QObject* parent)
             m_databaseManager, &DatabaseManager::deleteContact);
     connect(this, &MainBackend::dbSetContactRemarkRequested,
             m_databaseManager, &DatabaseManager::setContactRemark);
+    // 智能体会话 / 用户消息：读写同样在后台 DB 线程执行
+    connect(this, &MainBackend::dbLoadAgentSessionsRequested,
+            m_databaseManager, &DatabaseManager::loadAgentSessions);
+    connect(this, &MainBackend::dbCreateAgentSessionRequested,
+            m_databaseManager, &DatabaseManager::createAgentSession);
+    connect(this, &MainBackend::dbSaveAgentMessageRequested,
+            m_databaseManager, &DatabaseManager::saveAgentMessage);
+    connect(this, &MainBackend::dbSaveAgentMessageChunkRequested,
+            m_databaseManager, &DatabaseManager::saveAgentMessageChunk);
+    connect(this, &MainBackend::dbLoadAgentMessagesRequested,
+            m_databaseManager, &DatabaseManager::loadAgentMessages);
+    // 登录后拉到的会话列表：核对本地库（补插缺失 / 删掉服务器上没了的）
+    connect(this, &MainBackend::dbSyncAgentSessionsRequested,
+            m_databaseManager, &DatabaseManager::syncAgentSessions);
+    connect(this, &MainBackend::dbRenameAgentSessionRequested,
+            m_databaseManager, &DatabaseManager::renameAgentSession);
+    connect(this, &MainBackend::dbDeleteAgentSessionRequested,
+            m_databaseManager, &DatabaseManager::deleteAgentSession);
 
 
     // 5. 结果信号（后台线程发出）→ 本类槽（主线程）：跨线程自动 QueuedConnection
@@ -94,6 +116,7 @@ MainBackend::MainBackend(QObject* parent)
     m_loginBackend = new LoginBackend(this,m_tcpClient);
     m_chatBackend = new ChatBackend(this, m_tcpClient);
     m_contactBackend = new ContactBackend(this, m_tcpClient);   // 通讯录后端（共用同一个 TcpClient 发好友请求）
+    m_agentBackend = new AgentBackend(this, m_tcpClient);       // 智能体后端（共用同一条连接收发 agent_request/response）
     
     connect(m_tcpClient, &TcpClient::dataReceived, this, &MainBackend::JsonParsing);
     // TcpClient 共享信号统一路由到主后端，再分发给需要的后端（各后端不再直连）
@@ -116,6 +139,12 @@ MainBackend::MainBackend(QObject* parent)
             this, &MainBackend::onDbConversationsLoaded);
     connect(m_databaseManager, &DatabaseManager::contactsLoaded,
             this, &MainBackend::onDbContactsLoaded);
+    // 智能体会话列表：纯转发（没有副作用），信号对信号直接给 UI
+    connect(m_databaseManager, &DatabaseManager::agentSessionsLoaded,
+            this, &MainBackend::agentSessionsLoaded);
+    // 会话历史消息回读结果：同样纯转发（分块已经由 DB 层拼好）
+    connect(m_databaseManager, &DatabaseManager::agentMessagesLoaded,
+            this, &MainBackend::agentMessagesLoaded);
     // 通讯录的"出口"在 ContactBackend：它排完序发 contactsLoaded，
     // 这里信号接信号，原样转成 MainBackend::contactsLoaded 给 UI（喂 ContactList）
     connect(m_contactBackend, &ContactBackend::contactsLoaded,
@@ -178,6 +207,36 @@ MainBackend::MainBackend(QObject* parent)
             this, &MainBackend::onMessageReceived);
     connect(m_chatBackend, &ChatBackend::messageReceiveFailed,
             this, &MainBackend::onMessageReceiveFailed);
+    // 智能体回答：先在槽里分块落库，再转发给 UI 显示（落库不能让 UI 层负责，
+    // 否则用户切走会话后这段回答就丢了）
+    connect(m_agentBackend, &AgentBackend::agentMessageReceived,
+            this, &MainBackend::onAgentMessageReceived);
+    connect(m_agentBackend, &AgentBackend::agentRequestFailed,
+            this, &MainBackend::agentRequestFailed);
+    // 提问第一阶段：服务器分配消息 ID → 主线程存库 → 存成功才发对话请求（见下面三个槽）
+    connect(m_agentBackend, &AgentBackend::agentMessageIdAllocated,
+            this, &MainBackend::onAgentMessageIdAllocated);
+    connect(m_agentBackend, &AgentBackend::agentMessageIdAllocateFailed,
+            this, &MainBackend::onAgentMessageIdAllocateFailed);
+    connect(m_databaseManager, &DatabaseManager::agentMessageSaved,
+            this, &MainBackend::onAgentMessageSaved);
+    // 登录后拉回的服务器会话列表：纯转发到 DB 线程做核对，主线程不做任何判断，
+    // 所以信号对信号直接接
+    connect(m_agentBackend, &AgentBackend::agentSessionsPulled,
+            this, &MainBackend::dbSyncAgentSessionsRequested);
+    // 会话三件套的回执：六条信号各接各的具名槽（有副作用，不能信号对信号直连）
+    connect(m_agentBackend, &AgentBackend::agentSessionCreated,
+            this, &MainBackend::onAgentSessionCreated);
+    connect(m_agentBackend, &AgentBackend::agentSessionCreateFailed,
+            this, &MainBackend::onAgentSessionCreateFailed);
+    connect(m_agentBackend, &AgentBackend::agentSessionRenamed,
+            this, &MainBackend::onAgentSessionRenamed);
+    connect(m_agentBackend, &AgentBackend::agentSessionRenameFailed,
+            this, &MainBackend::onAgentSessionRenameFailed);
+    connect(m_agentBackend, &AgentBackend::agentSessionDeleted,
+            this, &MainBackend::onAgentSessionDeleted);
+    connect(m_agentBackend, &AgentBackend::agentSessionDeleteFailed,
+            this, &MainBackend::onAgentSessionDeleteFailed);
 }
 
 MainBackend::~MainBackend()
@@ -205,6 +264,10 @@ void MainBackend::setupLoginConnections()
                 m_loginBackend->setUserId(m_userid);   // 登录后端（登录/注册/改密流程用）
                 m_chatBackend->setUserId(m_userid);    // 聊天后端（拉取重试需要）
                 m_contactBackend->setUserId(m_userid); // 好友后端（好友请求要带申请人ID）
+                m_agentBackend->setUserId(m_userid);   // 智能体后端（预留账号）
+                // 登录成功顺带拉服务器上的智能体会话列表：本地库和它核对一遍
+                //（服务器有本地没有 → 补插；本地有服务器没有 → 删掉）
+                m_agentBackend->pullAgentSessions();
                 emit loginSuccess(m_userid);
                 // 登录成功 → 开启断线自愈 + 心跳检验（TcpClient 里每 3 秒一次的定时器）。
                 // 自愈打开后，这次会话期间链路断了由 TcpClient 退避重连一直试到连上
@@ -222,6 +285,14 @@ void MainBackend::setupLoginConnections()
                 s_loggedIn = false;                  // 登录失败，重置全局登录状态
                 resetFeature();
                 emit loginFailed();
+            });
+    // 登录被服务器限流（code=429）：与 loginFailed 同为流程终态（清状态 + 功能标记），
+    // 但单独转发让 UI 提示"稍后再试"——误报"账号或密码错误"会让用户对着正确密码反复点
+    connect(m_loginBackend, &LoginBackend::loginRateLimited,
+            this, [this](){
+                s_loggedIn = false;
+                resetFeature();
+                emit loginRateLimited();
             });
     // 网络层连不上（服务器没跑/断网）：与"密码错误"分开，UI 提示语不同，但同样是流程终态
     connect(m_loginBackend, &LoginBackend::loginNetworkError,
@@ -270,6 +341,12 @@ void MainBackend::setupLoginConnections()
                 resetFeature();
                 emit modifyPwdFailed();
             });
+    // 修改密码被服务器限流（code=429）：同样是终态、同样清功能标记，单独提示"稍后再试"
+    connect(m_loginBackend, &LoginBackend::modifyPwdRateLimited,
+            this, [this](){
+                resetFeature();
+                emit modifyPwdRateLimited();
+            });
     // 修改密码时网络层连不上：与"服务器拒绝"（modifyPwdFailed）分开，提示语不同，同样是终态
     connect(m_loginBackend, &LoginBackend::modifyPwdNetworkError,
             this, [this](const QString& reason){
@@ -300,6 +377,12 @@ void MainBackend::setupLoginConnections()
                 resetFeature();
                 emit connectForRegisterFailed();
             });
+    // 取号被服务器限流（code=429）：同样是终态、同样清功能标记，单独提示"稍后再试"
+    connect(m_loginBackend, &LoginBackend::connectForRegisterRateLimited,
+            this, [this](){
+                resetFeature();
+                emit connectForRegisterRateLimited();
+            });
     connect(m_loginBackend, &LoginBackend::connectForRegisterTimeout,
             this, [this](){
                 resetFeature();
@@ -315,6 +398,12 @@ void MainBackend::setupLoginConnections()
             this, [this](){
                 resetFeature();
                 emit registerFailed();
+            });
+    // 注册被服务器限流（code=429）：同样是终态、同样清功能标记，单独提示"稍后再试"
+    connect(m_loginBackend, &LoginBackend::registerRateLimited,
+            this, [this](){
+                resetFeature();
+                emit registerRateLimited();
             });
     // 注册时网络层连不上：与"服务器拒绝"（registerFailed）分开，提示语不同，同样是终态
     connect(m_loginBackend, &LoginBackend::registerNetworkError,
@@ -465,12 +554,14 @@ void MainBackend::onDbMessageIdUpdated(const QString& contactId, const QString& 
 // 所以这里不立刻发请求，只立一个"已预约"标记，等本轮事件循环转回来（0ms 定时器）再发一趟。
 // 有标记就直接返回，重复的调用被合并掉——省的是"整表重建 UI 列表"的次数，不是数据库查询
 void MainBackend::loadConversations()
-{
+{//合并节流还有另一种玩法时间计时每一次操作都会把计时器归零，当计时器跑到了指定的时间比如说50ms才会触发合并节流
     if (m_conversationsLoadPending) {
         return;   // 本轮已经约过了，这次并进去
     }
+    //事件循环轮次合并（0ms singleShot 合并），等本轮事件循环转回来（0ms 定时器）再发一趟。
     m_conversationsLoadPending = true;
     QTimer::singleShot(0, this, &MainBackend::onCoalescedLoadConversations);
+    //singleshot的机制当时间大于0时会交给系统内核去计时，但是等于0时会直接进入事件队列循环，等本轮事件循环转回来再执行
 }
 
 // 合并后真正去拉：清掉标记再发请求。清标记必须在这里（而不是发请求之后），
@@ -931,6 +1022,179 @@ void MainBackend::prepareRegisterConnection()
     m_currentFeature = LoginFeature::ConnectForRegister;   // 标记这条连接服务于"注册取号"
 }
 
+// ===== 智能体会话 / 消息 =====
+
+// 拉智能体会话列表：与 loadConversations 同一套路，只发请求，结果经
+// DatabaseManager::agentSessionsLoaded → 本类同名信号 → AgentWindow 抽屉
+void MainBackend::loadAgentSessions()
+{
+    emit dbLoadAgentSessionsRequested();
+}
+
+// 新建会话（三件套统一范式：先服务器，成功才动本地）：
+// thread_id 由客户端先生成，服务器用 (thread_id, user_id) 做联合主键，
+// 所以不需要临时 ID，回包里带回的也是这个 thread_id。
+// 服务器 5 秒内确认成功 → 才把会话行写进本地库并重拉列表；
+// 超时/失败 → 本地什么都没写，自然也不需要回滚
+void MainBackend::createAgentSession(const QString& sessionId, const QString& title)
+{
+    m_agentBackend->sendAgentSessionCreate(sessionId, title);
+}
+
+// 提问第一阶段：只先把问题暂存下来，向服务器申请这条消息的 ID。
+// 真正的落库 + 发对话请求都在拿到 ID 之后（见 onAgentMessageIdAllocated / onAgentMessageSaved）
+void MainBackend::sendAgentMessage(const QString& sessionId, const QString& content)
+{
+    if (sessionId.isEmpty()) {
+        return;
+    }
+
+    m_pendingPrompts.insert(sessionId, content);
+    m_agentBackend->requestAgentMessageId(sessionId);
+}
+
+// 服务器给了消息 ID：按这个 ID 先"空创建"一条用户消息（内容是用户刚输入的问题），
+// 落库结果回来后才发对话请求
+void MainBackend::onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId)
+{
+    const QString prompt = m_pendingPrompts.value(sessionId);
+    emit dbSaveAgentMessageRequested(sessionId, messageId, prompt, QDateTime::currentDateTime());
+}
+
+// 申请 ID 失败：这一轮走不下去了，把暂存的问题清掉，并复用请求失败信号让界面收回发送状态
+void MainBackend::onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message)
+{
+    m_pendingPrompts.remove(sessionId);
+    emit agentRequestFailed(sessionId, message);
+}
+
+// 提问第三阶段（入库回执）：成功 → 带着消息ID / 会话ID / 用户ID / 问题发 agent_request；
+// 失败 → 本轮取消（库里没存下，就不该让服务器开始回答）
+void MainBackend::onAgentMessageSaved(const QString& sessionId, const QString& messageId, bool success)
+{
+    const QString prompt = m_pendingPrompts.take(sessionId);
+
+    if (!success) {
+        emit agentRequestFailed(sessionId, QStringLiteral("用户消息保存失败，本轮已取消"));
+        return;
+    }
+
+    // 用户消息更新了会话快照（最后一句/时间），重拉一次抽屉列表
+    emit dbLoadAgentSessionsRequested();
+
+    // 问题为空 = 用户在这一步之前已经点了停止（stopAgentMessage 清掉了暂存的问题）：
+    // 消息已经落库但不再往下发对话请求
+    if (prompt.isEmpty()) {
+        return;
+    }
+    m_agentBackend->sendAgentRequest(sessionId, messageId, prompt);
+}
+
+// 回读某个会话的历史消息（最近 50 条）：只发请求，
+// 结果经 DatabaseManager::agentMessagesLoaded → 本类同名信号 → AgentChatArea 重建气泡
+void MainBackend::loadAgentMessages(const QString& sessionId)
+{
+    emit dbLoadAgentMessagesRequested(sessionId);
+}
+
+// 停止本轮回答：停止包交给 AgentBackend 发（它顺便放掉"在飞"标记，
+// 之后漏过来的片段不再被当成这一轮的内容）。
+// 这里再把这条回答的落库 ID 抹掉：即使真漏了一段过来，也是另起一条消息，
+// 不会把已经显示出来的半截回答接着续上
+void MainBackend::stopAgentMessage(const QString& sessionId)
+{
+    if (m_agentBackend != nullptr) {
+        m_agentBackend->stopAgentRequest(sessionId);
+    }
+    m_agentReplyIds.remove(sessionId);
+    // 还可能停在"申请 ID / 等落库"阶段：把暂存的问题丢掉，
+    // 之后即使 ID 回执晚到，也不会再发对话请求（见 onAgentMessageSaved 的空问题判断）
+    m_pendingPrompts.remove(sessionId);
+}
+
+// 服务器逐段推回 AI 回答：先保证这一段落库，再原样转发给界面。
+// messageId 按"一次回答"生成：第一段到达时建一个 UUID，同一条回答的所有分块共用它，
+// finished 后清掉，下一轮回答换新 ID（也避免和重启前的旧记录撞主键）
+void MainBackend::onAgentMessageReceived(const QString& sessionId, const QString& content, bool finished)
+{
+    if (!content.isEmpty()) {
+        QString& replyId = m_agentReplyIds[sessionId];
+        if (replyId.isEmpty()) {
+            replyId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        }
+        // 每段写一块：单块体积小，超长回答也不会把一行撑到离谱；
+        // 中途崩溃时已经落库的部分还能读回来
+        emit dbSaveAgentMessageChunkRequested(sessionId, replyId, content, QDateTime::currentDateTime());
+    }
+
+    if (finished) {
+        m_agentReplyIds.remove(sessionId);
+    }
+
+    // 照旧把流式内容转发给界面（界面按自己的当前会话决定显不显示）
+    emit agentMessageReceived(sessionId, content, finished);
+}
+
+// 改名：先问服务器，服务器确认后才改本地（超时/失败本地一行不动，UI 把行上的名字回滚）。
+// 这样不会出现"本地叫新名字、服务器还是旧名字"，也不需要"先改再改回去"这种回滚
+void MainBackend::renameAgentSession(const QString& sessionId, const QString& title)
+{
+    m_agentBackend->sendAgentSessionRename(sessionId, title);
+}
+
+// 删除会话：同样是"服务器优先"。服务器确认后才删本地（先删全部消息、再删会话行，
+// 由后台 DB 线程执行）。没确认之前本地一行不动——消息一旦删掉就找不回来了
+void MainBackend::deleteAgentSession(const QString& sessionId)
+{
+    m_agentBackend->sendAgentSessionDelete(sessionId);
+}
+
+// ===== 会话新建 =====
+// 服务器认了才落库：先写会话行、再重拉列表，最后让界面切进新会话。
+// 顺序上先写库后通知 UI：切页时抽屉里的那一行已经在路上了
+void MainBackend::onAgentSessionCreated(const QString& sessionId, const QString& title)
+{
+    emit dbCreateAgentSessionRequested(sessionId, title, QDateTime::currentDateTime());
+    emit dbLoadAgentSessionsRequested();
+    emit agentSessionCreateSucceeded(sessionId, title);
+}
+
+// 创建失败 / 超时：本地从来没写过东西，不用回滚，只把结果告诉界面
+void MainBackend::onAgentSessionCreateFailed(const QString& sessionId, const QString& message)
+{
+    Q_UNUSED(sessionId);
+    emit agentSessionCreateFailed(message);
+}
+
+// ===== 会话改名 =====
+// 服务器认了才写本地；写完重拉列表，抽屉那一行就换成新名字
+void MainBackend::onAgentSessionRenamed(const QString& sessionId, const QString& title)
+{
+    emit dbRenameAgentSessionRequested(sessionId, title);
+    emit dbLoadAgentSessionsRequested();
+}
+
+// 改名失败 / 超时：本地库没动过，界面把行上的名字回滚 + 提示
+void MainBackend::onAgentSessionRenameFailed(const QString& sessionId, const QString& message)
+{
+    emit agentSessionRenameFailed(sessionId, message);
+}
+
+// ===== 会话删除 =====
+// 服务器认了才真删（消息 + 会话行，后台 DB 线程做），然后重拉列表
+void MainBackend::onAgentSessionDeleted(const QString& sessionId)
+{
+    emit dbDeleteAgentSessionRequested(sessionId);
+    emit dbLoadAgentSessionsRequested();
+    emit agentSessionDeleteSucceeded(sessionId);
+}
+
+// 删除失败 / 超时：本地一行不动，只提示
+void MainBackend::onAgentSessionDeleteFailed(const QString& sessionId, const QString& message)
+{
+    emit agentSessionDeleteFailed(sessionId, message);
+}
+
 void MainBackend::JsonParsing(const QByteArray packet)
 {
     qDebug() << "收到服务器数据:" << packet;
@@ -972,6 +1236,10 @@ void MainBackend::JsonParsing(const QByteArray packet)
     else if (type == "pull_response") {
         // 服务器发完所有缓存消息后发来的拉取确认包，交给聊天后端处理（停止拉取定时器）
         m_chatBackend->onPullResponse(packet);
+    }
+    else if (type == "agent_response") {
+        // 智能体回答包（worker 逐段推回，流式拼接交给 UI）
+        m_agentBackend->onTcpDataReceived(packet);
     }
     else if (type == "friend_request_response"
           || type == "friend_request"                 // 服务器推送：别人发给我的好友申请
