@@ -8,6 +8,16 @@
 
 namespace
 {
+// item 上挂的两份数据：
+//   kRoleContactId   → 会话/联系人 ID（点击时用来切会话）
+//   kRoleContactName → 这一行最终显示的名字
+// 为什么名字也要挂在 item 上：建行的时候（rebuildItems）名字就已经算好了，
+// 点击时直接 item->data(kRoleContactName) 取是 O(1)，而且和行内控件结构完全解耦。
+// 以前是"渲染时不存、点击时顺着 itemWidget 的布局反查标签文字"，
+// 那种写法隐式依赖 itemAt(1)/itemAt(0) 的顺序，布局一改就静默拿不到名字（甚至空指针）
+constexpr int kRoleContactId = Qt::UserRole;
+constexpr int kRoleContactName = Qt::UserRole + 1;
+
 // 会话列表的排序规则：最后一条消息的时间越新，排得越靠上（倒序）。
 // 排序键取 ConversationInfo::lastTime —— 会话快照里"最后一条消息"的时间，
 // 拿它排正好对上 IM 的通用习惯：刚聊过的会话顶到最上面。
@@ -169,8 +179,10 @@ void MessageList::rebuildItems()
         const QString displayName = displayNameOf(conversation);
 
         QListWidgetItem* item = new QListWidgetItem(listWidget);
-        item->setData(Qt::UserRole, conversation.id);//给这一行藏一个好友 ID点击这一行时，就能知道是哪个联系人。
+        item->setData(kRoleContactId, conversation.id);//给这一行藏一个好友 ID点击这一行时，就能知道是哪个联系人。
         // UserRole : 是槽位编号
+        // 名字同样在建行时就存进去：点击回包要用它，别等到点击时再去界面里反查
+        item->setData(kRoleContactName, displayName);
         item->setSizeHint(QSize(0, 62));
 
         QWidget* container = new QWidget();//创建一个容器，用来装所有的子控件
@@ -277,7 +289,7 @@ void MessageList::highlightContact(const QString& contactId)
     for (int i = 0; i < listWidget->count(); ++i)
     {
         QListWidgetItem* item = listWidget->item(i);
-        if (item->data(Qt::UserRole).toString() == contactId)
+        if (item->data(kRoleContactId).toString() == contactId)
         {
             listWidget->setCurrentItem(item);
             listWidget->scrollToItem(item, QAbstractItemView::PositionAtCenter);
@@ -289,7 +301,7 @@ void MessageList::highlightContact(const QString& contactId)
 
 void MessageList::onItemClicked(QListWidgetItem* item)//用户点击了列表里的某一行，Qt 自动调用这个函数。
 {
-    QString contactId = item->data(Qt::UserRole).toString();//获取点击的项的用户角色数据(联系人ID)
+    /*QString contactId = item->data(Qt::UserRole).toString();//获取点击的项的用户角色数据(联系人ID)
 
 
     QWidget* widget = listWidget->itemWidget(item);//获取点击的项对应的 QWidget
@@ -325,6 +337,17 @@ void MessageList::onItemClicked(QListWidgetItem* item)//用户点击了列表里
                 }
             }
         }
+            控件树的使用示例*/
+    // ID 和名字都在建行时就挂在 item 上了（见 rebuildItems），这里直接取。
+    // 以前是顺着 itemWidget 的布局往下爬（itemAt(1)->widget()->layout()->itemAt(0)...）
+    // 去反查名字标签：能跑，但隐式依赖行内控件的顺序，改布局就会静默失效，
+    // 而且每一步 itemAt 越界只返回 nullptr，紧接着的 ->widget() 就是空指针，得层层判空兜着。
+    // 数据本来就归 item（模型）管，不该再从界面（视图）里捞回来
+    const QString contactId = item->data(kRoleContactId).toString();
+
+    QString contactName = item->data(kRoleContactName).toString();
+    if (contactName.isEmpty()) {
+        contactName = "未知联系人";   // 兜底：理论上不会空，留一手防脏数据
     }
 
     emit contactSelected(contactId, contactName);//发送联系人选择信号,包含联系人ID和姓名
@@ -342,7 +365,7 @@ void MessageList::onContextMenuRequested(const QPoint& pos)
     // 先选中，让用户看清这个菜单是冲哪一行来的（setCurrentItem 不会触发 itemClicked）
     listWidget->setCurrentItem(item);
 
-    const QString contactId = item->data(Qt::UserRole).toString();
+    const QString contactId = item->data(kRoleContactId).toString();
 
     QMenu menu(this);
     applyMenuStyle(menu);

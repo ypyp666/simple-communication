@@ -8,6 +8,8 @@
 #include <QUuid>
 #include <QCryptographicHash>
 #include <QDebug>
+#include <QHash>
+#include <QSet>
 #include <QCoreApplication>
 #include <algorithm>  // std::reverse（分页查询结果新→旧反转成正序）
 
@@ -289,6 +291,99 @@ bool DatabaseManager::createConversationTable()
     return true;
 }
 
+// 智能体会话表：一行一个会话，抽屉按 last_time 倒序展示。
+// 会话 ID 现在由客户端先生成（后续改成服务器下发时，只换生成处，这张表结构不用动）
+bool DatabaseManager::createAgentSessionTable()
+{
+    QSqlQuery query(m_messageDatabase);
+    QString sql = R"(
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            session_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            last_message TEXT,
+            last_time TEXT,
+            created_at TEXT NOT NULL
+        )
+    )";
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to create agent_sessions table:" << query.lastError().text();
+        return false;
+    }
+    query.exec("CREATE INDEX IF NOT EXISTS idx_agent_sessions_time ON agent_sessions(last_time)");
+
+    return true;
+}
+
+// 智能体消息表（分块存）：
+//   - 同一条消息可以有多行：用户提问固定 chunk_seq=0；AI 流式回答每收到一段写一块，序号递增
+//   - is_self 区分角色（1=用户，0=AI），回读时靠它决定气泡靠左还是靠右
+//   - 为什么要分块：单块体积可控，超长回答不会全堆在一行里；崩溃时也能保住已落库的部分
+// 老库是 (session_id, message_id) 单行结构（只存用户消息），这里做在线迁移：
+// 主键无法用 ALTER 改，只能重建表再搬数据
+bool DatabaseManager::createAgentMessageTable()
+{
+    QSqlQuery query(m_messageDatabase);
+    // 新库直接按新结构建；老库这张表已存在，这句是空操作，后面再迁移
+    QString sql = R"(
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            is_self INTEGER NOT NULL DEFAULT 1,
+            chunk_seq INTEGER NOT NULL DEFAULT 0,
+            content TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, message_id, chunk_seq)
+        )
+    )";
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to create agent_messages table:" << query.lastError().text();
+        return false;
+    }
+
+    // 迁移检测：老表没有 chunk_seq 列
+    bool hasChunkSeq = false;
+    QSqlQuery infoQuery(m_messageDatabase);
+    if (infoQuery.exec("PRAGMA table_info(agent_messages)")) {
+        while (infoQuery.next()) {
+            if (infoQuery.value(1).toString() == "chunk_seq") {
+                hasChunkSeq = true;
+                break;
+            }
+        }
+    }
+
+    if (!hasChunkSeq) {
+        // 老表里只有用户输入，全部按 is_self=1 / chunk_seq=0 搬进新结构
+        if (!m_messageDatabase.transaction()) {
+            qDebug() << "Failed to begin agent messages migration:"
+                     << m_messageDatabase.lastError().text();
+            return false;
+        }
+
+        QSqlQuery migrate(m_messageDatabase);
+        bool ok = migrate.exec("ALTER TABLE agent_messages RENAME TO agent_messages_legacy");
+        ok = ok && migrate.exec(sql);
+        ok = ok && migrate.exec(R"(
+            INSERT INTO agent_messages (session_id, message_id, is_self, chunk_seq, content, created_at)
+            SELECT session_id, message_id, 1, 0, content, created_at FROM agent_messages_legacy
+        )");
+        ok = ok && migrate.exec("DROP TABLE agent_messages_legacy");
+
+        if (!ok || !m_messageDatabase.commit()) {
+            qDebug() << "Failed to migrate agent_messages:" << migrate.lastError().text()
+                     << m_messageDatabase.lastError().text();
+            m_messageDatabase.rollback();
+            return false;
+        }
+    }
+
+    query.exec("CREATE INDEX IF NOT EXISTS idx_agent_messages_time ON agent_messages(created_at)");
+    // 回读按会话查，索引要带上 session_id（原来只有 created_at，跨会话查会全表扫）
+    query.exec("CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, created_at)");
+
+    return true;
+}
+
 // ========== 消息库操作 ==========
 
 bool DatabaseManager::openMessageDatabase(const QString& accountId)
@@ -324,14 +419,20 @@ bool DatabaseManager::openMessageDatabase(const QString& accountId)
     }
     
     qDebug() << "Message database opened:" << dbPath;
-    // 分库里的三张表在这里统一建好（都带 IF NOT EXISTS，重复执行无副作用）
+    // 分库里的表在这里统一建好（都带 IF NOT EXISTS，重复执行无副作用）
     if (!createMessageTable()) {
         return false;
     }
     if (!createContactTable()) {
         return false;
     }
-    return createConversationTable();
+    if (!createConversationTable()) {
+        return false;
+    }
+    if (!createAgentSessionTable()) {
+        return false;
+    }
+    return createAgentMessageTable();
 }
 
 void DatabaseManager::closeMessageDatabase()
@@ -926,7 +1027,8 @@ bool DatabaseManager::updateConversationMessage(const QString& contactId, const 
         return false;
     }
 
-    if (update.numRowsAffected() > 0) {
+    if (update.numRowsAffected() > 0)//返回这条 SQL 语句实际影响到的数据行数
+    {
         return true;   // 更新到已有会话了，收工
     }
 
@@ -1037,6 +1139,413 @@ bool DatabaseManager::deleteConversation(const QString& conversationId)
     query.bindValue(0, conversationId);
 
     return query.exec();
+}
+
+// ========== 智能体会话 / 用户消息 ==========
+
+// 读智能体会话列表（喂抽屉）。复用 ConversationInfo：UI 侧 MessageList 直接能渲染
+void DatabaseManager::loadAgentSessions()
+{
+    QList<ConversationInfo> sessions;
+    if (!m_messageDatabase.isOpen()) {
+        emit agentSessionsLoaded(sessions);   // 库没打开也要回一声，调用方不会空等
+        return;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    QString sql = R"(
+        SELECT session_id, title, last_message, last_time
+        FROM agent_sessions
+        ORDER BY last_time DESC
+    )";
+
+    if (!query.exec(sql)) {
+        qDebug() << "Failed to load agent sessions:" << query.lastError().text();
+        emit agentSessionsLoaded(sessions);
+        return;
+    }
+
+    while (query.next()) {
+        ConversationInfo info;
+        info.id = query.value(0).toString();
+        info.name = query.value(1).toString();
+        info.lastMessage = query.value(2).toString();
+        info.lastTime = QDateTime::fromString(query.value(3).toString(), Qt::ISODate);
+        info.isOnline = false;
+        info.unreadCount = 0;
+        sessions.append(info);
+    }
+
+    emit agentSessionsLoaded(sessions);
+}
+
+// 登录后拿服务器列表核对本地（服务器是"会话还在不在"的唯一权威）：
+//   服务器有、本地没有 → 补插（只写 ID + 名字，时间取当前，排序不会沉底）
+//   本地有、服务器没有 → 服务器上已删，连该会话的消息一起删
+// 整批一个事务，做完重拉一次列表，抽屉立即刷新
+void DatabaseManager::syncAgentSessions(const QList<ConversationInfo>& sessions)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return;
+    }
+
+    // 服务器这批会话的 ID 集合（"本地有、服务器没有"就靠它判断）
+    QSet<QString> serverIds;
+    for (const ConversationInfo& info : sessions) {
+        serverIds.insert(info.id);
+    }
+
+    if (!m_messageDatabase.transaction()) {
+        qDebug() << "Failed to begin sync agent sessions transaction:"
+                 << m_messageDatabase.lastError().text();
+        return;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    const QString nowText = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // 1. 服务器有、本地没有 → 补插一行空会话。
+    //    用 INSERT OR IGNORE：本地已有的保持原样（标题以本地为准，拉取不能把刚改的名字冲掉）
+    query.prepare(R"(
+        INSERT OR IGNORE INTO agent_sessions
+        (session_id, title, last_message, last_time, created_at)
+        VALUES (?, ?, '', ?, ?)
+    )");
+    for (const ConversationInfo& info : sessions) {
+        query.bindValue(0, info.id);
+        query.bindValue(1, info.name.isEmpty() ? QStringLiteral("新会话") : info.name);
+        query.bindValue(2, nowText);
+        query.bindValue(3, nowText);
+        if (!query.exec()) {
+            qDebug() << "Failed to insert synced agent session:" << query.lastError().text();
+            m_messageDatabase.rollback();
+            return;
+        }
+    }
+
+    // 2. 本地有、服务器没有 → 已被删。先读完本地 ID 再动手删（不边遍历结果集边改表）
+    QStringList staleIds;
+    {
+        QSqlQuery localQuery(m_messageDatabase);
+        if (!localQuery.exec("SELECT session_id FROM agent_sessions")) {
+            qDebug() << "Failed to list local agent sessions:" << localQuery.lastError().text();
+            m_messageDatabase.rollback();
+            return;
+        }
+        while (localQuery.next()) {
+            const QString localId = localQuery.value(0).toString();
+            if (!serverIds.contains(localId)) {
+                staleIds.append(localId);
+            }
+        }
+    }
+
+    for (const QString& staleId : staleIds) {
+        // 先删子表（消息），再删会话行，和 deleteAgentSession 的顺序一致
+        query.prepare("DELETE FROM agent_messages WHERE session_id = ?");
+        query.bindValue(0, staleId);
+        if (!query.exec()) {
+            qDebug() << "Failed to delete stale agent messages:" << query.lastError().text();
+            m_messageDatabase.rollback();
+            return;
+        }
+
+        query.prepare("DELETE FROM agent_sessions WHERE session_id = ?");
+        query.bindValue(0, staleId);
+        if (!query.exec()) {
+            qDebug() << "Failed to delete stale agent session:" << query.lastError().text();
+            m_messageDatabase.rollback();
+            return;
+        }
+    }
+
+    if (!m_messageDatabase.commit()) {
+        qDebug() << "Failed to commit sync agent sessions:" << m_messageDatabase.lastError().text();
+        m_messageDatabase.rollback();
+        return;
+    }
+
+    // 核对完重拉一次列表：新补插的行会出现在抽屉里，删掉的行随之消失
+    loadAgentSessions();
+}
+
+// 新建会话：只写会话行（最后一句话先留空，等第一条用户消息来了再更新快照）
+bool DatabaseManager::createAgentSession(const QString& sessionId, const QString& title,
+                                         const QDateTime& createdAt)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare(R"(
+        INSERT OR REPLACE INTO agent_sessions
+        (session_id, title, last_message, last_time, created_at)
+        VALUES (?, ?, '', ?, ?)
+    )");
+    query.bindValue(0, sessionId);
+    query.bindValue(1, title);
+    query.bindValue(2, createdAt.toString(Qt::ISODate));
+    query.bindValue(3, createdAt.toString(Qt::ISODate));
+
+    if (!query.exec()) {
+        qDebug() << "Failed to create agent session:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 存一条用户消息（整条一块：is_self=1、chunk_seq=0），
+// 并把会话快照的最后一句/时间同步更新（抽屉那一行立刻有新内容）。
+// 会话行理论上一定先由 createAgentSession 建好；万一缺行（比如历史脏数据），这里补插一条兜底
+bool DatabaseManager::saveAgentMessage(const QString& sessionId, const QString& messageId,
+                                       const QString& content, const QDateTime& createdAt)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        emit agentMessageSaved(sessionId, messageId, false);   // 主后端要据此取消这一轮
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare(R"(
+        INSERT OR REPLACE INTO agent_messages
+        (session_id, message_id, is_self, chunk_seq, content, created_at)
+        VALUES (?, ?, 1, 0, ?, ?)
+    )");
+    query.bindValue(0, sessionId);
+    query.bindValue(1, messageId);
+    query.bindValue(2, content);
+    query.bindValue(3, createdAt.toString(Qt::ISODate));
+
+    if (!query.exec()) {
+        qDebug() << "Failed to save agent message:" << query.lastError().text();
+        emit agentMessageSaved(sessionId, messageId, false);
+        return false;
+    }
+
+    query.prepare("UPDATE agent_sessions SET last_message = ?, last_time = ? WHERE session_id = ?");
+    query.bindValue(0, content);
+    query.bindValue(1, createdAt.toString(Qt::ISODate));
+    query.bindValue(2, sessionId);
+    if (!query.exec()) {
+        qDebug() << "Failed to update agent session snapshot:" << query.lastError().text();
+        emit agentMessageSaved(sessionId, messageId, false);
+        return false;
+    }
+
+    if (query.numRowsAffected() == 0) {
+        query.prepare(R"(
+            INSERT OR IGNORE INTO agent_sessions
+            (session_id, title, last_message, last_time, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        )");
+        query.bindValue(0, sessionId);
+        query.bindValue(1, QStringLiteral("新会话"));
+        query.bindValue(2, content);
+        query.bindValue(3, createdAt.toString(Qt::ISODate));
+        query.bindValue(4, createdAt.toString(Qt::ISODate));
+        query.exec();
+    }
+
+    emit agentMessageSaved(sessionId, messageId, true);
+    return true;
+}
+
+// 存 AI 回答的一段（is_self=0）。message_id 由主后端在一条回答开始时生成，
+// 同一条回答的所有分块共用它；chunk_seq 在库内自增（MAX+1），调用方不用维护序号。
+// 这里**不**更新 agent_sessions 快照：抽屉里那行显示的是"最后一条用户提问"，
+// 不该被 AI 自己的回答顶掉
+bool DatabaseManager::saveAgentMessageChunk(const QString& sessionId, const QString& messageId,
+                                            const QString& content, const QDateTime& createdAt)
+{
+    if (!m_messageDatabase.isOpen() || sessionId.isEmpty() || messageId.isEmpty()) {
+        qDebug() << "Cannot save agent message chunk (database closed or empty id)";
+        return false;
+    }
+
+    // 先取这一条消息当前的最大块序号，下一块接在后面。
+    // 分块按 (created_at, chunk_seq) 排序回读，同一毫秒到达的多块也能保持到达顺序
+    int chunkSeq = 0;
+    QSqlQuery seqQuery(m_messageDatabase);
+    seqQuery.prepare("SELECT COALESCE(MAX(chunk_seq), -1) + 1 FROM agent_messages "
+                     "WHERE session_id = ? AND message_id = ?");
+    seqQuery.bindValue(0, sessionId);
+    seqQuery.bindValue(1, messageId);
+    if (seqQuery.exec() && seqQuery.next()) {
+        chunkSeq = seqQuery.value(0).toInt();
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare(R"(
+        INSERT OR REPLACE INTO agent_messages
+        (session_id, message_id, is_self, chunk_seq, content, created_at)
+        VALUES (?, ?, 0, ?, ?, ?)
+    )");
+    query.bindValue(0, sessionId);
+    query.bindValue(1, messageId);
+    query.bindValue(2, chunkSeq);
+    query.bindValue(3, content);
+    query.bindValue(4, createdAt.toString(Qt::ISODate));
+
+    if (!query.exec()) {
+        qDebug() << "Failed to save agent message chunk:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
+}
+
+// 回读某个会话最近的 50 条消息（分页粒度是"消息"，不是"块"）：
+//   1) 先按每条消息最后一块的时间倒序，取出 50 个 message_id ——
+//      不能对块做 LIMIT，否则一条超长回答分成几百块会把其余历史挤掉
+//   2) 再把这些消息的全部块按 (created_at, chunk_seq) 正序取回，在这里拼成整条
+// 结果按时间正序（老 → 新）交给 UI，直接从上往下重建气泡即可
+void DatabaseManager::loadAgentMessages(const QString& sessionId)
+{
+    const int kRecentMessageLimit = 50;
+    QList<AgentMessageInfo> messages;
+
+    if (!m_messageDatabase.isOpen() || sessionId.isEmpty()) {
+        emit agentMessagesLoaded(sessionId, messages);   // 每个出口都要 emit，否则 UI 一直等
+        return;
+    }
+
+    QStringList messageIds;
+    QSqlQuery idQuery(m_messageDatabase);
+    idQuery.prepare("SELECT message_id FROM agent_messages WHERE session_id = ? "
+                    "GROUP BY message_id ORDER BY MAX(created_at) DESC LIMIT ?");
+    idQuery.bindValue(0, sessionId);
+    idQuery.bindValue(1, kRecentMessageLimit);
+    if (!idQuery.exec()) {
+        qDebug() << "Failed to query recent agent messages:" << idQuery.lastError().text();
+        emit agentMessagesLoaded(sessionId, messages);
+        return;
+    }
+    while (idQuery.next()) {
+        messageIds << idQuery.value(0).toString();
+    }
+
+    if (messageIds.isEmpty()) {
+        emit agentMessagesLoaded(sessionId, messages);
+        return;
+    }
+
+    QStringList placeholders;
+    for (int i = 0; i < messageIds.size(); ++i) {
+        placeholders << "?";
+    }
+    QSqlQuery query(m_messageDatabase);
+    query.prepare(QString("SELECT message_id, is_self, content, created_at FROM agent_messages "
+                          "WHERE session_id = ? AND message_id IN (%1) "
+                          "ORDER BY created_at ASC, chunk_seq ASC")
+                      .arg(placeholders.join(", ")));
+    query.bindValue(0, sessionId);
+    for (int i = 0; i < messageIds.size(); ++i) {
+        query.bindValue(i + 1, messageIds.at(i));
+    }
+    if (!query.exec()) {
+        qDebug() << "Failed to load agent message chunks:" << query.lastError().text();
+        emit agentMessagesLoaded(sessionId, messages);
+        return;
+    }
+
+    // 按 message_id 归组拼块；因为结果已按时间正序，第一次出现的顺序就是消息顺序
+    QHash<QString, int> indexById;
+    while (query.next()) {
+        const QString messageId = query.value(0).toString();
+        const QString content = query.value(2).toString();
+        int index = indexById.value(messageId, -1);
+        if (index < 0) {
+            AgentMessageInfo info;
+            info.id = messageId;
+            info.isSelf = query.value(1).toInt() != 0;
+            info.content = content;
+            info.createdAt = QDateTime::fromString(query.value(3).toString(), Qt::ISODate);
+            indexById.insert(messageId, messages.size());
+            messages.append(info);
+        } else {
+            messages[index].content += content;
+        }
+    }
+
+    emit agentMessagesLoaded(sessionId, messages);
+}
+
+// 删除智能体会话：消息表 + 会话表一起删。
+// 为什么用事务：两步要么全成要么全不成 —— 只删掉会话行、消息残留会变成"孤儿消息"，
+// 以后按会话 ID 查永远查不到，白白占库。
+// 为什么放后台线程：agent_messages 一个会话可能堆几千条，DELETE 是同步阻塞的，
+// 在主线程做会卡界面；这个槽由 MainBackend 的信号排队到 DbWorkerThread 执行
+bool DatabaseManager::deleteAgentSession(const QString& sessionId)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+    if (sessionId.isEmpty()) {
+        return false;
+    }
+
+    if (!m_messageDatabase.transaction()) {
+        qDebug() << "Failed to begin delete agent session transaction:"
+                 << m_messageDatabase.lastError().text();
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+
+    // 先删子表（消息），再删主表（会话行），顺序与建表时的引用关系保持一致
+    query.prepare("DELETE FROM agent_messages WHERE session_id = ?");
+    query.bindValue(0, sessionId);
+    if (!query.exec()) {
+        qDebug() << "Failed to delete agent messages:" << query.lastError().text();
+        m_messageDatabase.rollback();
+        return false;
+    }
+
+    query.prepare("DELETE FROM agent_sessions WHERE session_id = ?");
+    query.bindValue(0, sessionId);
+    if (!query.exec()) {
+        qDebug() << "Failed to delete agent session:" << query.lastError().text();
+        m_messageDatabase.rollback();
+        return false;
+    }
+
+    if (!m_messageDatabase.commit()) {
+        qDebug() << "Failed to commit delete agent session:" << m_messageDatabase.lastError().text();
+        m_messageDatabase.rollback();
+        return false;
+    }
+
+    return true;
+}
+
+// 重命名会话：只改标题一列，最后消息 / 时间不受影响
+bool DatabaseManager::renameAgentSession(const QString& sessionId, const QString& title)
+{
+    if (!m_messageDatabase.isOpen()) {
+        qDebug() << "Message database is not open";
+        return false;
+    }
+    if (sessionId.isEmpty() || title.isEmpty()) {
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare("UPDATE agent_sessions SET title = ? WHERE session_id = ?");
+    query.bindValue(0, title);
+    query.bindValue(1, sessionId);
+
+    if (!query.exec()) {
+        qDebug() << "Failed to rename agent session:" << query.lastError().text();
+        return false;
+    }
+
+    return true;
 }
 
 // ========== 联系人操作（contacts 表：通讯录好友资料）==========

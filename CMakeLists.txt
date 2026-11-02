@@ -77,6 +77,9 @@ add_executable(ChatUI
     src/ChatWindow.cpp           # 聊天窗口实现
     src/SearchWindow.cpp         # 搜索窗口窗口实现
     src/AgentWindow.cpp          # 代理窗口窗口实现
+    src/AgentChatArea.cpp        # 智能体专属聊天区（空态新建会话 + 聊天态）
+    src/AgentMessageItem.cpp     # 智能体消息气泡（无头像，预留流式/HITL）
+    src/AgentSessionList.cpp     # 智能体抽屉会话列表（名字 + 重命名/删除按钮，行圆角）
     src/ContactWindow.cpp        # 联系人窗口实现
     src/ContactList.cpp          # 联系人列表（占位，真正的通讯录后续再补）
     src/ContactDetailArea.cpp    # 右栏共用区域（好友详情 / 好友请求列表二选一）
@@ -130,6 +133,9 @@ add_executable(ChatUI
     include/MainBackend.h
     include/ContactWindow.h
     include/AgentWindow.h
+    include/AgentChatArea.h
+    include/AgentMessageItem.h
+    include/AgentSessionList.h
 
 
 

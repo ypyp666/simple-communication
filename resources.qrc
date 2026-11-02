@@ -14,5 +14,10 @@
         <file>res/icon/Serch_clickedd.svg</file>
         <file>res/icon/Agent_show.svg</file>
         <file>res/icon/Agent_clickedd.svg</file>
+        <file>res/icon/session.svg</file>
+        <file>res/icon/modify.svg</file>
+        <file>res/icon/delete.svg</file>
+        <file>res/icon/delete_hover.svg</file>
+        <file>res/icon/stop.svg</file>
     </qresource>
 </RCC>

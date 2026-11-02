@@ -15,9 +15,18 @@ class ChatInput : public QWidget
 public:
     explicit ChatInput(QWidget *parent = nullptr);
 
+    // 切换发送按钮的两种状态：
+    //   false = 平时："发送"两个字、蓝色圆角长条
+    //   true  = 回答中：去掉文字，换成蓝色圆形 stop 图标（点击语义是"停止本轮"）
+    void setSendingState(bool sending);
+
 signals:
     void sendMessage(const QString& content);
     void sendFile(const QString& filePath);
+    // "停止态"下点了那颗按钮：语义是"结束本轮回答"，不是发送。
+    // 只有把输入框切成回答中的那个页面（智能体页）会接这条信号——
+    // 普通聊天页从不调 setSendingState(true)，所以这条信号在那边永远不会有动静（状态隔离）
+    void stopRequested();
 
 protected:
     // 键盘交互全在这里：回车键要在"文本被插进去之前"拦下来判断是发送还是换行，
@@ -54,6 +63,10 @@ private:
     // 中文输入法里回车是"确认候选词"，跟"发送"是两码事，必须区分开：
     // 组字期间按回车直接发送，会把半截拼音发出去
     bool m_imeComposing = false;
+
+    // 当前是不是"回答中"（停图标状态）。输入框内容变化时开关按钮要参考它：
+    // 回答中按钮必须常亮（否则清空输入框后按钮变灰，停图标也跟着发灰）
+    bool m_sending = false;
 };
 
 #endif // CHATINPUT_H

@@ -8,6 +8,11 @@ namespace {
 // 与 TcpClient 的 kConnectTimeoutMs（30 秒，只管"TCP 连不连得上"，连上就停）是两个阶段，
 // 所以必须各用各的计时器：连上之后服务器要是装死，只有这张表能把流程从等待态里拽出来
 const int kResponseTimeoutMs = 10000;
+
+// 服务器限流状态码：未登录操作（登录/取号/注册/改密）点得太频繁时，
+// 服务器在正常响应类型（login_response 等）里带这个 code + success=false 拒包。
+// 必须和"账号密码错"分开——用户看到"稍后再试"才知道该等，而不是对着正确输入反复点
+const int kRateLimitCode = 429;
 }
 
 LoginBackend::LoginBackend(QObject* parent, TcpClient* tcpclient)
@@ -271,6 +276,11 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
             // 只存内存：程序一退，令牌跟着没，下次启动老老实实重新登录
             m_token = response["token"].toString();
             emit loginSuccess(m_accountId);
+        } else if (response["code"].toInt() == kRateLimitCode) {
+            // 被限流：服务器拒的是"点得太频繁"，不是账号密码
+            m_loginCompleted = true;
+            qDebug() << "登录被限流:" << response["message"].toString();
+            emit loginRateLimited();
         } else {
             m_loginCompleted = true;
             qDebug() << "登录失败:" << response["message"].toString();
@@ -293,6 +303,9 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
         if (response["success"].toBool()) {
             qDebug() << "修改密码成功";
             emit modifyPwdSuccess();
+        } else if (response["code"].toInt() == kRateLimitCode) {
+            qDebug() << "修改密码被限流:" << response["message"].toString();
+            emit modifyPwdRateLimited();
         } else {
             qDebug() << "修改密码失败:" << response["message"].toString();
             emit modifyPwdFailed();
@@ -306,6 +319,9 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
             qDebug() << "注册取号成功";
             auto account = response["accountId"].toString();
             emit connectForRegisterSuccess(account);
+        } else if (response["code"].toInt() == kRateLimitCode) {
+            qDebug() << "注册取号被限流:" << response["message"].toString();
+            emit connectForRegisterRateLimited();
         } else {
             qDebug() << "注册取号失败:" << response["message"].toString();
             emit connectForRegisterFailed();
@@ -317,6 +333,9 @@ void LoginBackend::onTcpDataReceived(const QByteArray& data)
         if (response["success"].toBool()) {
             qDebug() << "注册成功";
             emit registerSuccess();
+        } else if (response["code"].toInt() == kRateLimitCode) {
+            qDebug() << "注册被限流:" << response["message"].toString();
+            emit registerRateLimited();
         } else {
             qDebug() << "注册失败:" << response["message"].toString();
             emit registerFailed();

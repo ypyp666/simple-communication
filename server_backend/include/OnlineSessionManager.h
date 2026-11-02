@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <string>
 #include <memory>
+#include <ctime>
 
 struct Session
 {
@@ -13,6 +14,26 @@ struct Session
     // 除登录/断线重连/注册/获取账号/修改密码外，其余业务一律先看它。
     // 同账号被新连接顶替时，旧连接的它会立即被置回false。
     bool login_state=false;
+
+    // ===== 未登录操作限流（每个连接独立一份）=====
+    // limit_time：限流窗口的截止时间戳（秒），0 表示当前没有窗口
+    // unlogin_count：当前窗口内已发生的未登录操作次数
+    time_t limit_time = 0;
+    int    unlogin_count = 0;
+
+    // ===== 并发发送保护 =====
+    // 以前只有客户端自己的线程会往这个 fd 写，天然不会冲突；
+    // 现在智能体 worker 线程也要往回推结果，两个线程同时 send 会把两条 JSON
+    // 交错拼在一起，按 '\n' 拆包的协议直接失效。所以所有发送统一走 sendMtx。
+    std::mutex sendMtx;
+
+    // 连接是否已关闭：客户端线程 close(fd) 之前必须先置为 true。
+    // 否则 fd 号被内核回收再分配给新客户端后，worker 可能把答案推给陌生人。
+    bool closed = false;
+
+    // 统一发送出口：加锁 + 检查 closed + 处理 EINTR / 短写。
+    // 返回 false 表示连接已失效，调用方不要再重试。
+    bool SendJson(const std::string& data);
 };
 using SessionPtr = std::shared_ptr<Session>;
 
