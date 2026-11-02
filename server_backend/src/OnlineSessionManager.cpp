@@ -2,6 +2,9 @@
 
 #include <random>
 #include <iostream>
+#include <cerrno>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace
 {
@@ -34,6 +37,42 @@ OnlineSessionManager& OnlineSessionManager::Instance()
     // C++11及以上线程安全单例
     static OnlineSessionManager manager;
     return manager;
+}
+
+// Session 的统一发送出口。
+// 注意：这里必须"先拿锁再判 closed"，不能先判后拿锁——
+// 否则判完 closed 为 false、还没拿到锁的瞬间，客户端线程可能已经 close(fd) 了。
+bool Session::SendJson(const std::string& data)
+{
+    std::lock_guard<std::mutex> lock(sendMtx);
+
+    if (closed || fd < 0)
+    {
+        return false;
+    }
+
+    std::size_t sent = 0;
+    while (sent < data.size())
+    {
+        // MSG_NOSIGNAL：对端已关闭时返回错误而不是触发 SIGPIPE 把整个进程干掉
+        const ssize_t size = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (size < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;   // 被信号打断，不是断线，重试
+            }
+            closed = true;
+            return false;
+        }
+        if (size == 0)
+        {
+            closed = true;
+            return false;
+        }
+        sent += static_cast<std::size_t>(size);
+    }
+    return true;
 }
 
 void OnlineSessionManager::addSession(const std::string& account, SessionPtr sess)

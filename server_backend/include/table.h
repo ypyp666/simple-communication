@@ -30,6 +30,7 @@ enum class  CmdType {
     PullDelFriendCache,//上线拉取离线删除好友墓碑
     AckDelFriendCache,//回执并清除已同步的删除墓碑
     Examine,//心跳检验（纯存活探测，不查库）
+    AgentRequest,//智能体请求，前端申请调用智能体服务，后端转发给智能体服务端
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -58,7 +59,7 @@ enum class  CmdType {
     std::string HandlePullDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleExamine(const json& req, mysqlconn& conn, SessionPtr session);
-    
+    std::string HandleAgentRequest(const json& req, mysqlconn& conn, SessionPtr session);
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
@@ -84,7 +85,7 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::PullDelFriendCache, HandlePullDelFriendCache},
     {CmdType::AckDelFriendCache, HandleAckDelFriendCache},
     {CmdType::Examine, HandleExamine},
-
+    {CmdType::AgentRequest, HandleAgentRequest},
 };
 
 #endif //UNTITLED_TABLE_H
