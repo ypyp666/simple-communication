@@ -39,9 +39,8 @@ int main() {
     // Start() 一进去就阻塞在 accept 循环里，回不来了
     // 地址/超时优先读环境变量，读不到就用默认值 —— 部署时改环境变量即可，不用重编译
     AgentEndpoint endpoint;
-    endpoint.url               = "http://127.0.0.1:8000/chat";
+    endpoint.url               = "http://127.0.0.1:9000/chat";
     endpoint.connectTimeoutSec = 5;
-    endpoint.totalTimeoutSec   = 60;
     endpoint.mock              = false;//开关默认走http(false),如果要走本地模拟，部署时改环境变量即可，不用重编译
 
     if (const char* url = std::getenv("IM_AGENT_URL"); url != nullptr && *url != '\0')//c++17新特性：if 语句里定义变量，作用域只在 if/else 内也就是if(变量定义,判断条件)

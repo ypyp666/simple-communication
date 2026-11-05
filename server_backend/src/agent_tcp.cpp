@@ -10,8 +10,106 @@
 
 namespace
 {
-    // libcurl 的响应回调：curl 每收到一块数据就调一次，
-    // 我们要把这些碎片拼成完整响应体，所以把 std::string 的地址当 userdata 传进去。
+    // ===== SSE 解析结果 =====
+    struct SseResult
+    {
+        std::string answer;    // 所有 token 拼起来 = 完整回答
+        std::string threadId;  // 智能体分配的会话 id，下一轮带上它就有上下文了
+        std::string error;     // 智能体主动报的错误
+        bool        finished = false;   // 是否收到过 done / [DONE]
+    };
+
+    // 一次流式下载的上下文：既是 curl 的 userdata，也是“半行缓冲 + 累积结果”的容器。
+    //
+    // 为什么必须自己维护 pending：
+    //   TCP 是字节流，一次写回调收到的数据可能正好把一行 JSON 劈成两半，
+    //   也可能一次塞进来好几行。所以不完整的尾巴只能留着，等下一批字节到了再拼。
+    //   这也正是流式能成立的前提 —— 不能像以前那样攒完整包再解析。
+    struct StreamContext
+    {
+        std::string    pending;   // 还没凑成完整一行的尾巴
+        std::string    rawBody;   // 完整响应体，只给“不是 SSE”的兜底解析用
+        SseResult      sse;
+        AgentDeltaSink onDelta;   // 增量回调，可能为空（只要最终结果，不要流）
+    };
+
+    // 处理一整行 SSE。返回 false 表示要中止本次传输。
+    bool HandleSseLine(StreamContext& ctx, std::string line)
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();   // 兼容 CRLF
+        }
+
+        // 只关心 data: 行；event:/id:/retry:/: 注释行和空行都跳过
+        if (line.rfind("data:", 0) != 0)
+        {
+            return true;
+        }
+
+        std::string payload = line.substr(5);
+        // SSE 规范里 data: 后面允许跟一个空格，不裁掉的话 JSON 解析会失败
+        const std::size_t first = payload.find_first_not_of(' ');
+        if (first == std::string::npos)
+        {
+            return true;   // "data:" 后面是空的
+        }
+        payload = payload.substr(first);
+
+        if (payload == "[DONE]")
+        {
+            ctx.sse.finished = true;   // OpenAI 风格的结束标记
+            return true;
+        }
+
+        try
+        {
+            const nlohmann::json event = nlohmann::json::parse(payload);
+            const std::string name = event.value("event", std::string());
+
+            if (name == "token")
+            {
+                // 全程唯一一处“边收边转发”：
+                // 先把增量拼进总答案（日志和兜底要用），再立刻交给上层推给客户端，
+                // 用户看到的就是一个字一个字长出来，而不是等整段流结束后一次性出现。
+                const std::string delta = event.value("content", std::string());
+                if (!delta.empty())
+                {
+                    ctx.sse.answer += delta;
+                    if (ctx.onDelta && !ctx.onDelta(delta))
+                    {
+                        // 上层已经不想要了（客户端断线 / 用户停止），
+                        // 再把这半截流收完只是白烧带宽和 worker
+                        return false;
+                    }
+                }
+            }
+            else if (name == "session")
+            {
+                ctx.sse.threadId = event.value("thread_id", std::string());
+            }
+            else if (name == "done")
+            {
+                ctx.sse.finished = true;
+            }
+            else if (name == "error")
+            {
+                // 智能体自己的业务错误：记下来立刻停，
+                // 不能把已经收到的半截回答当成功推出去
+                ctx.sse.error = event.value("message", std::string("智能体内部错误"));
+                return false;
+            }
+            // meta 只用来打日志，这里不需要
+        }
+        catch (const std::exception&)
+        {
+            // 单行不是合法 JSON 就跳过，不能因为一行脏数据把整个回答丢掉
+        }
+        return true;
+    }
+
+    // libcurl 的响应回调：curl 每收到一块数据就调一次。
+    // 这里不解码整个响应体，而是按行切开、切出一行就立刻解析并回调 —— 流式输出就在这一步成真。
     std::size_t OnWriteBody(char* data, std::size_t size, std::size_t nmemb, void* userdata)
     {
         //四个参数意思分别为：
@@ -20,8 +118,41 @@ namespace
         // nmemb: 数据块的数量
         // userdata: 用户自定义数据指针
         const std::size_t total = size * nmemb;
-        static_cast<std::string*>(userdata)->append(data, total);
-        return total;   // 必须返回实际处理的字节数，返回少了 curl 会认为写失败
+        auto* ctx = static_cast<StreamContext*>(userdata);
+
+        ctx->rawBody.append(data, total);   // 兜底解析（非 SSE 接口）还要用完整包
+        ctx->pending.append(data, total);
+
+        std::size_t pos = 0;
+        while (true)
+        {
+            const std::size_t nl = ctx->pending.find('\n', pos);
+            if (nl == std::string::npos)
+            {
+                break;   // 剩下的是半行，留给下一次回调拼
+            }
+            std::string line = ctx->pending.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (!HandleSseLine(*ctx, std::move(line)))
+            {
+                // 返回 0 → curl 认为写失败，立刻以 CURLE_WRITE_ERROR 结束传输。
+                // 这是“客户端断线 / 智能体报错”时唯一能及时收手的办法
+                return 0;
+            }
+        }
+        ctx->pending.erase(0, pos);   // 丢掉已处理部分，只留尾巴
+        return total;                 // 必须返回实际处理的字节数，返回少了 curl 会认为写失败
+    }
+
+    // 一个 UTF-8 字符占几个字节。
+    // 模拟智能体要按字符切片推送，按字节硬切会把一个汉字劈成两半，客户端显示成乱码
+    std::size_t Utf8CharBytes(unsigned char lead)
+    {
+        if ((lead & 0x80) == 0x00) return 1;
+        if ((lead & 0xE0) == 0xC0) return 2;
+        if ((lead & 0xF0) == 0xE0) return 3;
+        if ((lead & 0xF8) == 0xF0) return 4;
+        return 1;   // 非法首字节当单字节处理，别把游标卡死
     }
 
     // libcurl 的进度回调：传输过程中被 curl 反复调用（约每秒数次）。
@@ -30,82 +161,10 @@ namespace
     // 只是读一个原子bool，绝不能在这里做耗时操作或加锁：
     // 这个回调跑在 curl 自己的传输循环里，卡住它等于卡住整个 worker。
     int OnCancelCheck(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+    //libcurl本身是c语言库，做不到像c++那样传递std::atomic<bool>，所以这里的userdata是void*类型的指针，指向一个std::atomic<bool>对象
     {
         const auto* flag = static_cast<const std::atomic<bool>*>(userdata);
         return flag->load(std::memory_order_relaxed) ? 1 : 0;
-    }
-
-    // ===== SSE 解析结果 =====
-    struct SseResult
-    {
-        std::string answer;    // 所有 token 拼起来 = 完整回答
-        std::string threadId;  // 智能体分配的会话 id，下一轮带上它就有上下文了
-        std::string error;     // 智能体主动报的错误
-    };
-
-    // 解析 Server-Sent Events 响应体。
-    // 智能体的 /chat 是流式的，一行一个事件，形如：
-    //     data: {"event":"session","thread_id":"..."}
-    //     data: {"event":"meta","agent":"chat_agent"}
-    //     data: {"event":"token","content":"你"}      <-- 增量，要拼接
-    //     data: {"event":"done","agent":"chat_agent"}
-    // 基础版先把整个流收完再拼；第二步做流式推送时，
-    // 只要把这段逻辑搬进 OnWriteBody 对每行即时处理即可，其余代码不用动。
-    void ParseSseBody(const std::string& body, SseResult& out)
-    {
-        std::istringstream in(body);
-        std::string line;
-
-        while (std::getline(in, line))
-        {
-            if (!line.empty() && line.back() == '\r')
-            {
-                line.pop_back();   // 兼容 CRLF
-            }
-
-            // 只关心 data: 行；event:/id:/retry:/: 注释行和空行都跳过
-            if (line.rfind("data:", 0) != 0)//从0之后范围找亿美元data
-            {
-                continue;
-            }
-
-            std::string payload = line.substr(5);//去掉前缀 "data:"，剩下的就是 JSON 负载
-            const std::size_t first = payload.find_first_not_of(' ');//从 payload 字符串里，找到第一个不是空格的字符的下标，stl函数找到第一个不是xx的字符
-            if (first == std::string::npos)//std::string::npos是std::string里定义的一个常量，代表**没有找到目标字符 / 子串
-            {
-                continue;   // "data:" 后面是空的
-            }
-            payload = payload.substr(first);//substr(pos)含义：**从下标 pos 开始，截取到字符串末尾SSE协议规范里data:后面允许跟一个空格，很多服务端都会写成 data: 内容。
-            //如果我们不做这个裁剪，payload 开头就会多一个空格，传给上层解析 JSON 的时候，偶尔会导致 json 解析失败
-            if (payload == "[DONE]")
-            {
-                break;      // OpenAI 风格的结束标记
-            }
-
-            try
-            {
-                const nlohmann::json event = nlohmann::json::parse(payload);
-                const std::string name = event.value("event", std::string());
-
-                if (name == "token")
-                {
-                    out.answer += event.value("content", std::string());//增量文字片段，拼到`out.answer`（流式输出的一小块文字
-                }
-                else if (name == "session")
-                {
-                    out.threadId = event.value("thread_id", std::string());//带回会话 id `thread_id`
-                }
-                else if (name == "error")//业务层面报错，填入`out.error`
-                {
-                    out.error = event.value("message", std::string("智能体内部错误"));
-                }
-                // meta / done 只用来打日志，这里不需要
-            }
-            catch (const std::exception&)
-            {
-                // 单行不是合法 JSON 就跳过，不能因为一行脏数据把整个回答丢掉
-            }
-        }
     }
 
     // 非流式接口的兜底：直接从 JSON 里挑回答字段。
@@ -218,7 +277,7 @@ void agent_tcp::Stop()
         std::lock_guard<std::mutex> lock(m_mtx);
         m_queue.clear();
         m_inFlight.clear();
-        m_cancel.clear();
+        m_cancel.clear(); 
     }
 
     // 所有 worker 都已 join，此时不会再有线程用 curl，可以安全清理
@@ -397,6 +456,47 @@ void agent_tcp::WorkerLoop()
             continue;
         }
 
+        // ===== ack 门 =====
+        // agent_response 和 agent_request_ack 是两条独立路径写 socket 的：
+        // ack 在 handle 线程、response 在 worker 线程。handle 那边 Submit 之后还要回包、
+        // 再交给 ClientWork 写出去，而 worker 一被 notify 就能跑 —— 两边没有任何先后保证。
+        // 客户端靠 ack 启动看门狗、靠 response 关看门狗，顺序反了就会把回答当成过期包。
+        //
+        // 改成流式之后，这个门必须挪到调智能体之前：
+        // 第一包 token 可能在 curl_easy_perform 返回之前就到达，如果还等到调用结束才开门，
+        // 第一个增量包就会抢在 ack 前面出去。而且此刻 worker 正在 curl 的写回调里，
+        // 在那里阻塞等 ack 会把 curl 的传输循环一起卡住，不如在这里先等完。
+        // ack 由 HandleAgentRequest 在 Submit 之后立刻发出，实际等待时间基本是微秒级。
+        // 上限 3 秒只是兜底：万一对端已经断线、ack 根本发不出去，worker 不能被永久卡住白占线程。
+        if (task.ackSent)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!task.ackSent->load(std::memory_order_acquire))
+            {
+                // 等闸门期间用户又点了停止，就没必要再等了
+                if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+                {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    std::cout << "[agent] 等待 ack 超时（3s），仍继续推送 requestId="
+                              << task.requestId << std::endl;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        // 等闸门期间用户可能又点了停止，推包前再确认一次
+        if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+        {
+            std::cout << "[agent] 本轮在等 ack 期间被取消，丢弃结果 requestId="
+                      << task.requestId << " threadId=" << task.threadId << std::endl;
+            finishTask();
+            continue;
+        }
+
         // ===== 干活区：阻塞时长完全取决于智能体，这里绝不能持有全局锁 =====
         std::cout << "[agent] 开始处理 requestId=" << task.requestId
                   << " account=" << task.account
@@ -417,12 +517,111 @@ void agent_tcp::WorkerLoop()
         // 多设备重连、服务重启之后算出来还是同一个 thread，上下文不会断。
         const std::string agentThread = MakeAgentThreadId(task.threadId, task.account);
 
+        // ===== 流式推送的准备 =====
+        // weak_ptr::lock() 失败说明用户已经下线、会话对象被销毁了；
+        // 成功就整轮持住：每个 token 都要回包，每块都去 lock 一次等于白多做一次原子操作。
+        const SessionPtr sess = task.session.lock();
+        bool pushedAny = false;   // 是否真的推过增量包
+
+        // 推一条 agent_response。
+        // 流式期间每块文字都是 done=false 的增量包，最后再单独发一条 done=true 的收尾包。
+        const auto pushResponse = [&](const std::string& delta, bool finished, bool ok,
+                                      int code, const std::string& message) -> bool
+        {
+            if (!sess)
+            {
+                return false;
+            }
+
+            nlohmann::json rsp;
+            // 失败也走同一个包类型，只看 success/code/message，
+            // 客户端就不用为"出错"再多写一条分支
+            rsp["type"] = "agent_response";
+
+            // 会话ID / 消息ID 一律原样回显：客户端靠它们把答案挂回正确的会话和气泡。
+            // threadId 是客户端生成的，serverId 是 agent_message_create 里服务器发的，
+            // 两个值服务器都不解析、不改写。改名 serverId 是为了对齐协议表
+            rsp["threadId"]  = task.threadId;
+            rsp["serverId"]  = task.messageId;
+            // 服务器内部编号，只供日志排查，客户端可以忽略
+            rsp["requestId"] = std::to_string(task.requestId);
+
+            rsp["answer"]   = delta;
+            rsp["done"]     = finished;
+            rsp["finished"] = finished;   // finished 是旧名字，一并带上做兼容
+            rsp["code"]     = code;
+            rsp["message"]  = message;
+            rsp["success"]  = ok;
+
+            // SendJson 内部持 sendMtx 并检查 closed，
+            // 保证不会和该连接自己的心跳应答交错拼出半行 JSON
+            return sess->SendJson(rsp.dump() + "\n");
+        };
+
+        // 智能体每吐一段字就调这里一次 —— 真正的流式输出就在这一步：
+        // 以前是把整个 SSE 收完才推一个包，现在是收到一块推一块。
+        const AgentDeltaSink onDelta = [&](const std::string& delta) -> bool
+        {
+            // 用户刚点了停止：立刻别再吐字，返回 false 让 curl 顺手收手
+            if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+            {
+                return false;
+            }
+
+            // 推不出去说明客户端已经断线，再把流收完只是白烧带宽和 worker
+            if (!pushResponse(delta, false, true, 0, ""))
+            {
+                return false;
+            }
+
+            pushedAny = true;
+            return true;
+        };
+
         // 智能体可能回一个新的 thread_id（首次对话时），所以这里留一个可变副本
         std::string agentThreadId = agentThread;
-        const std::string answer = endpoint.mock
-            ? MockAgent(task.prompt, agentThread)
-            : CallAgent(task.prompt, agentThread, endpoint, error,
-                        &agentThreadId, task.cancelled.get());
+
+        std::string answer;
+        if (endpoint.mock)
+        {
+            // 模拟智能体：先整段算好，再按 UTF-8 字符切片慢慢吐，
+            // 这样没有真实智能体时也能验证"边收边推"整条链路。
+            // 按字符边界推进，绝不从汉字中间切，否则客户端会看到乱码
+            const std::string full = MockAgent(task.prompt, agentThread);
+            std::size_t i = 0;
+            while (i < full.size())
+            {
+                if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
+                {
+                    break;
+                }
+
+                std::size_t end = i;
+                for (int n = 0; n < 2 && end < full.size(); ++n)
+                {
+                    end += Utf8CharBytes(static_cast<unsigned char>(full[end]));
+                }
+                if (end > full.size())
+                {
+                    end = full.size();
+                }
+
+                const std::string piece = full.substr(i, end - i);
+                i = end;
+                answer += piece;
+
+                if (!onDelta(piece))
+                {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            }
+        }
+        else
+        {
+            answer = CallAgent(task.prompt, agentThread, endpoint, error,
+                               &agentThreadId, task.cancelled.get(), onDelta);
+        }
 
         if (!agentThreadId.empty())
         {
@@ -459,99 +658,41 @@ void agent_tcp::WorkerLoop()
             continue;
         }
 
-        // ===== ack 门 =====
-        // agent_response 和 agent_request_ack 是两条独立路径写 socket 的：
-        // ack 在 handle 线程、response 在 worker 线程。handle 那边 Submit 之后还要回包、
-        // 再交给 ClientWork 写出去，而 worker 一被 notify 就能跑 —— 两边没有任何先后保证，
-        // mock 这个分支又特别快，几乎必然抢在 ack 前面。
-        // 客户端靠 ack 启动看门狗、靠 response 关看门狗，顺序反了就会把回答当成过期包。
-        // 所以这里先卡住，等 handle 把 ack 真正写进 socket 后再继续。
-        // 上限 3 秒只是兜底：万一对端已经断线、ack 根本发不出去，worker 不能被永久卡住白占线程。
-        if (task.ackSent)
+        // ===== 收尾包 =====
+        // 增量已经随到随推完了，这里只负责告诉客户端"本轮结束"。
+        // 成功、失败都必须发一条 done=true：客户端靠它结束"回答中"、关掉看门狗，
+        // 漏掉这一条，该会话就会永久锁在"回答中"，只能靠用户手动重开会话。
+        if (!sess)
         {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (!task.ackSent->load(std::memory_order_acquire))
-            {
-                // 等闸门期间用户又点了停止，就没必要再等了
-                if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
-                {
-                    break;
-                }
-                if (std::chrono::steady_clock::now() >= deadline)
-                {
-                    std::cout << "[agent] 等待 ack 超时（3s），仍继续推送 requestId="
-                              << task.requestId << std::endl;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-
-        // 等闸门期间用户可能又点了停止，推包前再确认一次
-        if (task.cancelled && task.cancelled->load(std::memory_order_relaxed))
-        {
-            std::cout << "[agent] 本轮在等 ack 期间被取消，丢弃结果 requestId="
-                      << task.requestId << " threadId=" << task.threadId << std::endl;
+            std::cout << "[agent] 用户已下线，丢弃结果 requestId=" << task.requestId << std::endl;
             finishTask();
             continue;
         }
 
-        // ===== 推送结果 =====
-        // weak_ptr::lock() 失败说明用户已经下线、会话对象被销毁了，结果直接丢弃
-        if (const SessionPtr sess = task.session.lock())
+        if (answer.empty())
         {
-            nlohmann::json rsp;
-            // 失败也走同一个包类型，只看 success/code/message，
-            // 客户端就不用为"出错"再多写一条分支
-            rsp["type"] = "agent_response";
-
-            // 会话ID / 消息ID 一律原样回显：客户端靠它们把答案挂回正确的会话和气泡。
-            // threadId 是客户端生成的，serverId 是 agent_message_create 里服务器发的，
-            // 两个值服务器都不解析、不改写。改名 serverId 是为了对齐协议表
-            rsp["threadId"] = task.threadId;
-            rsp["serverId"] = task.messageId;
-            // 服务器内部编号，只供日志排查，客户端可以忽略
-            rsp["requestId"] = std::to_string(task.requestId);
-
-            // done 每轮都必须为 true —— 客户端靠它结束“回答中”状态。
-            // 漏掉这一条，该会话就会永久锁在“回答中”，只能靠用户手动重开会话。
-            // 成功和失败都要带，所以放在分支外面统一设置；finished 是旧名字，一并带上做兼容
-            rsp["done"]     = true;
-            rsp["finished"] = true;
-
-            if (answer.empty())
-            {
-                // answer 和 error 同时为空（智能体返回 200 但内容里没有可用文本）
-                // 也是异常，不能当成功推一个空回答回去
-                rsp["code"]    = 502;
-                rsp["message"] = error.empty() ? "智能体没有返回任何内容" : error;
-                rsp["success"] = false;
-                rsp["answer"]  = "";
-            }
-            else
-            {
-                rsp["code"]    = 0;
-                rsp["message"] = "";
-                rsp["success"] = true;
-                // 顶层 answer 才是协议字段（兼容 content），不要再套一层 data
-                rsp["answer"] = answer;
-            }
-
-            // SendJson 内部持 sendMtx 并检查 closed，
-            // 保证不会和该连接自己的心跳应答交错拼出半行 JSON
-            if (sess->SendJson(rsp.dump() + "\n"))
-            {
-                std::cout << "[agent] 已推送 requestId=" << task.requestId
-                          << " threadId=" << task.threadId << std::endl;
-            }
-            else
-            {
-                std::cout << "[agent] 推送失败，连接已断开 requestId=" << task.requestId << std::endl;
-            }
+            // answer 和 error 同时为空（智能体返回 200 但内容里没有可用文本）
+            // 也是异常，不能当成功推一个空回答回去
+            const std::string message = error.empty() ? "智能体没有返回任何内容" : error;
+            pushResponse("", true, false, 502, message);
+            std::cout << "[agent] 本轮失败 requestId=" << task.requestId
+                      << " 原因=" << message << std::endl;
+        }
+        else if (!pushedAny)
+        {
+            // 一个字都没流式推过（不是 SSE，而是普通 JSON 接口）：整段一次性发出去，
+            // 行为和改造前完全一致，客户端那边只当收到一个很大的增量包
+            pushResponse(answer, true, true, 0, "");
+            std::cout << "[agent] 已推送（整包）requestId=" << task.requestId
+                      << " threadId=" << task.threadId << std::endl;
         }
         else
         {
-            std::cout << "[agent] 用户已下线，丢弃结果 requestId=" << task.requestId << std::endl;
+            // 增量包都已经发出去了，收尾包只带 done=true，回答内容不再重复发一遍
+            pushResponse("", true, true, 0, "");
+            std::cout << "[agent] 流式推送完成 requestId=" << task.requestId
+                      << " threadId=" << task.threadId
+                      << " 字节数=" << answer.size() << std::endl;
         }
 
         finishTask();
@@ -563,7 +704,8 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
                                  const AgentEndpoint& endpoint,
                                  std::string& outError,
                                  std::string* outThreadId,
-                                 const std::atomic<bool>* cancel)
+                                 const std::atomic<bool>* cancel,
+                                 const AgentDeltaSink& onDelta)
 {
     outError.clear();
 
@@ -596,8 +738,11 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
         return "";
     }
 
-    std::string responseBody;
-    responseBody.reserve(4096);
+    // 流式上下文：半行缓冲 + 累积结果 + 增量回调。
+    // 注意它必须活到 curl_easy_cleanup 之后 —— 它是 WRITEDATA 指向的对象
+    StreamContext ctx;
+    ctx.onDelta = onDelta;
+    ctx.rawBody.reserve(4096);
 
     curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -610,29 +755,30 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(bodyText.size()));//设置POST请求的内容长度，POST请求体的数据长度
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);//设置请求头，curl_slist_append返回的链表指针
 
-    // 响应不是直接打印，而是交给 OnWriteBody 拼进 responseBody
+    // 响应不是直接打印，而是交给 OnWriteBody 按行切、边解析边回调；
+    // 它只认识 StreamContext，所以这里传 ctx 的地址（而不是一个 std::string）
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, OnWriteBody);
-    // 传给回调的 userdata，这里是 responseBody 的地址
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
     // 🔴 多线程程序必须打开：不开的话 curl 用 SIGALRM 实现 DNS 超时，
     // 信号会被随机投递给进程里任意线程，可能导致整个服务被干掉
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
-    // 三级超时，各管一件事：
-    //   1) CONNECTTIMEOUT  只管 TCP 握手，防"智能体进程没起来"
-    //   2) LOW_SPEED_*     主检测手段，防"连上了但不出字"，流式场景就该用它
-    //   3) TIMEOUT         纯兜底，防"细水长流"式占住 worker，必须远大于正常回答耗时
+    // 两级超时，各管一件事：
+    //   1) CONNECTTIMEOUT  只管 TCP 握手，防“智能体进程没起来”
+    //   2) LOW_SPEED_*     唯一的静默检测，防“连上了但不出字”
+    // 故意不设 CURLOPT_TIMEOUT：流式场景下“总耗时”不是错误信号，
+    // 设了就会把“回答太长”当故障砍掉。长时间安静已由后端心跳（": ping"）消除，
+    // 所以低速超时一个计时器就能同时覆盖“要等很久”和“真的死了”两种情况。
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, endpoint.connectTimeoutSec);//连接阶段超时
 
     // 低速超时：连续 lowSpeedTimeSec 秒内平均速率低于 lowSpeedLimitBytes 才判死。
     // 注意判断的是"时间窗口内的平均速率"，不是瞬时速率，
     // 所以 1 字节/30 秒的实际含义是 30 秒内累计收到不足约 30 字节才中止。
+    // SSE 注释行（": ping"）同样是字节，会重置这个窗口 —— 这正是心跳能救命的原因，
+    // 也是 C++ 侧不需要为心跳写任何代码的原因（ParseSseBody 只认 "data:" 行，注释直接跳过）。
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, endpoint.lowSpeedLimitBytes);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  endpoint.lowSpeedTimeSec);
-
-    // 总时长兜底：宁可设得宽松，也不要让它抢在低速超时前面砍掉正常的长回答
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, endpoint.totalTimeoutSec);//整个http事务超时
 
     // 智能体通常要求 HTTP/1.1，显式指定避免协商到服务端不支持的版本
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
@@ -643,9 +789,10 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // 这是唯一能提前打断"已连上、正在收流"的请求的办法（超时只能干等）。
     if (cancel != nullptr)
     {
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, OnCancelCheck);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);//no progress直译：不要进度回调。默认值是1L：libcurl默认关闭进度回调，不会去调用你注册的进度函数。传0L= 关掉这个开关，启用进度回调。
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, OnCancelCheck);//XFERINFO = transfer info，传输信息回调。作用：告诉 libcurl：每次传输循环的时候，去调用你写好的这个函数OnCancelCheck
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));//这个是给上面那个回调函数传参数的，也就是回调里的 `void* userdata`
+        //**当 libcurl 调用 OnCancelCheck 的时候，把这个指针当成 userdata 传进去**。就是说，OnCancelCheck 里可以拿到这个 cancel 指针，去检查用户是否请求取消任务。onCancelCheck第一个参数
     }
 
     // ===== 3. 真的发出去（阻塞当前 worker，但只阻塞它自己）=====
@@ -659,6 +806,15 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
 
     if (code != CURLE_OK)
     {
+        // 智能体主动报错、客户端断线，都会让写回调返回 0 提前结束传输，
+        // 对外都表现为一个含糊的 CURLE_WRITE_ERROR，所以要先按它们解释
+        if (!ctx.sse.error.empty())
+        {
+            outError = ctx.sse.error;
+            std::cerr << "[agent] 智能体报错：" << outError << std::endl;
+            return "";
+        }
+
         // 把 curl 的错误码翻成人话，日志和客户端提示都用得上
         switch (code)
         {
@@ -671,15 +827,22 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
             outError = "无法连接智能体服务，请确认智能体进程已启动";
             break;
         case CURLE_WRITE_ERROR:
-            // 将来做流式推送时，写回调发现客户端断线会返回 0 触发这个码，
-            // 那不是智能体的错，日志里要能一眼区分开
-            outError = "客户端已断开，停止接收智能体回答";
+            // 写回调返回 0 的两个来源：用户点了停止（取消位已真），
+            // 或者推送时发现客户端断线。两者处理一样，但日志里要能一眼区分开
+            if (cancel != nullptr && cancel->load(std::memory_order_relaxed))
+            {
+                outError = "本轮回答已按用户请求停止";
+            }
+            else
+            {
+                outError = "客户端已断开，停止接收智能体回答";
+            }
             break;
         case CURLE_COULDNT_RESOLVE_HOST:
             outError = "智能体服务地址无法解析";
             break;
         case CURLE_ABORTED_BY_CALLBACK:
-            // 我们自己置的取消位把它打断的，和网络故障无关，必须单独区分
+            // 进度回调把它打断的（两次数据之间），和网络故障无关，必须单独区分
             outError = "本轮回答已按用户请求停止";
             break;
         case CURLE_GOT_NOTHING:
@@ -696,36 +859,41 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     if (httpStatus < 200 || httpStatus >= 300)
     {
         outError = "智能体服务返回异常状态码 " + std::to_string(httpStatus);
-        std::cerr << "[agent] " << outError << " body=" << responseBody.substr(0, 200) << std::endl;
+        std::cerr << "[agent] " << outError << " body=" << ctx.rawBody.substr(0, 200) << std::endl;
         return "";
     }
 
-    // ===== 4. 解析响应 =====
-    SseResult sse;
-    ParseSseBody(responseBody, sse);
-
-    if (!sse.error.empty())
+    // ===== 4. 收尾 =====
+    // 正常流里每一行已经在写回调里解析并回调过了，这里只剩“整理结果”和兜底。
+    // 若最后一行没有以 '\n' 结尾（有些服务端就这样），它还在 pending 里没收尾，补一刀
+    if (!ctx.pending.empty())
     {
-        outError = sse.error;
+        HandleSseLine(ctx, std::move(ctx.pending));
+        ctx.pending.clear();
+    }
+
+    if (!ctx.sse.error.empty())
+    {
+        outError = ctx.sse.error;
         return "";
     }
 
-    if (!sse.answer.empty())
+    if (!ctx.sse.answer.empty())
     {
         if (outThreadId != nullptr)
         {
-            *outThreadId = sse.threadId;
+            *outThreadId = ctx.sse.threadId;
         }
-        return sse.answer;
+        return ctx.sse.answer;
     }
 
     // 走到这里说明不是 SSE（或者流是空的），退回普通 JSON 解析，
     // 这样将来换成非流式接口也不用改代码
-    const std::string plain = ExtractAnswer(responseBody);
-    if (plain.empty() || plain == responseBody)
+    const std::string plain = ExtractAnswer(ctx.rawBody);
+    if (plain.empty() || plain == ctx.rawBody)
     {
         outError = "智能体返回内容为空或格式无法识别";
-        std::cerr << "[agent] " << outError << " body=" << responseBody.substr(0, 200) << std::endl;
+        std::cerr << "[agent] " << outError << " body=" << ctx.rawBody.substr(0, 200) << std::endl;
         return "";
     }
     return plain;

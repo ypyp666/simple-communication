@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -13,6 +14,15 @@
 #include <vector>
 
 #include "OnlineSessionManager.h"
+
+// ===== 流式增量回调 =====
+// 智能体每吐出一段文字（SSE 的 token 事件）就调一次，参数是这一段增量文本。
+// 返回 true  = 继续接收；
+// 返回 false = 立刻中止本次传输（客户端已经断线，或者用户刚点了停止）。
+//
+// 用 std::function 而不是模板参数，是为了让 CallAgent 继续当普通静态成员函数、
+// 定义留在 .cpp 里，不用把 curl 的头文件污染到每个调用方。
+using AgentDeltaSink = std::function<bool(const std::string&)>;
 
 // ===== 一次智能体请求 =====
 // 基础版：一问一答（非流式），先把「队列 + 线程池 + 安全推送」这条管子跑通。
@@ -160,12 +170,17 @@ public:
     // cancel 非空时注册 curl 进度回调：回调一旦读到取消位就返回非0，
     // curl_easy_perform 立刻以 CURLE_ABORTED_BY_CALLBACK 结束。
     // 这是唯一能提前打断"已经连上、正在收流"的请求的手段（超时只能干等）。
+    //
+    // onDelta 非空时走真流式：每解析出一段 token 就当场回调一次，由调用方立刻推给客户端，
+    // 不再等整个流收完。onDelta 返回 false 会让本次传输提前结束（客户端断线 / 用户停止）。
+    // 返回值仍然把完整回答拼好返回，方便日志和"非流式接口"的兜底。
     static std::string CallAgent(const std::string& prompt,
                                  const std::string& threadId,
                                  const AgentEndpoint& endpoint,
                                  std::string& outError,
                                  std::string* outThreadId = nullptr,
-                                 const std::atomic<bool>* cancel = nullptr);
+                                 const std::atomic<bool>* cancel = nullptr,
+                                 const AgentDeltaSink& onDelta = nullptr);
 
     // 纯本地模拟，不依赖网络。压测队列 / 智能体还没起来时用
     static std::string MockAgent(const std::string& prompt, const std::string& agentId);
