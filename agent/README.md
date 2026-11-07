@@ -98,6 +98,18 @@
 }
 ```
 
+### 动作白名单在哪加
+
+`action` 的取值不是随便的字符串，必须存在于 `src/main/tool.py` 的 `TASK_ACTIONS` 里，
+否则 `normalize_task_command()` 会直接把整条指令作废（返回 `{}`），不会传到客户端。
+
+Qt 端新增一个可执行操作时，要同步做两件事：
+
+1. 在 `tool.py` 的 `TASK_ACTIONS` 加一项：`"动作名": {"params": ["必填参数"], "desc": "说明"}`。
+2. 在 Qt 端的执行器里实现同名分支。
+
+服务端不需要再改别的地方——`TASK_PROMPT` 里的动作清单是由 `list_task_actions()` 现算的。
+
 ---
 
 ## 4. Qt 客户端接入要点
@@ -153,6 +165,14 @@ agent/
     │   ├── agent.py         # LangGraph 建图、专家节点、流式事件抽取
     │   ├── config.py        # 路径与环境变量（共享，避免循环导入）
     │   ├── server.py        # uvicorn 启动封装
-    │   └── tool.py          # 联网搜索工具
+    │   └── tool.py          # 所有工具 + 注册表(CHAT_TOOLS/...) + 动作白名单(TASK_ACTIONS)
     └── resources/           # 运行时数据（SQLite 会话库等，不入库）
 ```
+
+## 8. 代码风格约定
+
+- **所有工具都写在 `tool.py`**，靠文件末尾的 `CHAT_TOOLS` / `VISION_TOOLS` / `TASK_TOOLS`
+  注册表暴露，`agent.py` 只负责挑哪个列表给哪个专家，不写工具实现。
+- **不使用复杂语法糖**：不用列表/生成器推导式、不用三元表达式堆叠、不用 `**` 解包拼字典、
+  不用链式 `or` 取默认值。统一写成显式 `for` 循环 + `if/else` 分支，宁可多几行。
+- 一个工具只干一件事，参数拍平，不要嵌套结构。

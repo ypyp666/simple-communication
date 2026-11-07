@@ -15,8 +15,6 @@
 3. examine_expert 用 interrupt() 挂起，checkpointer 持久化 thread_id，
    客户端批准后通过 Command(resume=...) 恢复同一条会话。
 """
-from typing import Literal
-
 import json
 
 import aiosqlite
@@ -24,7 +22,6 @@ import aiosqlite
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -39,7 +36,12 @@ from main.config import (
     RESOURCES_DIR,
     require,
 )
-from main.tool import web_searchquery
+from main.tool import (
+    CHAT_TOOLS,
+    VISION_TOOLS,
+    list_task_actions,
+    normalize_task_command,
+)
 
 MAX_RECURSION = 20
 
@@ -72,28 +74,6 @@ class AgentState(MessagesState):
     task_command: dict = {}    # 交给客户端真正执行的指令
 
 
-class RouteDecision(BaseModel):
-    """supervisor 的结构化输出。"""
-    route: Literal["chat", "imagine", "task", "end"] = Field(
-        description="chat=普通闲聊/情绪对话；imagine=需要看图片；"
-                    "task=要改动数据或调用软件功能；end=无需回复"
-    )
-    reason: str = Field(default="", description="一句话说明判断依据")
-
-
-class TaskPlan(BaseModel):
-    """task_expert 规划阶段的结构化输出。"""
-    summary: str = Field(description="向用户确认这次要做什么，口语化一句话")
-    steps: list[str] = Field(default_factory=list, description="将执行的操作，按顺序")
-    risk: Literal["low", "medium", "high"] = Field(
-        default="medium", description="风险等级，high 表示不可逆操作"
-    )
-    command: dict = Field(
-        default_factory=dict,
-        description='交给客户端执行的指令，如 {"action":"delete_friend","params":{...}}',
-    )
-
-
 # ---------------------------------------------------------------- checkpointer
 
 _async_checkpointer = None
@@ -110,17 +90,16 @@ async def get_checkpointer():
             await _async_checkpointer.setup()
     return _async_checkpointer
 
-chat_expert=create_agent(
-    model=model,
-    tools=[web_searchquery],
-    system_prompt="""
+
+# ---------------------------------------------------------------- 提示词
+
+CHAT_PROMPT = """
 你是一个情感专家，你最擅长的就是与人沟通，你的沟通技巧贴合实际懂得安抚别人的情绪，别人说的话你都能接住，你是用户最喜爱的聊天助手，当遇到不理解的东西时你会
 使用 Deepseek 搜索工具
 ###注意：你的回答必须贴合口语化贴合真人，但是遇到以下违规行为禁止回答：涉及色情、暴力、政治敏感、违法犯罪、诈骗、赌博、恐怖主义、极端主义、仇恨言论、歧视言论等内容,违反中国大陆法律法规的内容禁止回答
 ##此外补充涉及宗教敏感和政治敏感内容禁止回答，涉及歧视问题的内容（包括性别，地域，民族和群体）禁止回答，涉及未成年人不良信息的内容禁止回答，涉及医疗健康、金融投资、法律咨询等专业领域的内容禁止回答，涉及个人隐私和个人信息的内容禁止回答，涉及虚假信息和谣言的内容禁止回答，涉及广告营销和商业推广的内容禁止回答，涉及侵权盗版和知识产权的内容禁止回答，涉及网络安全和信息安全的内容禁止回答
 #最后禁止回答的内容统一回复：对不起，我无法回答这个问题。请换一个话题。
 """
-)
 
 IMAGINE_PROMPT = """
 你是图像理解专家。用户会发来图片，可能附带一句说明。
@@ -129,25 +108,36 @@ IMAGINE_PROMPT = """
 回答使用简体中文，先给结论，再给必要的细节，不要输出与图片无关的联想。
 """
 
-TASK_PROMPT = """
-你是任务专家，负责理解用户想对软件执行的**有副作用的操作**（例如删除好友、修改关系、批量处理）。
-你的职责边界：
-- 只做意图识别与方案拆解，不要假装已经执行。
-- 如果用户意图含糊、缺少必要参数（对象、数量、范围），不要猜，直接在 summary 里向用户追问。
-- 高风险或不可逆操作（删除、清空、批量修改）标记 risk="high"。
-- command 里放结构化指令，动作名用小写下划线，参数放在 params 中。
+# 动作白名单从 tool.py 生成，提示词里列出的动作就是客户端能执行的动作。
+TASK_PROMPT = (
+    "你是任务专家，负责理解用户想对软件执行的**有副作用的操作**（例如删除好友、修改关系、批量处理）。\n"
+    "你的职责边界：\n"
+    "- 只做意图识别与方案拆解，不要假装已经执行。\n"
+    "- 如果用户意图含糊、缺少必要参数（对象、数量、范围），不要猜，直接在 summary 里向用户追问。\n"
+    "- 高风险或不可逆操作（删除、清空、批量修改）标记 risk=\"high\"。\n"
+    "\n可用动作只有下面这些，不要自己编造新的：\n"
+    f"{list_task_actions()}\n"
+    "\n输出要求：只输出一个 JSON 对象，不要输出解释、不要加 markdown 代码块，字段如下：\n"
+    '{"summary": "向用户确认这次要做什么，口语化一句话",\n'
+    ' "steps": ["第一步", "第二步"],\n'
+    ' "risk": "low|medium|high",\n'
+    ' "command": {"action": "delete_friend", "params": {"name": "张三"}}}\n'
+)
 
-输出要求：只输出一个 JSON 对象，不要输出解释、不要加 markdown 代码块，字段如下：
-{"summary": "向用户确认这次要做什么，口语化一句话",
- "steps": ["第一步", "第二步"],
- "risk": "low|medium|high",
- "command": {"action": "delete_friend", "params": {"name": "张三"}}}
-"""
 
+# ---------------------------------------------------------------- 专家
 
-# chat_expert 的定义见下方（沿用原有 system_prompt）
+# 工具列表统一从 tool.py 取，这里只选「用哪一组」，不直接声明工具
+chat_expert = create_agent(
+    model=model,
+    tools=CHAT_TOOLS,
+    system_prompt=CHAT_PROMPT,
+    name="chat_expert",
+)
+
 imagine_expert = create_agent(
     model=vision_model,
+    tools=VISION_TOOLS,
     system_prompt=IMAGINE_PROMPT,
     name="imagine_expert",
 )
@@ -165,16 +155,32 @@ def _content_to_parts(content) -> list[dict]:
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     if isinstance(content, list):
-        return [p if isinstance(p, dict) else {"type": "text", "text": str(p)} for p in content]
+        parts = []
+        for piece in content:
+            if isinstance(piece, dict):
+                parts.append(piece)
+            else:
+                parts.append({"type": "text", "text": str(piece)})
+        return parts
     return []
 
 
 def _has_image(content) -> bool:
-    return any(p.get("type") == "image_url" for p in _content_to_parts(content))
+    parts = _content_to_parts(content)
+    for piece in parts:
+        if piece.get("type") == "image_url":
+            return True
+    return False
 
 
 def _text_of(content) -> str:
-    return "".join(p.get("text", "") for p in _content_to_parts(content) if p.get("type") == "text")
+    parts = _content_to_parts(content)
+    text = ""
+    for piece in parts:
+        if piece.get("type") != "text":
+            continue
+        text += piece.get("text", "")
+    return text
 
 
 def _last_human(state: AgentState) -> HumanMessage | None:
@@ -186,16 +192,22 @@ def _last_human(state: AgentState) -> HumanMessage | None:
 
 def _keyword_route(question: str) -> str:
     """模型分类失败时的关键词兜底，避免整轮对话丢掉。"""
-    q = question or ""
-    if any(k in q for k in ("删除", "删掉", "移除", "修改", "批量", "添加", "设置", "清空")):
-        return "task"
+    if not question:
+        return "chat"
+    keywords = ("删除", "删掉", "移除", "修改", "批量", "添加", "设置", "清空")
+    for word in keywords:
+        if word in question:
+            return "task"
     return "chat"
 
 
 def _extract_route(text: str) -> str:
     """从模型输出里抠出 route，允许模型多话，取第一个命中的关键词。"""
-    low = (text or "").lower()
-    for name in ("imagine", "task", "chat", "end"):
+    if not text:
+        return ""
+    low = text.lower()
+    names = ("imagine", "task", "chat", "end")
+    for name in names:
         if name in low:
             return name
     return ""
@@ -203,18 +215,33 @@ def _extract_route(text: str) -> str:
 
 def _extract_json(text: str) -> dict:
     """从模型输出里抠出第一个 JSON 对象，抠不到返回空 dict。"""
-    raw = (text or "").strip()
-    if raw.startswith("```"):  # 去掉 ```json ... ``` 包裹
-        raw = raw.strip("`")
-        raw = raw.split("\n", 1)[-1] if raw.lower().startswith("json") else raw
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
+    if not text:
         return {}
+
+    raw = text.strip()
+
+    # 去掉 ```json ... ``` 这种包裹
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        lines = raw.split("\n", 1)
+        if len(lines) == 2:
+            raw = lines[1]
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1:
+        return {}
+    if end <= start:
+        return {}
+
     try:
         data = json.loads(raw[start:end + 1])
-        return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+    if isinstance(data, dict):
+        return data
+    return {}
 
 
 # ---------------------------------------------------------------- supervisor
@@ -229,6 +256,17 @@ async def supervisor_node(state: AgentState) -> dict:
     question = _text_of(last.content)
 
     fallback = _keyword_route(question)
+
+    if has_img:
+        img_hint = "包含"
+    else:
+        img_hint = "不包含"
+
+    if question:
+        human_text = question
+    else:
+        human_text = "（用户只发了图片，没有说话）"
+
     try:
         reply = await supervisor_llm.ainvoke([
             ("system",
@@ -238,11 +276,13 @@ async def supervisor_node(state: AgentState) -> dict:
              "- imagine：用户提供了图片，需要看图才能回答\n"
              "- task：要改动数据或调用软件功能（删除好友、修改关系、批量操作等）\n"
              "- end：空消息或无法理解的乱码\n"
-             f"当前消息{'包含' if has_img else '不包含'}图片。\n"
+             f"当前消息{img_hint}图片。\n"
              "输出格式：只输出一行 `route: 值`，不要解释，不要输出其它任何内容。"),
-            ("human", question or "（用户只发了图片，没有说话）"),
+            ("human", human_text),
         ])
-        route = _extract_route(_text_of(reply.content)) or fallback
+        route = _extract_route(_text_of(reply.content))
+        if not route:
+            route = fallback
     except Exception:
         # 分类失败退化到关键词兜底，不让整轮对话失败
         route = fallback
@@ -255,8 +295,12 @@ async def supervisor_node(state: AgentState) -> dict:
 
 
 def route_after_supervisor(state: AgentState) -> str:
-    route = state.get("route") or "end"
-    return route if route in {"chat", "imagine", "task"} else END
+    route = state.get("route")
+    if not route:
+        return END
+    if route == "chat" or route == "imagine" or route == "task":
+        return route
+    return END
 
 
 # ---------------------------------------------------------------- 专家节点
@@ -280,26 +324,50 @@ async def task_expert_node(state: AgentState) -> dict:
     if state.get("approval_status") == "approved":
         # 第二段：用户已批准。真正的副作用由客户端收到 task_execute 后执行，
         # 服务端只负责把指令和确认文案回写进会话。
+        summary = state.get("plan_summary")
+        if not summary:
+            summary = "操作已提交执行。"
+        command = state.get("task_command")
+        if not command:
+            command = {}
         return {
-            "messages": [AIMessage(content=state.get("plan_summary") or "操作已提交执行。")],
-            "task_command": state.get("task_command") or {},
+            "messages": [AIMessage(content=summary)],
+            "task_command": command,
         }
 
-    # 第一段：规划，不执行
-    history = [m for m in state["messages"] if isinstance(m, (HumanMessage, AIMessage))]
+    # 第一段：规划，不执行。只把人类与助手的对话给模型，不递工具消息。
+    history = [("system", TASK_PROMPT)]
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage):
+            history.append(msg)
+        elif isinstance(msg, AIMessage):
+            history.append(msg)
+
     try:
-        reply = await task_planner.ainvoke([("system", TASK_PROMPT), *history])
+        reply = await task_planner.ainvoke(history)
         raw = _text_of(reply.content)
         plan = _extract_json(raw)
-        summary = str(plan.get("summary") or raw.strip() or "请确认是否执行该操作。")
-        steps = [str(s) for s in (plan.get("steps") or [])]
-        risk = str(plan.get("risk") or "medium")
-        command = plan.get("command") if isinstance(plan.get("command"), dict) else {}
+
+        summary = str(plan.get("summary", ""))
+        if not summary:
+            summary = raw.strip()
+        if not summary:
+            summary = "请确认是否执行该操作。"
+
+        steps = []
+        raw_steps = plan.get("steps", [])
+        if isinstance(raw_steps, list):
+            for step in raw_steps:
+                steps.append(str(step))
+
+        # 动作名与风险等级由 tool.py 白名单校验，模型编的动作会直接作废
+        command = normalize_task_command(plan.get("command"), plan.get("risk"))
+
         return {
             "messages": [AIMessage(content=summary)],
             "plan_summary": summary,
             "plan_steps": steps,
-            "task_command": {**command, "risk": risk},
+            "task_command": command,
             "approval_status": "",
         }
     except Exception as exc:  # noqa: BLE001
@@ -311,7 +379,10 @@ async def task_expert_node(state: AgentState) -> dict:
 
 def route_after_task(state: AgentState) -> str:
     """未表态就送去审批；已批准（执行完）或已拒绝都直接收尾。"""
-    if state.get("approval_status") in {"approved", "rejected"}:
+    status = state.get("approval_status")
+    if status == "approved":
+        return END
+    if status == "rejected":
         return END
     return "examine_expert"
 
@@ -334,11 +405,15 @@ async def examine_expert_node(state: AgentState) -> dict:
     else:
         approved = bool(decision)
 
-    return {"approval_status": "approved" if approved else "rejected"}
+    if approved:
+        return {"approval_status": "approved"}
+    return {"approval_status": "rejected"}
 
 
 def route_after_examine(state: AgentState) -> str:
-    return "task_expert" if state.get("approval_status") == "approved" else END
+    if state.get("approval_status") == "approved":
+        return "task_expert"
+    return END
 
 
 # ---------------------------------------------------------------- 建图
@@ -399,23 +474,33 @@ def _event_node(event: dict) -> str | None:
 
     第一段正是父图里的节点名，用它判别最稳。
     """
-    md = event.get("metadata") or {}
-    ns = md.get("langgraph_checkpoint_ns") or ""
+    md = event.get("metadata")
+    if not md:
+        md = {}
+
+    ns = md.get("langgraph_checkpoint_ns")
     if ns:
-        return ns.split("|", 1)[0].split(":", 1)[0]
+        head = ns.split("|", 1)[0]
+        return head.split(":", 1)[0]
+
     return md.get("langgraph_node")
 
 
 def _chunk_text(chunk) -> str:
+    """从模型流式块里取纯文本。"""
     content = getattr(chunk, "content", None)
     if not content:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(
-        piece.get("text", "") if isinstance(piece, dict) else str(piece)
-        for piece in content
-    )
+
+    text = ""
+    for piece in content:
+        if isinstance(piece, dict):
+            text += piece.get("text", "")
+        else:
+            text += str(piece)
+    return text
 
 
 # route 名 → 节点名，保证 token / done 事件里的 agent 字段用同一套词汇
@@ -433,28 +518,60 @@ def _config_for(thread_id: str) -> dict:
     }
 
 
+def _collect_interrupts(snapshot):
+    """把 snapshot 上的 interrupt 收成一个列表。
+
+    不同版本可能挂在 snapshot.interrupts 上，也可能挂在每个 task 上，两种都兜住。
+    """
+    found = []
+
+    top = getattr(snapshot, "interrupts", None)
+    if top:
+        for item in top:
+            found.append(item)
+
+    if found:
+        return found
+
+    tasks = getattr(snapshot, "tasks", None)
+    if not tasks:
+        return found
+
+    for task in tasks:
+        task_interrupts = getattr(task, "interrupts", None)
+        if not task_interrupts:
+            continue
+        for item in task_interrupts:
+            found.append(item)
+    return found
+
+
 async def _emit_state_effects(graph, config):
     """图跑完后回读状态，把「待审批」「待执行」交给客户端。"""
     snapshot = await graph.aget_state(config)
-    values = snapshot.values or {}
+    values = snapshot.values
+    if not values:
+        values = {}
 
-    # interrupt 在 1.x 里可能挂在 snapshot 上，也可能挂在每个 task 上，两种都兜住
-    interrupts = getattr(snapshot, "interrupts", None) or tuple(
-        i for task in (getattr(snapshot, "tasks", None) or ())
-        for i in getattr(task, "interrupts", ())
-    )
+    interrupts = _collect_interrupts(snapshot)
     if interrupts:
         payload = interrupts[0].value
         if isinstance(payload, dict):
-            yield {**payload, "event": "approval_required"}
+            event = {"event": "approval_required"}
+            for key, value in payload.items():
+                event[key] = value
+            yield event
         else:
             yield {"event": "approval_required", "summary": str(payload)}
         return
 
     status = values.get("approval_status")
-    if status == "approved" and values.get("task_command"):
-        yield {"event": "task_execute", "command": values["task_command"]}
-    elif status == "rejected":
+    if status == "approved":
+        command = values.get("task_command")
+        if command:
+            yield {"event": "task_execute", "command": command}
+        return
+    if status == "rejected":
         yield {"event": "task_rejected"}
 
 
@@ -466,7 +583,11 @@ async def _run_graph(graph, graph_input, config):
         node = _event_node(event)
         if node not in VISIBLE_NODES:
             continue
-        text = _chunk_text((event.get("data") or {}).get("chunk"))
+
+        data = event.get("data")
+        if not data:
+            continue
+        text = _chunk_text(data.get("chunk"))
         if text:
             yield {"event": "token", "agent": node, "content": text}
 
@@ -478,12 +599,18 @@ def build_human_content(message: str, images: list[str] | None = None):
     """把文本 + 图片组装成 HumanMessage 支持的 content。"""
     if not images:
         return message
-    parts: list[dict] = []
+
+    parts = []
     if message:
         parts.append({"type": "text", "text": message})
+
     for img in images:
-        url = img if img.startswith(("http://", "https://", "data:")) else f"data:image/jpeg;base64,{img}"
+        if img.startswith("http://") or img.startswith("https://") or img.startswith("data:"):
+            url = img
+        else:
+            url = "data:image/jpeg;base64," + img
         parts.append({"type": "image_url", "image_url": {"url": url}})
+
     return parts
 
 
@@ -494,14 +621,26 @@ async def chat_stream(thread_id: str, user_message: str, images: list[str] | Non
     """
     graph = await get_supervisor_graph()
     config = _config_for(thread_id)
-    payload = {"messages": [HumanMessage(content=build_human_content(user_message, images))]}
+
+    content = build_human_content(user_message, images)
+    payload = {"messages": [HumanMessage(content=content)]}
 
     async for item in _run_graph(graph, payload, config):
         yield item
 
     snapshot = await graph.aget_state(config)
-    route = (snapshot.values or {}).get("route", "")
-    yield {"event": "done", "agent": ROUTE_TO_NODE.get(route, route)}
+    values = snapshot.values
+    if values:
+        route = values.get("route", "")
+    else:
+        route = ""
+
+    if route in ROUTE_TO_NODE:
+        agent_name = ROUTE_TO_NODE[route]
+    else:
+        agent_name = route
+
+    yield {"event": "done", "agent": agent_name}
 
 
 async def resume_stream(thread_id: str, approved: bool, note: str = ""):
@@ -510,11 +649,14 @@ async def resume_stream(thread_id: str, approved: bool, note: str = ""):
     config = _config_for(thread_id)
 
     snapshot = await graph.aget_state(config)
-    if not (getattr(snapshot, "next", None) or getattr(snapshot, "interrupts", None)):
+    has_next = bool(getattr(snapshot, "next", None))
+    has_interrupt = bool(_collect_interrupts(snapshot))
+    if not has_next and not has_interrupt:
         yield {"event": "error", "message": "该会话没有待审批的任务"}
         return
 
     command = Command(resume={"approved": approved, "note": note})
     async for item in _run_graph(graph, command, config):
         yield item
+
     yield {"event": "done", "agent": "task_expert"}
