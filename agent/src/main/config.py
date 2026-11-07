@@ -20,6 +20,8 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
 DEEPSEEK_SEARCH_URL = os.getenv("DEEPSEEK_SEARCH_URL")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+# 图片理解专家用的视觉模型；没有单独配置时退回主模型
+DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL") or DEEPSEEK_MODEL
 
 # 服务监听参数，Qt 客户端与后端约定这两个值即可
 HOST = os.getenv("AGENT_HOST", "127.0.0.1")
