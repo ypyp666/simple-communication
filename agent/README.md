@@ -18,12 +18,14 @@
                         │           ┌──────────────┐   ┌───────────────┐
                         └──────────►│ task_expert  │──►│examine_expert │
                                      └──────────────┘   │   (HITL)      │
-                                            ▲           └───────┬───────┘
-                                            │ 批准后回到执行阶段   │
-                                            └───────────────────┤
-                                                                │ 拒绝 / 超时
-                                                                ▼
-                                                               END
+                                            ▲           └───┬───────┬───┘
+                                            │ 批准后回到执行阶段 │       │ 拒绝
+                                            └─────────────────┘       │
+                                                                      ▼
+                                                             ┌────────────────┐
+                                                             │  report_expert │──► END
+                                                             └────────────────┘
+                                                              执行完也回到这里再说一句
 ```
 
 | 节点 | 职责 | 输出给用户的事件 |
@@ -33,6 +35,7 @@
 | `imagine_expert` | 图片理解专家，解析画面、文字、表格 | `token` |
 | `task_expert` | 任务专家，两段式：**规划**（生成方案并请求审批）→ **执行**（产出指令） | `approval_required` / `task_execute` |
 | `examine_expert` | 人类审批（HITL），`interrupt()` 挂起等待前端决定 | `approval_required` / `task_rejected` |
+| `report_expert` | 任务链路收尾播报：执行完 / 取消后都用一句人话交代结果 | `token` |
 
 要点：
 
@@ -40,6 +43,11 @@
   用户只看 `approval_required` 里的 `summary` / `steps`。
 - 真正的副作用（删好友、改关系等）由 **Qt 客户端**收到 `task_execute` 后执行，服务端只负责
   决策与留痕。
+- 任务链路不会静默结束：批准执行后、用户取消后，都会经过 `report_expert` 说一句
+  「干了什么 / 现在到哪一步」。它只能说自己「已下发」或「已取消」，**不会声称执行成功**，
+  真实结果由客户端执行后自行反馈。
+- 事件顺序固定为：`task_execute` / `task_rejected` → `token`(`report_expert`) → `done`，
+  服务端会把播报先攒住，避免客户端先看到「已下发」再收到指令。
 - 审批挂起后即使前端断开、后端重启，只要 `thread_id` 不变，仍可通过 `/approve` 续上。
 
 ---
@@ -81,7 +89,7 @@
 | `event` | 载荷 | 说明 |
 | :-- | :-- | :-- |
 | `session` | `thread_id` | 流的第一条，前端持久化这个 id |
-| `token` | `agent`, `content` | 增量文本，`agent` 为 `chat_expert` 或 `imagine_expert` |
+| `token` | `agent`, `content` | 增量文本，`agent` 为 `chat_expert` / `imagine_expert` / `report_expert` |
 | `approval_required` | `summary`, `steps`, `command` | 需要弹确认框，用户选择后调 `/approve` |
 | `task_execute` | `command` | 已批准，客户端据此执行真实操作 |
 | `task_rejected` | — | 已拒绝，任务终止 |
@@ -120,7 +128,9 @@ Qt 端新增一个可执行操作时，要同步做两件事：
 4. 收到 `approval_required` 弹出确认对话框，用户点「同意」→ `POST /approve {approved:true}`，
    点「取消」→ `POST /approve {approved:false}`。
 5. 收到 `task_execute` 才真正改动本地数据。
-6. 不要设置过短的低速超时；正常静默最长可能持续数十秒，靠 `: ping` 保活。
+6. 执行完不用自己拼提示文案：后面会跟着 `token`（`agent="report_expert"`）的播报，
+   直接用普通气泡渲染，末尾以 `done` 收尾。
+7. 不要设置过短的低速超时；正常静默最长可能持续数十秒，靠 `: ping` 保活。
 
 ---
 
