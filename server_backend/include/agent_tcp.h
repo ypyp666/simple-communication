@@ -95,6 +95,11 @@ struct AgentApproval
     std::string summary;    // 要用户确认的那句话
     std::string steps;      // JSON 数组原文；智能体没给就是 "[]"
     std::string command;    // JSON 对象原文；智能体没给就是 "{}"
+    // 「给谁、做什么」的两列表，形如 [{"label":"对象","value":"老李（账号 1001）"}]。
+    // 为什么单独一个字段而不是让客户端从 command 里拼：command 里只有数字账号，
+    // 人名是智能体才有的信息（它查过好友表）。客户端拿不到名字就只能给用户看
+    // 一串数字，那审批框等于没告诉他发给谁。
+    std::string detail;     // JSON 数组原文；智能体没给就是 "[]"
 };
 
 // 审批回调：agent_tcp 解析到 approval_required 时调一次，

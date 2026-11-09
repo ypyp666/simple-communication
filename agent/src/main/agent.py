@@ -25,6 +25,7 @@
    是可见的（在 VISIBLE_NODES 里），所以用户不会再看到任务链路静悄悄地结束。
 """
 import json
+import re
 
 import aiosqlite
 
@@ -50,6 +51,7 @@ from main.tool import (
     CHAT_TOOLS,
     TASK_TOOLS,
     VISION_TOOLS,
+    describe_task_command,
     list_task_actions,
     normalize_task_command,
 )
@@ -437,8 +439,44 @@ def _attach_forward_packet(command: dict, tool_results: dict) -> dict:
     if packet.get("type") != "agent_send_message":
         return {}
 
+    _fill_target_name(packet, tool_results)
     command["params"] = packet
     return command
+
+
+def _fill_target_name(packet: dict, tool_results: dict) -> None:
+    """包里没人名就把它补上，供审批框显示「发给谁」。
+
+    为什么需要这层兜底：人名只影响展示，模型完全可能记得传、也可能忘。
+    而「发给谁」恰恰是用户在审批框上最需要看清的一行——只有一串数字账号
+    等于没告诉他。search_friend 的返回文本里本来就有「账号ID：1001，
+    用户名：张三」，照着 targetId 就能配回来。
+
+    配不上就留空，绝不猜：宁可只显示账号，也不能显示一个别的名字。
+    投递永远以 targetId 为准，这里补的名字写错了也不会发错人。
+    """
+    name = packet.get("targetName")
+    if isinstance(name, str) and name.strip() != "":
+        return
+
+    target_id = packet.get("targetId")
+    if target_id is None:
+        return
+    target_id = str(target_id).strip()
+    if target_id == "":
+        return
+
+    found = tool_results.get("search_friend")
+    if not isinstance(found, str):
+        return
+
+    # 只认 format_friend_rows 写出的那一行，别的文本一概不解析：
+    # 它来自我们自己的格式化函数，格式是可控的
+    pattern = r"账号ID：(\d+)，用户名：([^，\n]+)"
+    for match in re.finditer(pattern, found):
+        if match.group(1) == target_id:
+            packet["targetName"] = match.group(2).strip()
+            return
 
 
 async def task_expert_node(state: AgentState, config) -> dict:
@@ -530,6 +568,10 @@ async def examine_expert_node(state: AgentState) -> dict:
         "summary": state.get("plan_summary", ""),
         "steps": state.get("plan_steps", []),
         "command": state.get("task_command", {}),
+        # detail 是给用户看的「给谁、做什么」两列表：全部由服务端从指令的
+        # 确定字段生成，不经过模型。summary/steps 是模型写的，适合当一句话
+        # 描述；真正让用户看清对象和内容的必须是 detail。
+        "detail": describe_task_command(state.get("task_command", {})),
     })
 
     if isinstance(decision, dict):

@@ -100,7 +100,7 @@
 | :-- | :-- | :-- |
 | `session` | `thread_id` | 流的第一条，前端持久化这个 id |
 | `token` | `agent`, `content` | 增量文本，`agent` 为 `chat_expert` / `imagine_expert` / `report_expert` |
-| `approval_required` | `thread_id`, `summary`, `steps`, `command` | 需要弹确认框，用户选择后调 `/approve` |
+| `approval_required` | `thread_id`, `summary`, `steps`, `command`, `detail` | 需要弹确认框，用户选择后调 `/approve` |
 | `task_execute` | `command` | 已批准，客户端据此执行真实操作 |
 | `task_rejected` | — | 已拒绝，任务终止 |
 | `error` | `message` | 异常信息 |
@@ -120,6 +120,47 @@
 
 `approval_required.thread_id` 是给**转发层**用的：审批是**另一条** HTTP 请求（`/approve`），
 转发层手上只有原来那条长连接，不会自己去拆配置，靠这个字段才能续上同一条会话。
+
+### 审批框里必须能看清「给谁、做什么」
+
+`summary` 和 `steps` 是模型写的，通当一句话描述很合适，但它们**不能担当审批依据**：
+模型很容易写出「帮你把消息发出去」这种不含对象的句子，用户在弹框上看不到要发给谁、
+要删的是谁，这个「同意」就点得毫无意义。所以 `approval_required` 额外带一个 `detail`，
+它是**服务端**从指令的确定字段生成的键值对列表，模型无法影响内容：
+
+```json
+"detail": [
+  { "label": "操作", "value": "发送消息给好友" },
+  { "label": "对象", "value": "老李（账号 1001）" },
+  { "label": "内容", "value": "老李，周末的球还打不打？" },
+  { "label": "时间", "value": "2026-11-09 16:23:08" },
+  { "label": "风险", "value": "高" }
+]
+```
+
+客户端只要按顺序两列渲染（`label` 右对齐、`value` 左对齐），**不要自己拼中文**：
+新增动作时服务端会自己给出对应的行，Qt 端不用改代码。
+
+各行怎么来的：
+
+| `label` | 取值来源 | 什么动作会有 |
+| :-- | :-- | :-- |
+| `操作` | `TASK_ACTIONS[action]["label"]`（中文名） | 全部 |
+| `对象` | `targetName` + `targetId`，或 `name` | 全部 |
+| `内容` | `params.content` | 发消息 |
+| `新备注` | `params.remark` | 改备注 |
+| `时间` | `params.sendTime` | 发消息 |
+| `风险` | `RISK_LABELS[risk]` → 低/中/高 | 全部 |
+
+两条设计约束：
+
+- **人名只用于显示，投递一律以 `targetId` 为准。** `targetName` 哪怕写错也不会发错人；
+  它只是让用户在审批框里看到一个认识的名字。取不到人名时就只显示账号，**绝不猜**。
+- **人名不靠模型传。** 模型传了就用；没传的话 `_fill_target_name()` 会从
+  `search_friend` 的返回文本里按 `targetId` 配回来（那里本来就有「账号ID：1001，
+  用户名：张三」）。即模型词穷或健忘，审批框上的名字也不会缺。
+
+`detail` 为空数组（`[]`）时说明指令无效或动作未知，应当直接禁用「同意」按钮。
 
 `command` 结构示例：
 
@@ -146,11 +187,15 @@ Qt 端新增一个可执行操作时，要同步做两件事：
 
    ```python
    "动作名": {
-       "desc": "说明",
+       "label": "给用户看的中文名",   # 渲染在审批框的「操作」行
+       "desc": "给模型看的说明",
        "params": ["必填参数"],
        "chain": ["search_friend"],   # 可选：执行前必须先调的工具，按顺序
    }
    ```
+
+   `label` 与 `desc` 故意分开：`label` 进审批框给普通用户看，`desc` 进提示词给模型看，
+   后者里那些「params 留空、由谁备好」对用户是噪音。
 
 2. 在 Qt 端的执行器里实现同名分支。
 
@@ -218,6 +263,7 @@ docstring 里，**不要为了新工具去改提示词**。
 {
   "type": "agent_send_message",
   "targetId": "1001",
+  "targetName": "老李",
   "sendId": "42",
   "content": "周五的会改到下午三点，到时候见",
   "sendTime": "2026-11-09 14:56:10"
@@ -228,11 +274,16 @@ docstring 里，**不要为了新工具去改提示词**。
 | :-- | :-- | :-- |
 | `type` | 包类型，固定 `agent_send_message` | 工具 |
 | `targetId` | 目标用户账号（`message.receive_id`） | 工具，取自 `search_friend` |
+| `targetName` | 目标好友的显示名（用户名），**只用于显示** | 模型→工具；可缺 |
 | `sendId` | 发送者账号（`message.send_id`） | 工具，取自 `config` 里的当前用户 |
 | `content` | 智能体拟好的内容（`message.context`） | 模型，经 `forward_message` 校验 |
 | `sendTime` | `YYYY-MM-DD HH:MM:SS`（`message.sentime`） | **工具自己取时间** |
 
 账号一律写成字符串，和 Qt 客户端、C++ 后端一致。
+
+`targetName` 是故意做成可选的：取不到就不写这个键（`build_send_packet` 只在名字非空时
+加入），客户端回退成显示 `targetId`。写成空字符串反而更差——会渲染成「对象：」后面一片空白。
+服务端执行时**完全忽略** `targetName`，只认 `targetId`。
 
 为什么不让模型自己填这几个字段：模型没有时钟，`sendTime` 让它填只会得到一个编的时间；
 `sendId` 更不该由它猜。所以 `agent.py` 里的 `_attach_forward_packet` 会**用工具的返回

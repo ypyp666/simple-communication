@@ -502,11 +502,13 @@ AGENT_SEND_MESSAGE_TYPE = "agent_send_message"
 MAX_FORWARD_CHARS = 1000
 
 
-def build_send_packet(own_id: int, target_id: int, content: str) -> dict:
+def build_send_packet(own_id: int, target_id: int, content: str,
+                      target_name: str = "") -> dict:
     """拼出交给服务器转发的 agent_send_message 包。
 
-    四个字段的来路分得很清楚：
-    - targetId：search_friend 查出来的账号ID；
+    字段的来路分得很清楚：
+    - targetId：search_friend 查出来的账号ID，**投递的唯一依据**；
+    - targetName：好友的人名/备注，**只给审批框显示用**，服务器可以不看；
     - content：智能体拟好的内容；
     - sendId：当前登录用户，从 config 取，不由模型提供；
     - sendTime：工具自己取。模型没有时钟，让它填只会得到一个编的时间。
@@ -520,12 +522,20 @@ def build_send_packet(own_id: int, target_id: int, content: str) -> dict:
         "content": content,
         "sendTime": now.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    # 没人名就干脆不写这个字段：写一个空串进去，审批框会显示「对象：」后面空白，
+    # 比直接显示账号ID 更让人困惑
+    if isinstance(target_name, str):
+        name = target_name.strip()
+        if name != "":
+            packet["targetName"] = name
+
     return packet
 
 
 @tool
 async def forward_message(target_account: str | int, content: str,
-                          config: RunnableConfig) -> str:
+                          config: RunnableConfig, target_name: str = "") -> str:
     """准备转发包：把拟好的内容打包成服务器能直接转发的消息。
 
     【用途】
@@ -584,7 +594,7 @@ async def forward_message(target_account: str | int, content: str,
             f"{MAX_FORWARD_CHARS} 字上限，请拆短后再备包"
         )
 
-    packet = build_send_packet(own_id, target_id, content)
+    packet = build_send_packet(own_id, target_id, content, target_name)
     return json.dumps(packet, ensure_ascii=False)
 
 
@@ -598,26 +608,43 @@ async def forward_message(target_account: str | int, content: str,
 # 工具的详细说明写在工具自己的 docstring 里，不在这里重复。
 TASK_ACTIONS = {
     "delete_friend": {
+        "label": "删除好友",
         "desc": "删除好友",
         "params": ["name"],
         "chain": ["search_friend"],
     },
     "update_friend_remark": {
+        "label": "修改好友备注",
         "desc": "修改好友备注",
         "params": ["name", "remark"],
         "chain": ["search_friend"],
     },
     "add_friend": {
+        "label": "添加好友",
         "desc": "添加好友",
         "params": ["name"],
     },
     "agent_send_message": {
+        # label 是给用户看的中文名，desc 是给模型看的说明，两者故意分开：
+        # desc 里那些「params 留空、由谁备好」对用户是噪音
+        "label": "发送消息给好友",
         "desc": "把内容转发给好友，params 留空，由 forward_message 备好",
         "params": [],
         "chain": ["search_friend", "forward_message"],
     },
 }
 
+# 风险等级的中文说法。审批框直接把这三个字显示给用户，
+# 让他一眼看出这条指令是轻是重
+RISK_LABELS = {
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+}
+
+# 校验用的合法取值。单独留一份而不是直接取 RISK_LABELS 的键，
+# 是因为两者的用途不一样：一个管能不能存，一个管怎么显示，
+# 将来加等级时很可能只改其中一个
 RISK_LEVELS = ("low", "medium", "high")
 
 
@@ -678,6 +705,89 @@ def normalize_task_command(raw_command, fallback_risk=None) -> dict:
         "risk": risk,
     }
     return command
+
+
+def describe_task_command(command) -> list:
+    """把一条指令翻译成「给谁、做什么」的展示行，供审批框直接渲染。
+
+    为什么不让模型自己写这几行：它写的 summary 常常是「帮你把消息发出去」
+    这种不含对象的空话，用户在审批框上根本看不出要发给谁，那这个审批就
+    白点了。这里全部从 command 的确定字段里取，模型换什么说法都影响不到展示。
+
+    返回 [{"label": "操作", "value": "发送消息给好友"}, ...]，
+    客户端按顺序两列渲染即可，不用自己拼中文字符串，新增动作也不用改客户端。
+    """
+    detail = []
+    if not isinstance(command, dict):
+        return detail
+
+    action = command.get("action")
+    if not isinstance(action, str):
+        return detail
+
+    spec = TASK_ACTIONS.get(action)
+    action_label = action
+    if isinstance(spec, dict):
+        label = spec.get("label")
+        if isinstance(label, str) and label != "":
+            action_label = label
+    detail.append({"label": "操作", "value": action_label})
+
+    params = command.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    # 对象：能拿到人名就显示成「老李（账号 1001）」。
+    # 宁可少显示，也绝不在这里编一个名字出来——用户是照着这行字点同意的
+    target_name = ""
+    raw_name = params.get("targetName")
+    if isinstance(raw_name, str):
+        target_name = raw_name.strip()
+    if target_name == "":
+        raw_name = params.get("name")
+        if isinstance(raw_name, str):
+            target_name = raw_name.strip()
+
+    target_id = ""
+    raw_id = params.get("targetId")
+    if raw_id is not None:
+        target_id = str(raw_id).strip()
+
+    if target_name != "" and target_id != "":
+        detail.append({"label": "对象", "value": f"{target_name}（账号 {target_id}）"})
+    elif target_name != "":
+        detail.append({"label": "对象", "value": target_name})
+    elif target_id != "":
+        detail.append({"label": "对象", "value": f"账号 {target_id}"})
+
+    # 正文：发消息看 content，改备注看 remark。
+    # 长内容不在工具层截断，完整交给客户端，由它决定换行还是折叠
+    content = ""
+    raw_content = params.get("content")
+    if isinstance(raw_content, str):
+        content = raw_content
+    if content.strip() != "":
+        detail.append({"label": "内容", "value": content})
+
+    remark = ""
+    raw_remark = params.get("remark")
+    if isinstance(raw_remark, str):
+        remark = raw_remark
+    if remark.strip() != "":
+        detail.append({"label": "新备注", "value": remark})
+
+    send_time = ""
+    raw_time = params.get("sendTime")
+    if isinstance(raw_time, str):
+        send_time = raw_time
+    if send_time.strip() != "":
+        detail.append({"label": "时间", "value": send_time})
+
+    risk = command.get("risk")
+    if risk in RISK_LABELS:
+        detail.append({"label": "风险", "value": RISK_LABELS[risk]})
+
+    return detail
 
 
 # ---------------------------------------------------------------- 注册表

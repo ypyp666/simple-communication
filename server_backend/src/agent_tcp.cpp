@@ -25,6 +25,9 @@ namespace
         std::string approvalSummary;   // 要用户确认的那句话
         std::string approvalSteps;     // JSON 数组原文
         std::string approvalCommand;   // JSON 对象原文
+        // 「给谁、做什么」的两列表，JSON 数组原文。
+        // 服务器不解析它，只原样搬运——里面的人名只有智能体查得到
+        std::string approvalDetail;
     };
 
     // 一次流式下载的上下文：既是 curl 的 userdata，也是“半行缓冲 + 累积结果”的容器。
@@ -145,6 +148,14 @@ namespace
                 if (event.contains("command"))
                 {
                     ctx.sse.approvalCommand = event["command"].dump();
+                }
+
+                // 「给谁、做什么」的两列表。缺了只影响审批框好不好读，
+                // 不影响能不能批准，所以没给就当成空数组，不报错
+                ctx.sse.approvalDetail = "[]";
+                if (event.contains("detail"))
+                {
+                    ctx.sse.approvalDetail = event["detail"].dump();
                 }
             }
             // meta 只用来打日志，这里不需要
@@ -693,6 +704,14 @@ void agent_tcp::WorkerLoop()
                 rsp["command"] = approval.command;
             }
 
+            // 「给谁、做什么」的两列表，客户端按顺序渲染成两列就行，
+            // 不用自己拼中文字符串（新增动作也不用改客户端）
+            rsp["detail"] = nlohmann::json::parse(approval.detail, nullptr, false);
+            if (rsp["detail"].is_discarded())
+            {
+                rsp["detail"] = nlohmann::json::array();
+            }
+
             return sess->SendJson(rsp.dump() + "\n");
         };
 
@@ -1082,6 +1101,7 @@ std::string agent_tcp::PostAgentStream(const std::string& url,
             approval.summary  = ctx.sse.approvalSummary;
             approval.steps    = ctx.sse.approvalSteps;
             approval.command  = ctx.sse.approvalCommand;
+            approval.detail   = ctx.sse.approvalDetail;
 
             if (!onApproval(approval))
             {
