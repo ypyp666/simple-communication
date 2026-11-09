@@ -444,6 +444,58 @@ def _attach_forward_packet(command: dict, tool_results: dict) -> dict:
     return command
 
 
+# search_friend 的返回文本里每个好友占一行，格式由我们自己写的
+# format_friend_rows 决定，所以可以放心按它解析
+_FRIEND_ROW_PATTERN = re.compile(r"账号ID：(\d+)，用户名：([^，\n]+)")
+
+# 这些动作在客户端执行时只认账号：服务器上的 HandleDeleteFriend /
+# HandleSetRemark 都是从请求里读 targetId，光有人名根本调不动。
+# 让客户端自己拿名字再查一遍，等于把「到底是谁」重新变成一次猜测，
+# 所以和发消息的包一样，只认工具真的查到的那个账号。
+ACTIONS_NEEDING_TARGET_ID = ("delete_friend", "update_friend_remark")
+
+
+def _fill_target_id(command: dict, tool_results: dict) -> dict:
+    """给指令补上唯一的 targetId，补不齐就整条作废。
+
+    删除好友、改备注这类动作最后落到客户端的 delete_friend / set_remark，
+    这两个处理器都只读 targetId。模型常常只写一个人名（提示词里给的例子
+    就是 {"name": "张三"}），光凭这个名字客户端执行不了。
+
+    这里不去猜，只认 search_friend 当次返回的那一个人：
+    - 恰好一个人：把账号和人名都写进 params，审批框也能显示「张三（账号 1001）」
+    - 查不到、查到多个人：返回空 dict，整条指令作废，不弹审批框。
+      同名多人时 search_friend 本身就要求先问用户，替用户挑一个去删，
+      是这条链路上最不能犯的错。
+    """
+    if not command:
+        return command
+
+    action = command.get("action")
+    if action not in ACTIONS_NEEDING_TARGET_ID:
+        return command
+
+    found = tool_results.get("search_friend")
+    if not isinstance(found, str):
+        return {}
+
+    rows = []
+    for match in _FRIEND_ROW_PATTERN.finditer(found):
+        rows.append(match)
+
+    if len(rows) != 1:
+        return {}
+
+    params = command.get("params")
+    if not isinstance(params, dict):
+        params = {}
+
+    params["targetId"] = rows[0].group(1)
+    params["targetName"] = rows[0].group(2).strip()
+    command["params"] = params
+    return command
+
+
 def _fill_target_name(packet: dict, tool_results: dict) -> None:
     """包里没人名就把它补上，供审批框显示「发给谁」。
 
@@ -472,8 +524,7 @@ def _fill_target_name(packet: dict, tool_results: dict) -> None:
 
     # 只认 format_friend_rows 写出的那一行，别的文本一概不解析：
     # 它来自我们自己的格式化函数，格式是可控的
-    pattern = r"账号ID：(\d+)，用户名：([^，\n]+)"
-    for match in re.finditer(pattern, found):
+    for match in _FRIEND_ROW_PATTERN.finditer(found):
         if match.group(1) == target_id:
             packet["targetName"] = match.group(2).strip()
             return
@@ -524,6 +575,8 @@ async def task_expert_node(state: AgentState, config) -> dict:
         command = normalize_task_command(plan.get("command"), plan.get("risk"))
         # 带副作用的指令只认工具真的备好的数据，不给模型转抄的机会
         command = _attach_forward_packet(command, tool_results)
+        # 删除 / 改备注在客户端按账号执行，目标账号同样从查好友的结果里取
+        command = _fill_target_id(command, tool_results)
 
         return {
             "messages": [AIMessage(content=summary)],

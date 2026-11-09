@@ -330,9 +330,106 @@ docstring 里，**不要为了新工具去改提示词**。
 所以这里的分工是：**执行者换成客户端，通道没换。** 客户端的 `repost` 照样打到服务器，
 服务器照样调同一个 `Repost()` 写库 + 推给对方。没有任何一条路绕开服务器。
 
+#### 客户端要补的代码（按依赖顺序）
+
+**第 1 步：路由。** 在 `MainBackend::JsonParsing` 的 `else if` 链末尾加一条：
+
+```cpp
+else if (type == "agent_approval_required"
+      || type == "agent_approve_ack"
+      || type == "agent_task_execute"
+      || type == "agent_task_rejected") {
+    m_agentBackend->onTcpDataReceived(packet);
+}
+```
+
+漏一个分支不会报错、不会断言，包会**静默消失**——服务器侧漏掉 `task_execute`
+时就出过这个事故：审批点了，什么也没发生，播报还说「已下发」。
+
+**第 2 步：审批框。** 载荷里三样东西分工不同，别混着用：
+
+| 字段 | 用途 | 谁写的 |
+| :-- | :-- | :-- |
+| `detail` | **审批依据**：「操作 / 对象 / 内容 / 时间 / 风险」两列 | 服务端按指令字段确定性生成 |
+| `summary` | 一句话副标题 | 模型 |
+| `steps` | 分步说明，小字或折叠 | 模型 |
+
+- `detail` 是 `[{"label":"操作","value":"发送消息给好友"}, ...]`，按数组顺序渲染两列，
+  **不要在客户端拼中文**（新增动作时才不用改 Qt）。
+- `detail` 为空数组时**禁用「同意」**：这说明服务端没生成出可读内容，让用户盲签没有意义。
+- 点「同意 / 拒绝」只是回执，**不要在这一刻改任何本地数据**。真正执行要等第 3 步。
+- 回执包（TCP，和 `agent_request` 同一条连接）：
+
+```json
+{"type": "agent_approve", "threadId": "<照抄审批包>", "serverId": "<照抄审批包>",
+ "approved": true, "note": ""}
+```
+
+- 发完立刻把按钮切成「已提交」，然后**等 `agent_approve_ack` 再关弹框**：
+  - `success = true`：关框；
+  - `success = false`：把 `message` 显示出来（常见是「没有待审批的任务，可能已被处理或已取消」），
+    别静默关掉，否则用户以为点成功了；
+  - 等不到 ack（超时）：也要解锁按钮并提示，**不能永久禁用**。
+
+**第 3 步：执行。** 收到 `agent_task_execute` 后按 `command.action` 分支：
+
+| `action` | 客户端调什么 | 参数从哪来 |
+| :-- | :-- | :-- |
+| `agent_send_message` | 复用 `ChatBackend::sendMessage(targetId, msg)` | `params.targetId` / `params.content` / `params.sendTime` |
+| `delete_friend` | `delete_friend` | `params.targetId` |
+| `update_friend_remark` | `set_remark` | `params.targetId` + `params.remark` |
+| `add_friend` | 见下文，暂不可执行 | `params.name` |
+
+- 智能体备好的包和 `repost` 请求字段几乎一一对应，最省事的写法就是**原样搬过去**
+  （走 `startSendMessage` 而不是 `sendMessage`：前者带断线检查和超时兜底）：
+
+```cpp
+OutgoingMessage msg;
+msg.accountId  = m_userid;                                   // 自己
+msg.senderId   = params.value("sendId");                     // 填什么都行，服务器会覆盖
+msg.content    = params.value("content");
+msg.sendTime   = QDateTime::fromString(params.value("sendTime").toString(),
+                                       "yyyy-MM-dd HH:mm:ss");  // 解析失败就用当前时间
+msg.tempId     = QUuid::createUuid().toString();              // 自己生成
+m_chatBackend->startSendMessage(params.value("targetId").toString(), msg);
+```
+
+- `sendId` 不要信包里的：`HandleRepost` 里 `message["sendId"] = session->account;`
+  直接覆盖，客户端填什么都一样。**身份永远来自登录会话**。
+- 复用现有发送路径的意义：气泡、转圈动画、30 秒超时兜底、失败红叹号 + 用户手动重发，
+  全都现成。失败时用户点重发，就是一条普通消息，不需要为智能体单独做一套重试。
+
+**第 4 步：幂等。** 按 `requestId` 去重（保留最近 N 条即可）。服务器重推、客户端重连
+补拉都可能让同一条指令到两遍，而删除是不可逆的——**执行两次的代价比漏执行大得多**。
+
+**第 5 步：收尾。**
+
+- 不认识的 `action`：提示「这个操作当前版本还不支持」，不要静默吞掉。
+- 执行失败：**不要自动重试**（删除类操作重试可能变成删错人），把接口原始 `message`
+  显示出来，交用户决定。
+- `agent_task_rejected`：数据上什么都不做；如果界面有「等待执行」之类的状态，收掉它。
+- 执行结果不需要额外气泡：跟着来的 `report_expert` 播报已经在走普通渲染，接口自己
+  的 `*_response` 也会照常回来。
+
+#### `add_friend` 的 `targetId` 暂时没有来源
+
+`delete_friend` / `update_friend_remark` 的目标账号由智能体从 `search_friend` 的
+结果里确定性补上（`agent.py:_fill_target_id`）：恰好查到一个人就填 `targetId`，
+查不到或查到多个人**整条指令作废、不弹审批框**——同名多人时替用户挑一个去删，
+是这条链路上最不能犯的错。
+
+`add_friend` 是例外：要加的人本来就不在好友列表里，智能体没有全局搜索工具，
+包里只有 `name`。客户端要支持它，就得自己调 `search_request` 查账号，并且处理重名
+（查出多个人必须让用户选）。在客户端补上这一步之前，建议先把 `add_friend` 从
+`tool.py` 的 `TASK_ACTIONS` 里摘掉，否则用户会看到一个点不动的审批框。
+
 > 顺序说明：`agent_task_execute` 一到就会被推给客户端（不等流结束），保证客户端
 > **先拿到指令、后看到「已按计划下发」的播报**。审批包相反，要等流收尾再推，
 > 否则客户端可能先弹框、后收到「本轮结束」，两条包先后反了。
+>
+> 掉线时这条指令**不会补发**：服务器只留一行日志（`客户端已下线，无法下发任务`），
+> 挂起记录此时已被消费掉。代价是用户得重新发起一次，好处是重连之后不会突然执行
+> 几分钟前批准的删除。
 
 
 ---
