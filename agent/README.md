@@ -116,6 +116,10 @@
 }
 ```
 
+有副作用的动作如果其参数必须由工具产出（例如 `agent_send_message` 的包里有工具自己取的时间），
+`params` 会由服务端在规划结束后覆盖成工具返回的包；这类动作在 `TASK_ACTIONS` 里把
+`params` 写成空列表，动作清单就不会渲染「必填参数」，模型只需要给出 `action`。
+
 ### 动作白名单在哪加
 
 `action` 的取值不是随便的字符串，必须存在于 `src/main/tool.py` 的 `TASK_ACTIONS` 里，
@@ -147,7 +151,7 @@ docstring 里，**不要为了新工具去改提示词**。
 | :-- | :-- | :-- |
 | `CHAT_TOOLS` | 聊天专家 | `web_searchquery` |
 | `VISION_TOOLS` | 图片理解专家 | 空 |
-| `TASK_TOOLS` | 任务专家（规划阶段） | `search_friend`、`get_chat_history` |
+| `TASK_TOOLS` | 任务专家（规划阶段） | `search_friend`、`get_chat_history`、`forward_message` |
 
 任务专家跑的是手动工具循环（`_plan_with_tools`），最多 `MAX_TOOL_ROUNDS` 轮，
 最后强制收敛成纯文本 JSON，所以工具再调用也不会把规划结果截断。
@@ -160,7 +164,7 @@ docstring 里，**不要为了新工具去改提示词**。
 | :-- | :-- | :-- |
 | 1 | `search_friend` 查好友账号 | 已实现 |
 | 2 | `get_chat_history` 拉聊天记录 | 已实现 |
-| 3 | `forward_message` 把内容交给服务器转发 | 待实现，有副作用、必须走审批 |
+| 3 | `forward_message` 把内容打包交给服务器转发 | 已实现，有副作用、必须走审批 |
 
 拆开的理由：第 1、2 步只读，可以放心让模型自己调；第 3 步会真的把消息发出去，
 必须挂在 `examine_expert` 后面。合成一个大工具的话整条链都得审批，
@@ -189,6 +193,39 @@ docstring 里，**不要为了新工具去改提示词**。
 
 业务库账号只被授予存储过程的 `EXECUTE` 权限，**没有表的 `SELECT` 权限**，
 所以工具里一律走 `CALL`，不要改成自己拼 `SELECT`。
+
+### 出站协议：`agent_send_message`
+
+`forward_message` 不直接发消息，它只把内容**打成包**返回；包跟着指令走完审批，
+批准后才由客户端下发、服务器执行。包的字段就是后端要认的契约：
+
+```json
+{
+  "type": "agent_send_message",
+  "targetId": "1001",
+  "sendId": "42",
+  "content": "周五的会改到下午三点，到时候见",
+  "sendTime": "2026-11-09 14:56:10"
+}
+```
+
+| 字段 | 含义 | 谁来填 |
+| :-- | :-- | :-- |
+| `type` | 包类型，固定 `agent_send_message` | 工具 |
+| `targetId` | 目标用户账号（`message.receive_id`） | 工具，取自 `search_friend` |
+| `sendId` | 发送者账号（`message.send_id`） | 工具，取自 `config` 里的当前用户 |
+| `content` | 智能体拟好的内容（`message.context`） | 模型，经 `forward_message` 校验 |
+| `sendTime` | `YYYY-MM-DD HH:MM:SS`（`message.sentime`） | **工具自己取时间** |
+
+账号一律写成字符串，和 Qt 客户端、C++ 后端一致。
+
+为什么不让模型自己填这几个字段：模型没有时钟，`sendTime` 让它填只会得到一个编的时间；
+`sendId` 更不该由它猜。所以 `agent.py` 里的 `_attach_forward_packet` 会**用工具的返回
+直接覆盖** `command.params`，覆盖失败（工具没调、或返回的是失败文案）就整条指令作废，
+不弹审批框。模型只负责给 `action`，包不由它转抄。
+
+`forward_message` 的拒绝条件：账号不是纯数字、内容为空、内容超过 1000 字、
+不能发给自己、拿不到当前用户身份。超长不截断——截断等于替用户改了话。
 
 ---
 

@@ -14,6 +14,8 @@
    事件循环只负责等，等的同时还能处理别的会话的心跳和 token。
 """
 import asyncio
+import datetime
+import json
 
 import pymysql
 import requests
@@ -491,17 +493,99 @@ async def get_chat_history(account_id: str | int, config: RunnableConfig) -> str
     return format_chat_rows(rows, own_id)
 
 
-# ---------------------------------------------------------------- 待实现的一步
-# 下面这环还只有约定、没有实现，所以故意不给它加 @tool、也不放进注册表，
-# 模型看不到这个名字，也就不会在它没做好的时候先向用户乱承诺。
-#
-# forward_message(account_id, content)：
-#   把拟好的回复内容和账号ID交给服务器，由服务器解析后转发。
-#   这一环有副作用，必须挂到审批链路上：先让用户在 examine_expert 确认，
-#   批准之后才允许真正发给服务器。
-#   写的时候照前两个工具的格式：参数扁平、返回字符串、异常自己吞掉转成失败文案，
-#   「用途 / 链条位置 / 何时调 / 返回怎么用」全写在它自己的 docstring 里，
-#   不要回头去改提示词。
+# ---------------------------------------------------------------- 第三步：转发
+
+# 交给服务器转发的包类型，C++ 后端的 CmdType 按这个名字认
+AGENT_SEND_MESSAGE_TYPE = "agent_send_message"
+
+# 单条转发内容的安全上限。超了不截断——截断等于替用户改了话，宁可让它重拟
+MAX_FORWARD_CHARS = 1000
+
+
+def build_send_packet(own_id: int, target_id: int, content: str) -> dict:
+    """拼出交给服务器转发的 agent_send_message 包。
+
+    四个字段的来路分得很清楚：
+    - targetId：search_friend 查出来的账号ID；
+    - content：智能体拟好的内容；
+    - sendId：当前登录用户，从 config 取，不由模型提供；
+    - sendTime：工具自己取。模型没有时钟，让它填只会得到一个编的时间。
+    账号一律写成字符串，和 C++ 后端、Qt 客户端的习惯保持一致。
+    """
+    now = datetime.datetime.now()
+    packet = {
+        "type": AGENT_SEND_MESSAGE_TYPE,
+        "targetId": str(target_id),
+        "sendId": str(own_id),
+        "content": content,
+        "sendTime": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return packet
+
+
+@tool
+async def forward_message(target_account: str | int, content: str,
+                          config: RunnableConfig) -> str:
+    """准备转发包：把拟好的内容打包成服务器能直接转发的消息。
+
+    【用途】
+    把「发给谁、发什么、谁发的、什么时候发」拼成一个 `agent_send_message` 包，
+    交给服务器去写库并推给对方。
+
+    【在链条中的位置】
+    「帮某位好友恢复/转发消息」这类任务靠多个工具接力完成，本工具是第三环：
+        1. search_friend     拿到好友账号ID        只读
+        2. get_chat_history  读这段会话的聊天记录  只读
+        3. forward_message   把内容打包给服务器转发  <- 本工具
+    本工具只备包，不直接发出去：包会跟着指令回到服务器，用户在审批环节
+    点头之后才会真的发，用户拒了就不会发。
+
+    【什么时候调】
+    - 内容和对象都已经确定，就差「把这句话发出去」的时候；
+    - 内容必须是你自己拟好的最终版本，不要先备包再问用户要不要改。
+
+    【返回结果怎么用】
+    - 正常返回一段 JSON，里面已经有 type / targetId / sendId / content / sendTime，
+      这就是要交给服务器的包；你只需要在 command 里给出 action=agent_send_message，
+      **不要自己再填 targetId / content / sendTime**，服务端会拿本工具的返回原样填充。
+    - 返回以「【消息转发工具调用失败】」开头：包没备成，不要说已经发了，
+      原样转述给用户，command 留空 {}。
+
+    Args:
+        target_account: 好友的账号ID，必须是 search_friend 返回的那个数字，
+            不要把用户说的名字或备注直接传进来
+        content: 要发给对方的完整内容，一句一句写清楚，不要带「以下是消息：」这类说明
+    """
+    if not db_is_configured():
+        return "【消息转发工具调用失败】服务端没有配置数据库账号，请联系管理员"
+
+    own_id = resolve_own_id(config)
+    if own_id is None:
+        return "【消息转发工具调用失败】拿不到当前用户的账号ID，请让客户端在请求里带上 user_id"
+
+    target_id = parse_account_id(target_account)
+    if target_id is None:
+        return (
+            f"【消息转发工具调用失败】好友账号ID必须是纯数字，收到的是「{target_account}」。"
+            "请先调用 search_friend 按名字或备注查到账号ID"
+        )
+
+    if target_id == own_id:
+        return "【消息转发工具调用失败】不能把消息发给自己"
+
+    if not isinstance(content, str):
+        return "【消息转发工具调用失败】消息内容必须是文本"
+    content = content.strip()
+    if content == "":
+        return "【消息转发工具调用失败】消息内容不能为空"
+    if len(content) > MAX_FORWARD_CHARS:
+        return (
+            f"【消息转发工具调用失败】消息内容 {len(content)} 字，超过 "
+            f"{MAX_FORWARD_CHARS} 字上限，请拆短后再备包"
+        )
+
+    packet = build_send_packet(own_id, target_id, content)
+    return json.dumps(packet, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- 任务动作
@@ -527,10 +611,10 @@ TASK_ACTIONS = {
         "desc": "添加好友",
         "params": ["name"],
     },
-    "send_message": {
-        "desc": "给好友发送消息",
-        "params": ["name", "content"],
-        "chain": ["search_friend"],
+    "agent_send_message": {
+        "desc": "把内容转发给好友，params 留空，由 forward_message 备好",
+        "params": [],
+        "chain": ["search_friend", "forward_message"],
     },
 }
 
@@ -547,7 +631,9 @@ def list_task_actions() -> str:
     lines = []
     for action, spec in TASK_ACTIONS.items():
         need = "、".join(spec["params"])
-        line = f"- {action}：{spec['desc']}，必填参数 {need}"
+        line = f"- {action}：{spec['desc']}"
+        if need:
+            line += f"，必填参数 {need}"
 
         chain = spec.get("chain")
         if isinstance(chain, list) and len(chain) > 0:
@@ -602,8 +688,9 @@ CHAT_TOOLS = [web_searchquery]
 # 图片理解专家：只描述看到的画面，不需要外部工具
 VISION_TOOLS = []
 
-# 任务专家：查好友、读聊天记录这类只读工具可以自己调；
-# 真正有副作用的操作仍然只输出指令，等 Qt 客户端收到 task_execute 再执行。
-TASK_TOOLS = [search_friend, get_chat_history]
+# 任务专家：查好友、读聊天记录、备转发包这类工具可以自己调；
+# 备好的包不会直接发出去——它只是指令的一部分，等 Qt 客户端收到 task_execute、
+# 用户也已经在审批环节点过头之后，服务器才会真正把消息推给好友。
+TASK_TOOLS = [search_friend, get_chat_history, forward_message]
 
 

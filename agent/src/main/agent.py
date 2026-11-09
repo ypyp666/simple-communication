@@ -188,8 +188,9 @@ TASK_TOOL_MAP = {}
 for _tool in TASK_TOOLS:
     TASK_TOOL_MAP[_tool.name] = _tool
 
-# 规划阶段最多允许模型连续调几轮工具，防止它反复查同一个名字陷入死循环
-MAX_TOOL_ROUNDS = 3
+# 规划阶段最多允许模型连续调几轮工具，防止它反复查同一个名字陷入死循环。
+# 三步链路（查好友 → 读记录 → 备包）恰好用掉三轮，再留一轮给收尾。
+MAX_TOOL_ROUNDS = 4
 
 
 # ---------------------------------------------------------------- 小工具
@@ -370,14 +371,19 @@ async def _plan_with_tools(history, config):
     1. 限制轮数，防止模型反复查同一个名字打转；
     2. 工具执行时的 config 由我们自己传，user_id 才能带到库里；
     3. 最后一定要收敛成纯文本 JSON，不能被工具调用半路截断。
+
+    除了最终回复，还吐出「工具名 -> 最后一次返回」的字典。上层要用它做
+    确定性校验：有副作用的指令只能基于工具真的备好的数据生成，不能让模型
+    凭记忆重写一遍。
     """
     messages = list(history)
+    tool_results = {}
 
     for _round in range(MAX_TOOL_ROUNDS):
         reply = await task_planner.ainvoke(messages, config)
         tool_calls = getattr(reply, "tool_calls", None)
         if not tool_calls:
-            return reply
+            return reply, tool_results
 
         messages.append(reply)
         for call in tool_calls:
@@ -397,11 +403,42 @@ async def _plan_with_tools(history, config):
                     content = f"工具 {name} 执行失败：{exc}"
                 if not isinstance(content, str):
                     content = str(content)
+                tool_results[name] = content
 
             messages.append(ToolMessage(content=content, tool_call_id=call_id))
 
     # 轮数用完还没收敛，最后强制要一次纯文本，不给它再调工具的机会
-    return await model.ainvoke(messages)
+    return await model.ainvoke(messages), tool_results
+
+
+def _attach_forward_packet(command: dict, tool_results: dict) -> dict:
+    """把 forward_message 备好的包原样塞进指令，包不齐就整条作废。
+
+    为什么覆盖而不是让模型自己填：sendTime 必须由工具取（模型没有时钟，
+    填出来的时间是编的），sendId 必须由服务端取（模型不该知道当前用户是谁）。
+    让模型转抄一遍，它随时可能把时间改掉、把账号抄错，而这种错误会直接
+    发到真实好友那里。所以包只从工具结果里取，取不到就不弹审批框。
+    """
+    if not command:
+        return command
+    if command.get("action") != "agent_send_message":
+        return command
+
+    raw = tool_results.get("forward_message")
+    if not isinstance(raw, str):
+        return {}
+
+    try:
+        packet = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(packet, dict):
+        return {}
+    if packet.get("type") != "agent_send_message":
+        return {}
+
+    command["params"] = packet
+    return command
 
 
 async def task_expert_node(state: AgentState, config) -> dict:
@@ -429,7 +466,7 @@ async def task_expert_node(state: AgentState, config) -> dict:
             history.append(msg)
 
     try:
-        reply = await _plan_with_tools(history, config)
+        reply, tool_results = await _plan_with_tools(history, config)
         raw = _text_of(reply.content)
         plan = _extract_json(raw)
 
@@ -447,6 +484,8 @@ async def task_expert_node(state: AgentState, config) -> dict:
 
         # 动作名与风险等级由 tool.py 白名单校验，模型编的动作会直接作废
         command = normalize_task_command(plan.get("command"), plan.get("risk"))
+        # 带副作用的指令只认工具真的备好的数据，不给模型转抄的机会
+        command = _attach_forward_packet(command, tool_results)
 
         return {
             "messages": [AIMessage(content=summary)],
