@@ -259,5 +259,23 @@ agent/
 
 - **不使用复杂语法糖**：不用列表/生成器推导式、不用三元表达式堆叠、不用 `**` 解包拼字典、
   不用链式 `or` 取默认值。统一写成显式 `for` 循环 + `if/else` 分支，宁可多几行。
+- **工具一律写成 `async def`。** 下游的 `requests`、`pymysql` 都是同步阻塞库，
+  直接在事件循环里等它们，一个用户的慢查询/慢搜索会把所有会话一起冻住——
+  SSE 心跳发不出去，别人的 token 也不流了。
+
+  做法固定：同步逻辑原样写成普通函数，工具里用 `await asyncio.to_thread(...)`
+  丢进线程池，事件循环只负责等，等的过程中还能处理别的会话。
+
+  ```python
+  def call_search_user(own_id, target_name):   # 同步逻辑，别在事件循环里直接调
+      ...
+
+  @tool
+  async def search_friend(target_name: str, config: RunnableConfig) -> str:
+      retcode, rows = await asyncio.to_thread(call_search_user, own_id, target_name)
+  ```
+
+  注意 `asyncio.to_thread` 只是不占事件循环，底层操作本身取消不掉：
+  超时要靠 `connect_timeout` / `timeout=` 兜底，不要指望 `wait_for` 能救。
 - 一个工具只干一件事，参数拍平，不要嵌套结构。
 - 没写完的工具不要加 `@tool`、不要放进注册表，模型看不到就调不到，也就不会乱承诺。

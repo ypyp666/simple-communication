@@ -8,7 +8,13 @@
    真正的执行由 Qt 客户端收到 task_execute 后完成。
 4. 需要「当前登录用户是谁」的工具，不要把这个 id 当成工具参数让模型去猜，
    统一用 config 里的 user_id（见 resolve_own_id）。
+5. 工具一律写成 async def。这里所有下游（requests、pymysql）都是同步阻塞的，
+   一阻塞就把整个事件循环卡住，别的用户的 SSE 流会跟着一起停。
+   做法统一是：同步逻辑原样写在普通函数里，工具里用 asyncio.to_thread 丢到线程池，
+   事件循环只负责等，等的同时还能处理别的会话的心跳和 token。
 """
+import asyncio
+
 import pymysql
 import requests
 from pymysql.constants import CLIENT
@@ -53,10 +59,18 @@ def format_search_results(raw_results: list) -> str:
     return output
 
 
+def post_search_request(headers: dict, payload: dict) -> dict:
+    """同步发一次搜索请求，返回解析后的 JSON。只在线程池里跑。"""
+    resp = requests.post(url=DEEPSEEK_SEARCH_URL, headers=headers,
+                         json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # Deepseek搜索工具
 @tool
-def web_searchquery(query: str, count: int = 5, ori_question: str | None = None,
-                    need_content: bool = True) -> str:
+async def web_searchquery(query: str, count: int = 5, ori_question: str | None = None,
+                          need_content: bool = True) -> str:
     """
     联网搜索工具，查询互联网实时信息、新闻、资料、最新事件。
     当模型内部知识库过时，需要外部最新资料时，调用此工具。
@@ -80,10 +94,8 @@ def web_searchquery(query: str, count: int = 5, ori_question: str | None = None,
         "need_content": need_content,
     }
     try:
-        resp = requests.post(url=DEEPSEEK_SEARCH_URL, headers=headers,
-                             json=payload, timeout=15)
-        resp.raise_for_status()
-        resp_data = resp.json()
+        # requests 是同步库，最长会卡 15 秒，绝不能直接在事件循环里等
+        resp_data = await asyncio.to_thread(post_search_request, headers, payload)
         raw_results = resp_data.get("results", [])
         return format_search_results(raw_results)
     except Exception as e:
@@ -162,6 +174,10 @@ def open_db():
 
     client_flag 必须带 MULTI_RESULTS：存储过程先回结果集、再回输出参数，
     不带这个标志 pymysql 会抛 "Commands out of sync"。
+
+    注意这个函数是同步阻塞的，只能在 asyncio.to_thread 里调用。
+    连接和查询的耗时靠 connect_timeout 兜底，不要指望取消 await 能打断它——
+    线程已经发出去的 TCP 请求是收不回来的。
     """
     connection = pymysql.connect(
         host=DB_HOST,
@@ -235,7 +251,7 @@ def format_friend_rows(rows) -> str:
 
 
 @tool
-def search_friend(target_name: str, config: RunnableConfig) -> str:
+async def search_friend(target_name: str, config: RunnableConfig) -> str:
     """查好友账号：把用户嘴里的「张三」「老李」换成真实的账号ID。
 
     【用途】
@@ -277,7 +293,9 @@ def search_friend(target_name: str, config: RunnableConfig) -> str:
         return "【好友查询工具调用失败】好友名字不能为空"
 
     try:
-        retcode, rows = call_search_user(own_id, target_name)
+        # pymysql 是同步阻塞库，直接 await 会卡住整个事件循环，
+        # 这里丢到线程池，别的会话的 SSE 心跳和 token 照常走
+        retcode, rows = await asyncio.to_thread(call_search_user, own_id, target_name)
     except Exception as exc:
         return f"【好友查询工具调用失败】数据库连接或执行异常: {str(exc)}"
 
