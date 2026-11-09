@@ -4,6 +4,11 @@
 内部由 **LangGraph** 编排「路由 → 专家 → 审批」的多智能体图，会话状态由 **SQLite checkpointer**
 持久化，因此审批可以跨请求、跨重启续跑。
 
+> **「本地仓库」指哪一个**：本文提到的「本地仓库」一律指根目录下的
+> `simple-communication/`（C++ 服务器 + Python 智能体所在的独立 git 仓库），
+> **不是**外层这个 `ChatApllication` 客户端工程。改协议、查服务端实现、跑智能体，
+> 都在 `simple-communication/` 里动手。
+
 ---
 
 ## 1. 架构
