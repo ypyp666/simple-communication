@@ -80,6 +80,7 @@ add_executable(ChatUI
     src/AgentChatArea.cpp        # 智能体专属聊天区（空态新建会话 + 聊天态）
     src/AgentMessageItem.cpp     # 智能体消息气泡（无头像，预留流式/HITL）
     src/AgentSessionList.cpp     # 智能体抽屉会话列表（名字 + 重命名/删除按钮，行圆角）
+    src/AgentApprovalCard.cpp    # 智能体审批卡（summary + 两列 detail + steps + 同意/拒绝）
     src/ContactWindow.cpp        # 联系人窗口实现
     src/ContactList.cpp          # 联系人列表（占位，真正的通讯录后续再补）
     src/ContactDetailArea.cpp    # 右栏共用区域（好友详情 / 好友请求列表二选一）
@@ -136,6 +137,7 @@ add_executable(ChatUI
     include/AgentChatArea.h
     include/AgentMessageItem.h
     include/AgentSessionList.h
+    include/AgentApprovalCard.h
 
 
 

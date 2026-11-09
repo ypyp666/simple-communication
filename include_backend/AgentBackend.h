@@ -45,6 +45,17 @@ signals:
     void agentMessageIdAllocated(const QString& sessionId, const QString& messageId);
     void agentMessageIdAllocateFailed(const QString& sessionId, const QString& message);
 
+    // === 人机审批（HITL）四件套，各走各自的信号，不合并 ===
+    // 服务器要求用户确认某次操作：UI 弹卡片，用户点同意/拒绝后走 sendAgentApprove
+    void agentApprovalRequired(const AgentApprovalInfo& info);
+    // 审批回执：serverId 用于对上是哪张卡；success=false 时 message 要显示出来
+    //（常见是"没有待审批的任务，可能已被处理或已取消"），不能静默关框
+    void agentApproveAcked(const QString& serverId, bool success, const QString& message);
+    // 审批通过后服务器下发的可执行指令（不等流结束，先到先执行）
+    void agentTaskExecute(const AgentTaskCommand& command);
+    // 服务器告知这条指令被拒绝执行（例如用户拒绝了审批）：本地数据什么都不用做
+    void agentTaskRejected(const QString& requestId);
+
 public slots:
     // sessionId 只用于本地把回答对回发起它的会话；messageId 是服务器分配的消息 ID
     //（先 requestAgentMessageId 拿到、本地落库成功之后才调这里）；
@@ -62,6 +73,10 @@ public slots:
     void pullAgentSessions();
     // 提问第一步：向服务器申请这条消息的 ID（请求只带 sessionId + userId）
     void requestAgentMessageId(const QString& sessionId);
+    // 审批回执：threadId / serverId 原样回显服务器下发的审批包，
+    // approved=false 时服务端会直接终止任务、不执行任何操作
+    void sendAgentApprove(const QString& threadId, const QString& serverId,
+                          bool approved, const QString& note);
     void onTcpDataReceived(const QByteArray& packet);
 
 private:
@@ -79,6 +94,12 @@ private:
     void onCreateSessionTimeout(const QString& sessionId);
     void onRenameSessionTimeout(const QString& sessionId);
     void onDeleteSessionTimeout(const QString& sessionId);
+    // === 审批四件套的解析（一种包一个函数，进门按 type 分派）===
+    void handleApprovalRequired(const QJsonObject& response);
+    void handleApproveAck(const QJsonObject& response);
+    void handleTaskExecute(const QJsonObject& response);
+    // 审批回执超时：解锁卡片按钮并提示，不能让它永久停在"已提交"
+    void onApproveTimeout(const QString& serverId);
 
     // std::unordered_map 默认不认识 QString，补一个基于 qHash 的哈希函数
     // （Qt 没给 QString 提供 std::hash 特化，只能自己带一个）
@@ -110,6 +131,10 @@ private:
     // 流式输出看门狗：收到"请求已受理"确认包后启动，每收到一段输出就重置；
     // 超过 kStreamTimeoutMs 一直没有输出 → 判定卡死，本地中止本轮
     QTimer* m_streamWatchdog = nullptr;
+    // === 审批回执的在飞登记 ===
+    // 键 = serverId（服务器下发的 messageId）。有键 = 这次审批还在等 agent_approve_ack，
+    // 重复点击直接忽略；回执 / 超时后删掉
+    QHash<QString, QTimer*> m_approveTimers;
 };
 
 #endif // AGENTBACKEND_H

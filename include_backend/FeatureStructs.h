@@ -10,6 +10,9 @@
 #include <QString>
 #include <QDateTime>
 #include <QMetaType>
+#include <QJsonObject>
+#include <QList>
+#include <QStringList>
 
 // 联系人信息结构体
 struct ContactInfo {
@@ -90,6 +93,31 @@ struct AgentMessageInfo {
     QDateTime createdAt;   // 该消息第一块的落库时间
 };
 
+// 审批依据的一行（渲染成"标签：值"两列）。
+// 标签和值都由服务端按指令字段确定性生成，客户端不拼中文——
+// 以后新增动作类型才不用改 Qt 这边
+struct AgentApprovalItem {
+    QString label;
+    QString value;
+};
+
+// 服务端下发的"这次操作需要你确认"（agent_approval_required）
+struct AgentApprovalInfo {
+    QString threadId;               // 会话 ID，回执时原样带回
+    QString serverId;               // agent_message_create 拿到的 messageId，回执时原样带回
+    QString requestId;              // 仅排查日志用，客户端忽略
+    QString summary;                // 一句话主内容（模型生成）
+    QList<AgentApprovalItem> detail; // 审批依据（服务端生成）；空数组 = 不能让用户签
+    QStringList steps;              // 分步说明（模型生成，小字展示）
+};
+
+// 服务器批准后下发的可执行指令（agent_task_execute）
+struct AgentTaskCommand {
+    QString requestId;     // 幂等去重用（服务器重推 / 重连补拉可能来两遍）
+    QString action;        // agent_send_message / delete_friend / update_friend_remark / add_friend
+    QJsonObject params;    // 该动作的参数，字段与聊天侧 repost 请求几乎一一对应
+};
+
 // =============================================================================
 // 功能标识枚举（登录 / 注册 / 修改密码 / 消息发送）
 // 登录、注册和"忘记密码（修改密码）"都发生在未登录阶段，都要走同一条共享 TcpClient，
@@ -121,5 +149,7 @@ Q_DECLARE_METATYPE(ConversationInfo)
 Q_DECLARE_METATYPE(MessageInfo)
 Q_DECLARE_METATYPE(OutgoingMessage)
 Q_DECLARE_METATYPE(AgentMessageInfo)
+Q_DECLARE_METATYPE(AgentApprovalInfo)
+Q_DECLARE_METATYPE(AgentTaskCommand)
 
 #endif // FEATURESTRUCTS_H

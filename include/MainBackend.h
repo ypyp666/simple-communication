@@ -6,6 +6,8 @@
 #include <QStringList>
 #include <QThread>
 #include <QHash>
+#include <QSet>
+#include <QQueue>
 #include <qstringview.h>
 #include "LoginBackend.h"
 #include "ChatBackend.h"
@@ -144,6 +146,17 @@ signals:
     void agentSessionDeleteSucceeded(const QString& sessionId);
     void agentSessionDeleteFailed(const QString& sessionId, const QString& message);
 
+    // === 智能体人机审批（HITL）===
+    // 服务器要求确认某次操作：界面在对话里插一张审批卡（纯转发）
+    void agentApprovalRequired(const AgentApprovalInfo& info);
+    // 审批回执结果：serverId 用来对上卡片；success=false 时 message 必须显示出来
+    void agentApproveAcked(const QString& serverId, bool success, const QString& message);
+    // 当前版本不支持的动作（例如 add_friend）：提示用户，不静默吞掉
+    void agentTaskUnsupported(const QString& action);
+    // 指令执行失败：把接口原始 message 交给界面提示，不自动重试
+    //（删除类操作重试可能变成删错人，必须由用户决定）
+    void agentTaskFailed(const QString& message);
+
     // === 数据库异步请求信号（主线程发出 → 后台DB线程执行）===
     void dbSaveMessageRequested(const MessageInfo& message);
     void dbSetAccountRequested(const QString& accountId);
@@ -264,6 +277,10 @@ public slots:
     void renameAgentSession(const QString& sessionId, const QString& title);
     // 删除智能体会话：连同该会话的全部消息一起删（后台 DB 线程执行，UI 不会卡）
     void deleteAgentSession(const QString& sessionId);
+    // 审批回执：threadId / serverId 必须原样回传服务器（拒绝理由 note 可空）。
+    // 这一步只回执，不改任何本地数据——真正执行要等服务器的 agent_task_execute
+    void sendAgentApprove(const QString& threadId, const QString& serverId,
+                          bool approved, const QString& note);
     // 登出：预留的口。当前登录账号作废，通知各功能后端把自己那份 ID 清成空白。
     // 真正的登出流程（断开 TCP、回登录页）还没接，这里只负责"清账号"这一件事
     void logout();
@@ -323,6 +340,17 @@ private slots:
     void onAgentSessionRenameFailed(const QString& sessionId, const QString& message);
     void onAgentSessionDeleted(const QString& sessionId);
     void onAgentSessionDeleteFailed(const QString& sessionId, const QString& message);
+
+    // === 智能体任务执行（服务器批准审批后下发）===
+    // 按 command.action 分派；先做 requestId 去重（重推 / 重连补拉会来两遍）
+    void onAgentTaskExecute(const AgentTaskCommand& command);
+    // 服务器告知指令被拒绝执行：本地没执行过任何操作，只留日志
+    void onAgentTaskRejected(const QString& requestId);
+    // 下面三个只用来判断"这次失败是不是智能体指令引起的"：
+    // 是的话往智能体页抛一条提示（不自动重试，交用户决定）
+    void onAgentTaskSendSucceeded(const QString& tempId, const QString& serverId);
+    void onAgentTaskSendFailed(const QString& tempId, const QString& serverId);
+    void onAgentTaskDeleteFailed(const QString& targetId, const QString& message);
     void onDbInitialized(bool success);
     // 服务器确认删好友成功：本地这时才真删（删库 + 重拉通讯录刷新列表），再上抛 friendDeleted
     void onFriendDeleteSuccess(const QString& targetId);
@@ -362,6 +390,12 @@ private slots:
   
 
 private:
+    // 三种可执行动作各一个函数（按 command.action 分派后调用）。
+    // 都只负责"把指令参数翻译成本地已有接口"，不在里面做重试
+    void executeAgentSendMessage(const QJsonObject& params);
+    void executeAgentDeleteFriend(const QJsonObject& params);
+    void executeAgentUpdateRemark(const QJsonObject& params);
+
     LoginBackend* m_loginBackend;
     ChatBackend* m_chatBackend;
     ContactBackend* m_contactBackend;
@@ -373,6 +407,19 @@ private:
     // 提问在"申请 ID → 落库 → 发对话请求"之间要暂存的用户问题（会话ID → 问题）。
     // 落库成功、真正发出去后清掉；申请 ID 失败也清掉
     QHash<QString, QString> m_pendingPrompts;
+
+    // === 智能体指令（HITL 执行阶段）===
+    // 已执行过的 requestId：服务器重推 / 重连补拉都可能让同一条指令到两遍，
+    // 而删除不可逆——执行两次的代价比漏执行大得多。
+    // set 负责查重，queue 负责只保留最近 N 条，防止无限增长
+    QSet<QString> m_executedTaskIds;
+    QQueue<QString> m_executedTaskOrder;
+    // 智能体发起、还在等结果的"正常操作"，键分别是 tempId（发消息）/ targetId（删好友、改备注）。
+    // 只为了一件事：这类操作的失败信号本来是给聊天页/通讯录页的，
+    // 要判断"是不是智能体指令引起的"才能往智能体页提示
+    QSet<QString> m_agentPendingSends;
+    QSet<QString> m_agentPendingDeletes;
+    QSet<QString> m_agentPendingRemarks;
 
     // 注册登录后端（登录/修改密码）的信号连接，从构造函数抽出，避免构造函数越堆越长
     void setupLoginConnections();

@@ -1453,19 +1453,32 @@ void DatabaseManager::loadAgentMessages(const QString& sessionId)
         return;
     }
 
-    // 按 message_id 归组拼块；因为结果已按时间正序，第一次出现的顺序就是消息顺序
+    // 按 (message_id, is_self) 归组拼块；因为结果已按时间正序，第一次出现的顺序就是消息顺序。
+    // 为什么把 is_self 也算进分组键：老版本曾把 AI 回答的分块写进"用户提问那个 message_id"
+    // 下（同一 ID 里既有 is_self=1 又有 is_self=0），只按 message_id 归组会把问题和回答
+    // 拼成一条、is_self 又只取了首行 → 回读出来就是"AI 消息和用户消息混在一起"。
+    // 新数据同一条消息的 is_self 必然一致，加这一维对它们没有任何影响
     QHash<QString, int> indexById;
+    QSet<QString> usedUiIds;   // UI 侧拿 id 当气泡的键，同一 ID 拆成两个角色时要错开
     while (query.next()) {
         const QString messageId = query.value(0).toString();
+        const bool isSelf = query.value(1).toInt() != 0;
         const QString content = query.value(2).toString();
-        int index = indexById.value(messageId, -1);
+        const QString groupKey = messageId + (isSelf ? "|self" : "|ai");
+
+        int index = indexById.value(groupKey, -1);
         if (index < 0) {
             AgentMessageInfo info;
-            info.id = messageId;
-            info.isSelf = query.value(1).toInt() != 0;
+            // 同一个 message_id 下已经出现过另一种角色（老数据）：
+            // 后出现的那条换个 UI ID，否则 showHistory 里 QHash 会互相覆盖
+            info.id = usedUiIds.contains(messageId)
+                    ? messageId + (isSelf ? "-self" : "-ai")
+                    : messageId;
+            info.isSelf = isSelf;
             info.content = content;
             info.createdAt = QDateTime::fromString(query.value(3).toString(), Qt::ISODate);
-            indexById.insert(messageId, messages.size());
+            indexById.insert(groupKey, messages.size());
+            usedUiIds.insert(messageId);
             messages.append(info);
         } else {
             messages[index].content += content;

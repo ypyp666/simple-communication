@@ -13,6 +13,9 @@ constexpr int kSessionOpTimeoutMs = 5000;
 // 流式输出的静默上限：5 分钟没有任何输出才判超时。
 // 给得这么宽是因为智能体先"思考"再吐字，思考阶段本来就没有任何回包
 constexpr int kStreamTimeoutMs = 5 * 60 * 1000;
+// 审批回执的等待上限：超过就解锁按钮并提示。
+// 不能给太长——卡片停在"已提交"时用户什么都做不了
+constexpr int kApproveTimeoutMs = 10000;
 }
 
 AgentBackend::AgentBackend(QObject* parent, TcpClient* tcpClient)
@@ -446,6 +449,25 @@ void AgentBackend::onTcpDataReceived(const QByteArray& packet)
         return;
     }
 
+    // === 人机审批四件套：一种包一个处理函数，漏一种就是"点了没反应" ===
+    if (responseType == "agent_approval_required") {
+        handleApprovalRequired(response);
+        return;
+    }
+    if (responseType == "agent_approve_ack") {
+        handleApproveAck(response);
+        return;
+    }
+    if (responseType == "agent_task_execute") {
+        handleTaskExecute(response);
+        return;
+    }
+    if (responseType == "agent_task_rejected") {
+        // 数据上什么都不做：本地还没执行任何操作，这里只是通知一声
+        emit agentTaskRejected(response["requestId"].toString());
+        return;
+    }
+
     if (responseType != "agent_response") {
         return;
     }
@@ -492,4 +514,139 @@ void AgentBackend::onTcpDataReceived(const QByteArray& packet)
     if (!content.isEmpty() || finished) {
         emit agentMessageReceived(sessionId, content, finished);
     }
+}
+
+// ===== 人机审批（HITL）：审批卡片 → 回执 → 服务器下发指令 =====
+void AgentBackend::sendAgentApprove(const QString& threadId, const QString& serverId,
+                                    bool approved, const QString& note)
+{
+    if (threadId.isEmpty() || serverId.isEmpty()) {
+        return;   // 缺字段就没法让服务器找回挂起记录
+    }
+    // 同一张卡只允许一次回执在飞：界面那边按钮已禁用，这里再兜一层
+    if (m_approveTimers.contains(serverId)) {
+        return;
+    }
+    if (m_tcpClient == nullptr || !m_tcpClient->isConnected()) {
+        emit agentApproveAcked(serverId, false, QStringLiteral("网络未连接"));
+        return;
+    }
+
+    QJsonObject request;
+    request["type"] = "agent_approve";
+    // threadId / serverId 必须原样照抄审批包，服务器靠这两个字段定位挂起记录
+    request["threadId"] = threadId;
+    request["serverId"] = serverId;
+    request["approved"] = approved;
+    request["note"] = note;   // 拒绝理由，可空
+
+    QTimer* timer = new QTimer(this);
+    timer->setSingleShot(true);
+    m_approveTimers.insert(serverId, timer);
+    connect(timer, &QTimer::timeout, this, [this, serverId]() {
+        onApproveTimeout(serverId);
+    });
+    timer->start(kApproveTimeoutMs);
+
+    QByteArray packet = QJsonDocument(request).toJson(QJsonDocument::Compact) + "\n";
+    qDebug() << "发送智能体审批回执包：" << packet;
+    m_tcpClient->sendData(packet);
+}
+
+void AgentBackend::onApproveTimeout(const QString& serverId)
+{
+    if (QTimer* timer = m_approveTimers.take(serverId)) {
+        timer->deleteLater();
+    }
+    // 超时也走"结果"信号：界面必须解锁按钮，不能永久停在"已提交"
+    emit agentApproveAcked(serverId, false, QStringLiteral("等待服务器确认超时，请重试"));
+}
+
+void AgentBackend::handleApproveAck(const QJsonObject& response)
+{
+    const QString serverId = response["serverId"].toString();
+    QTimer* timer = m_approveTimers.take(serverId);
+    if (timer == nullptr) {
+        // 超时已经处理过，或者不是本客户端发的审批：忽略
+        return;
+    }
+    timer->stop();
+    timer->deleteLater();
+
+    const bool success = response["success"].toBool();
+    QString message = response["message"].toString();
+    if (!success && message.isEmpty()) {
+        message = QStringLiteral("审批提交失败");
+    }
+    emit agentApproveAcked(serverId, success, message);
+}
+
+void AgentBackend::handleApprovalRequired(const QJsonObject& response)
+{
+    AgentApprovalInfo info;
+    info.threadId = response["threadId"].toString();
+    info.serverId = response["serverId"].toString();
+    info.requestId = response["requestId"].toString();
+    info.summary = response["summary"].toString();
+
+    // detail：服务端按指令字段确定性生成，客户端只按数组顺序渲染两列，不拼任何中文
+    const QJsonArray detail = response["detail"].toArray();
+    for (const QJsonValue& value : detail) {
+        const QJsonObject item = value.toObject();
+        AgentApprovalItem row;
+        row.label = item["label"].toString();
+        row.value = item["value"].toString();
+        if (row.label.isEmpty() && row.value.isEmpty()) {
+            continue;   // 空行丢掉，别在卡片上留一道空白
+        }
+        info.detail.append(row);
+    }
+
+    // steps：正常是字符串数组；降级成单个字符串就整体当一条
+    const QJsonValue stepsValue = response["steps"];
+    if (stepsValue.isArray()) {
+        const QJsonArray steps = stepsValue.toArray();
+        for (const QJsonValue& value : steps) {
+            const QString step = value.toString();
+            if (!step.isEmpty()) {
+                info.steps.append(step);
+            }
+        }
+    } else if (stepsValue.isString()) {
+        const QString step = stepsValue.toString();
+        if (!step.isEmpty()) {
+            info.steps.append(step);
+        }
+    }
+
+    // 缺 threadId / serverId 就回不了执，弹出来也只是让人干看——丢掉并留日志
+    if (info.threadId.isEmpty() || info.serverId.isEmpty()) {
+        qDebug() << "审批包缺少 threadId / serverId，无法回执：" << response;
+        return;
+    }
+
+    emit agentApprovalRequired(info);
+}
+
+void AgentBackend::handleTaskExecute(const QJsonObject& response)
+{
+    AgentTaskCommand command;
+    command.requestId = response["requestId"].toString();
+
+    // command 正常是对象（action + params）；降级成字符串时只认动作名、没有参数
+    const QJsonValue commandValue = response["command"];
+    if (commandValue.isObject()) {
+        const QJsonObject commandObject = commandValue.toObject();
+        command.action = commandObject["action"].toString();
+        command.params = commandObject["params"].toObject();
+    } else if (commandValue.isString()) {
+        command.action = commandValue.toString();
+    }
+
+    if (command.action.isEmpty()) {
+        qDebug() << "任务执行包缺少 command.action：" << response;
+        return;
+    }
+
+    emit agentTaskExecute(command);
 }

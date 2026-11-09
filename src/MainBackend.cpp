@@ -27,6 +27,9 @@ MainBackend::MainBackend(QObject* parent)
     // 智能体历史消息回读：DB 线程查完带 QList<AgentMessageInfo> 回主线程，同样要注册
     qRegisterMetaType<AgentMessageInfo>();
     qRegisterMetaType<QList<AgentMessageInfo>>();
+    // 人机审批：审批信息与执行指令都在信号里传结构体，注册后排队连接也能送过去
+    qRegisterMetaType<AgentApprovalInfo>();
+    qRegisterMetaType<AgentTaskCommand>();
 
     
     // 1. 创建后台数据库线程
@@ -237,6 +240,24 @@ MainBackend::MainBackend(QObject* parent)
             this, &MainBackend::onAgentSessionDeleted);
     connect(m_agentBackend, &AgentBackend::agentSessionDeleteFailed,
             this, &MainBackend::onAgentSessionDeleteFailed);
+    // 审批包 / 审批回执：纯转发（界面自己记卡片、自己解锁按钮，主线程不做判断）
+    connect(m_agentBackend, &AgentBackend::agentApprovalRequired,
+            this, &MainBackend::agentApprovalRequired);
+    connect(m_agentBackend, &AgentBackend::agentApproveAcked,
+            this, &MainBackend::agentApproveAcked);
+    // 任务执行有副作用（发消息 / 删好友 / 改备注），不能信号对信号，落具名槽
+    connect(m_agentBackend, &AgentBackend::agentTaskExecute,
+            this, &MainBackend::onAgentTaskExecute);
+    connect(m_agentBackend, &AgentBackend::agentTaskRejected,
+            this, &MainBackend::onAgentTaskRejected);
+    // 执行结果的旁听：这些信号本来就发给聊天页 / 通讯录页，
+    // 这里只是额外辨认"是不是智能体发起的"，是的话再往智能体页抛一条失败提示
+    connect(m_chatBackend, &ChatBackend::sendSuccess,
+            this, &MainBackend::onAgentTaskSendSucceeded);
+    connect(m_chatBackend, &ChatBackend::sendFailed,
+            this, &MainBackend::onAgentTaskSendFailed);
+    connect(m_contactBackend, &ContactBackend::deleteFriendFailed,
+            this, &MainBackend::onAgentTaskDeleteFailed);
 }
 
 MainBackend::~MainBackend()
@@ -691,6 +712,8 @@ void MainBackend::onSetRemarkSuccess(const QString& targetId)
     emit setContactRemarkSuccess(contactId, m_pendingRemark);      // 通知详情页把旧值刷成新值
     m_pendingRemarkContactId.clear();
     m_pendingRemark.clear();
+    // 这条如果是智能体指令发起的，成功就把它从"等结果"里摘掉（不用提示）
+    m_agentPendingRemarks.remove(contactId);
 }
 
 // 改备注失败：回包不带 remark（也不一定带 targetId），把发出时记下的补上再上抛，
@@ -701,6 +724,10 @@ void MainBackend::onSetRemarkFailed(const QString& targetId, const QString& mess
     emit setContactRemarkFailed(contactId, message);
     m_pendingRemarkContactId.clear();
     m_pendingRemark.clear();
+    // 智能体指令引起的失败：额外往智能体页抛一条提示，不自动重试
+    if (m_agentPendingRemarks.remove(contactId) > 0) {
+        emit agentTaskFailed(message);
+    }
 }
 
 // 分页加载本地聊天记录：只发请求信号，实际查询在后台 DB 线程执行，
@@ -742,6 +769,8 @@ void MainBackend::onFriendDeleteSuccess(const QString& targetId)
     emit dbDeleteContactRequested(targetId);  // 删本地库
     loadContacts();                           // 重拉通讯录 → ContactList 自动刷新
     emit friendDeleted(targetId);             // 通知 UI：主界面接去删掉该好友的会话（见 MainWindow ⑩）
+    // 这条如果是智能体指令发起的，成功就摘掉（不用提示）
+    m_agentPendingDeletes.remove(targetId);
 }
 
 // 服务器侧的"删好友"落到本地：离线墓碑与在线被删推送共用这一份逻辑，
@@ -1237,18 +1266,18 @@ void MainBackend::JsonParsing(const QByteArray packet)
         // 服务器发完所有缓存消息后发来的拉取确认包，交给聊天后端处理（停止拉取定时器）
         m_chatBackend->onPullResponse(packet);
     }
-    else if (type == "agent_response"
-          || type == "agent_session_response"   // 会话增删改的统一回执，进 AgentBackend 后按 op 再分派
-          || type == "agent_sessions_list"      // 登录后拉回来的会话列表
-          || type == "agent_message_created"    // 提问第一步：服务器分配消息 ID
-          || type == "agent_request_ack"        // 对话请求已受理（启动无输出看门狗）
-          || type == "agent_approval_required"  // 智能体停在审批点（待补 UI 处理）
-          || type == "agent_approve_ack"        // 审批回执已受理（待补 UI 处理）
-          || type == "agent_task_execute"       // 批准后下发的待执行指令（待补 UI 处理）
-          || type == "agent_task_rejected") {   // 用户拒绝（待补 UI 处理）
-        // 智能体一族：本函数只做粗路由，具体分发在 AgentBackend::onTcpDataReceived 里
-        // 按 type / op 完成。这里漏一个分支不会有任何报错——包会被静默丢掉，客户端
-        // 表现成「点了按钮转几秒然后超时」，排查时很难想到是路由漏了，务必成组添加
+    else if (type == "agent_response"             // 流式回答片段
+          || type == "agent_session_response"     // 会话新建 / 改名 / 删除的回执
+          || type == "agent_sessions_list"        // 登录后拉取的会话列表
+          || type == "agent_message_created"      // 服务器分配的消息 ID
+          || type == "agent_request_ack"          // 对话请求已受理（开始算静默超时）
+          || type == "agent_approval_required"    // 需要用户确认某次操作
+          || type == "agent_approve_ack"          // 审批回执结果
+          || type == "agent_task_execute"         // 审批通过后下发的可执行指令
+          || type == "agent_task_rejected") {     // 指令被拒绝执行
+        // 智能体的包全部交给智能体后端按 type 再分发。
+        // 这里漏一个 type 不会报错、不会断言，包会静默消失——
+        // 表现就是"点了没反应"（审批点了没动静 / 会话建了不出现），所以集中列全
         m_agentBackend->onTcpDataReceived(packet);
     }
     else if (type == "friend_request_response"
@@ -1264,5 +1293,142 @@ void MainBackend::JsonParsing(const QByteArray packet)
           || type == "friend_deleted") {             // 在线被删推送（别人删我，服务器实时推）
         // 好友相关的回包统一交给好友后端，由它内部按 type 再分发（主后端只做粗路由）
         m_contactBackend->onTcpDataReceived(packet);
+    }
+}
+
+// 审批回执：只是"我同意 / 我拒绝"这个答复，本地数据一律不动。
+// 真正执行要等服务器的 agent_task_execute
+void MainBackend::sendAgentApprove(const QString& threadId, const QString& serverId,
+                                   bool approved, const QString& note)
+{
+    m_agentBackend->sendAgentApprove(threadId, serverId, approved, note);
+}
+
+// ===== 智能体任务执行（HITL 第二阶段：审批通过后服务器下发指令）=====
+void MainBackend::onAgentTaskExecute(const AgentTaskCommand& command)
+{
+    // 去重表只保留最近这么多条：够挡住"重推 + 重连补拉"的重复，又不会无限长
+    constexpr int kExecutedTaskCacheSize = 200;
+
+    // 幂等：同一条 requestId 只执行一次，先登记再执行。
+    // 服务器重推、客户端重连补拉都可能让同一条指令到两遍；
+    // 删除不可逆——执行两次的代价比漏执行大得多
+    if (!command.requestId.isEmpty()) {
+        if (m_executedTaskIds.contains(command.requestId)) {
+            qDebug() << "重复的智能体任务指令，已忽略：" << command.requestId;
+            return;
+        }
+        m_executedTaskIds.insert(command.requestId);
+        m_executedTaskOrder.enqueue(command.requestId);
+        while (m_executedTaskOrder.size() > kExecutedTaskCacheSize) {
+            m_executedTaskIds.remove(m_executedTaskOrder.dequeue());
+        }
+    }
+
+    const QString action = command.action;
+    if (action == "agent_send_message") {
+        executeAgentSendMessage(command.params);
+        return;
+    }
+    if (action == "delete_friend") {
+        executeAgentDeleteFriend(command.params);
+        return;
+    }
+    if (action == "update_friend_remark") {
+        executeAgentUpdateRemark(command.params);
+        return;
+    }
+    if (action == "add_friend") {
+        // 暂无来源：要加的人本来就不在好友列表里，智能体只给得出名字，
+        // 客户端还得自己按名字搜账号并处理重名。这一步没做之前不能盲执行
+        emit agentTaskUnsupported(QStringLiteral("add_friend"));
+        return;
+    }
+
+    // 不认识的动作：提示用户，不静默吞掉
+    emit agentTaskUnsupported(action);
+}
+
+// agent_send_message：参数与聊天侧 repost 请求几乎一一对应，原样搬过去。
+// 走 startSendMessage（不是 sendMessage）：带断线检查 + 30 秒超时兜底，
+// 气泡、转圈、失败红叹号、用户手动重发全都是现成的
+void MainBackend::executeAgentSendMessage(const QJsonObject& params)
+{
+    const QString targetId = params.value("targetId").toString();
+    const QString content = params.value("content").toString();
+    if (targetId.isEmpty() || content.isEmpty()) {
+        emit agentTaskFailed(QStringLiteral("指令缺少接收方或内容，未执行"));
+        return;
+    }
+
+    OutgoingMessage message;
+    message.type = "repost";
+    message.accountId = m_userid;   // 身份永远来自登录会话，不信包里的 sendId
+    message.senderId = m_userid;    // 服务器会用会话身份覆盖，这里填一致性值
+    message.targetId = targetId;
+    message.content = content;
+    // sendTime 正常是 "yyyy-MM-dd HH:mm:ss"；解析失败就按当前时间发
+    const QDateTime sendTime = QDateTime::fromString(params.value("sendTime").toString(),
+                                                     "yyyy-MM-dd HH:mm:ss");
+    message.sendTime = sendTime.isValid() ? sendTime : QDateTime::currentDateTime();
+    message.tempId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    m_agentPendingSends.insert(message.tempId);
+    m_chatBackend->startSendMessage(targetId, message);
+}
+
+void MainBackend::executeAgentDeleteFriend(const QJsonObject& params)
+{
+    const QString targetId = params.value("targetId").toString();
+    if (targetId.isEmpty()) {
+        emit agentTaskFailed(QStringLiteral("指令缺少要删除的好友，未执行"));
+        return;
+    }
+
+    m_agentPendingDeletes.insert(targetId);
+    // 只是"请求删除"：本地联系人要等服务器确认（onFriendDeleteSuccess）才真删
+    deleteFriend(targetId);
+}
+
+void MainBackend::executeAgentUpdateRemark(const QJsonObject& params)
+{
+    const QString targetId = params.value("targetId").toString();
+    if (targetId.isEmpty()) {
+        emit agentTaskFailed(QStringLiteral("指令缺少要修改备注的好友，未执行"));
+        return;
+    }
+
+    m_agentPendingRemarks.insert(targetId);
+    // 同样等服务器确认（onSetRemarkSuccess）才写本地库
+    setContactRemark(targetId, params.value("remark").toString());
+}
+
+void MainBackend::onAgentTaskRejected(const QString& requestId)
+{
+    // 数据上什么都不用做：本地从未执行过这条指令。
+    // 界面上也没有常驻的"等待执行"状态（审批卡在回执成功后就收掉了），只留个日志
+    qDebug() << "智能体任务被服务器拒绝执行：" << requestId;
+}
+
+void MainBackend::onAgentTaskSendSucceeded(const QString& tempId, const QString& serverId)
+{
+    Q_UNUSED(serverId);
+    m_agentPendingSends.remove(tempId);
+}
+
+void MainBackend::onAgentTaskSendFailed(const QString& tempId, const QString& serverId)
+{
+    Q_UNUSED(serverId);
+    if (m_agentPendingSends.remove(tempId) > 0) {
+        // 发送失败的回包不带文字原因，给一句能指导用户的提示；不自动重试
+        emit agentTaskFailed(QStringLiteral("消息发送失败，可在聊天页手动重发"));
+    }
+}
+
+void MainBackend::onAgentTaskDeleteFailed(const QString& targetId, const QString& message)
+{
+    // 只有确实是智能体指令发起的那次删除才额外提示（手动删好友的失败照旧只给通讯录页）
+    if (m_agentPendingDeletes.remove(targetId) > 0) {
+        emit agentTaskFailed(message);
     }
 }

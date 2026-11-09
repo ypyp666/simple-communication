@@ -3,11 +3,12 @@
 
 #include <QWidget>
 #include <QMap>
+#include <QHash>
 #include <QList>
 #include <QString>
 #include <QStringList>
 #include <QIcon>              // 标题条图标按钮的两档图标（正常 / 置灰）
-#include "FeatureStructs.h"   // AgentMessageInfo：历史回读的入参结构体
+#include "FeatureStructs.h"   // AgentMessageInfo / AgentApprovalInfo
 
 class QLabel;
 class QStackedWidget;
@@ -17,6 +18,7 @@ class QPushButton;
 class QResizeEvent;
 class ChatInput;
 class AgentMessageItem;
+class AgentApprovalCard;
 
 // 智能体专属聊天区：
 //   - 默认空态：页面中间一个「新建会话」按钮
@@ -65,6 +67,12 @@ public:
     // 历史回读结果：库里拼好的整条消息按时间正序，重建成一屏气泡。
     // sessionId 对不上当前会话就整包丢弃（回包总是晚于用户操作，可能已经切走）
     void showHistory(const QString& sessionId, const QList<AgentMessageInfo>& messages);
+    // 服务器要求确认某次操作：在当前对话末尾插一张审批卡。
+    // threadId 对不上当前会话就丢弃（审批属于别的会话，插到这儿会误导）
+    void showApprovalCard(const AgentApprovalInfo& info);
+    // 审批回执结果：success=true 才把卡片收成一行小字「用户已选择：同意 / 拒绝」；
+    // 失败 / 超时要解锁按钮并把原因显示在卡片上，不能静默关掉
+    void onApproveAcked(const QString& serverId, bool success, const QString& message);
 
 signals:
     // 用户点发送：只带会话 ID 和内容。消息 ID 由服务器分配，主后端拿到后
@@ -75,6 +83,9 @@ signals:
     void sessionCreateRequested(const QString& sessionId, const QString& title);
     // 要停掉这个会话正在回答的那一轮（主后端据此发 agent_stop + 清掉落库消息 ID）
     void stopAnswer(const QString& sessionId);
+    // 用户在审批卡上点了同意 / 拒绝：只回执，不改任何本地数据
+    //（真正执行要等服务器批下来再下发 agent_task_execute）
+    void approveRequested(const QString& threadId, const QString& serverId, bool approved);
 
 protected:
     // 窗口宽度变了：标题条里能放下的字数也变了，重新做一次省略号
@@ -85,6 +96,8 @@ private slots:
     void onInputSend(const QString& content);
     // 输入框在"停止态"下被点：结束本轮（不发新消息，已打的字也不清）
     void onStopClicked();
+    // 审批卡上的按钮被点：按 serverId 找到卡，取出 threadId 再往上层抛
+    void onApprovalDecisionMade(const QString& serverId, bool approved);
 
 private:
     // 正在回答就停掉（切会话 / 新建会话 / 回空态 / 离开页面都走这一个口）：
@@ -94,6 +107,8 @@ private:
     void clearMessages();
     void scrollToBottom();
     QString newMessageId();
+    // 审批卡被"确认"了：原地换成一行小字（卡片消失，只留下用户选了什么）
+    void replaceApprovalCardWithLabel(const QString& serverId, const QString& text);
     // 按标签当前宽度把会话名做省略（名字太长时不硬裁，末尾给"..."）
     void updateSessionTitleText();
 
@@ -111,6 +126,9 @@ private:
     QVBoxLayout* m_messagesLayout = nullptr;
     ChatInput* m_input = nullptr;               // 直接复用现有输入框
     QMap<QString, AgentMessageItem*> m_items;   // 消息 ID -> 气泡（流式/HITL 定位用）
+    // 审批卡：serverId -> 卡片。回执结果是异步回来的，靠它把结果对回是哪一张卡；
+    // 用户切会话清屏时一起清掉（那些回执到了直接忽略）
+    QHash<QString, AgentApprovalCard*> m_approvalCards;
     QString m_sessionId;                        // 当前会话 ID（切会话/新建时改变）
     QString m_streamMessageId;                  // 正在接收的 AI 气泡 ID（空=本轮还没开始）
     // 发送按钮当前处于哪种状态：false=发送态（发 agent_request），true=停止态（本轮还在回答）。

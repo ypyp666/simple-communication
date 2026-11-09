@@ -1,5 +1,6 @@
 #include "AgentChatArea.h"
 #include "AgentMessageItem.h"
+#include "AgentApprovalCard.h"
 #include "ChatInput.h"
 
 #include <QVBoxLayout>
@@ -315,18 +316,16 @@ void AgentChatArea::requestNewSession()
 
     // 会话 ID = threadId，由客户端本地生成（服务器只认 (userId, threadId) 联合主键，
     // 不会下发 ID）；userId 由会话操作包单独携带。
-    //
-    // 这里必须是纯数字、非 0、不超过 10 位，不能用 UUID：
-    // 服务器的 thread_id 是 INT，而且把请求转给智能体时要把「会话ID + 'n' + 账号」
-    // 拼成一个字符串，只有两段都是纯数字，'n' 才是唯一的分界点。
-    // UUID 会被服务器直接回 400「会话参数非法」，客户端只能看到 5 秒后超时。
-    // generate() 返回 quint32，范围正好是 1..0xFFFFFFFF（最多 10 位）；
-    // 万一撞上已有会话，服务器回 409，走上面的失败链路让用户重试即可
-    quint32 rawSessionId = QRandomGenerator::global()->generate();
-    if (rawSessionId == 0) {
-        rawSessionId = 1;   // 0 会被服务器判非法，这种极端值兜一下
+    // 必须是纯数字、≤10 位、非 0：库里 thread_id 是 INT，且发给智能体时要拼成
+    // "会话ID + 'n' + 账号"，只有两段都是纯数字，分隔符 'n' 才一定不会混进 ID 里。
+    // quint32 最大 4294967295，天然 ≤10 位；generate() 可能出 0，跳过重摇
+    quint32 numericId = QRandomGenerator::global()->generate();
+    while (numericId == 0) {
+        numericId = QRandomGenerator::global()->generate();
     }
-    const QString sessionId = QString::number(rawSessionId);
+    // 极小概率和本地已有会话撞号：交给服务器的 409 冲突失败链路提示用户重试，
+    // 这里不需要自己维护一份已用 ID 表
+    const QString sessionId = QString::number(numericId);
     emit sessionCreateRequested(sessionId, QStringLiteral("新会话"));
 }
 
@@ -521,6 +520,9 @@ void AgentChatArea::clearMessages()
         delete layoutItem;
     }
     m_items.clear();   // 同步清映射，避免悬挂指针
+    // 审批卡也一起没了（widget 已被删掉），映射表跟着清：
+    // 那些卡的回执晚到就直接被 onApproveAcked 忽略
+    m_approvalCards.clear();
     m_messagesLayout->addStretch(1);
 }
 
@@ -534,4 +536,81 @@ void AgentChatArea::scrollToBottom()
         }
         scrollBar->setValue(scrollBar->maximum());
     });
+}
+
+// ===== 人机审批卡片 =====
+void AgentChatArea::showApprovalCard(const AgentApprovalInfo& info)
+{
+    // 审批属于别的会话（用户已经切走）：插到当前对话里会误导，直接丢
+    if (info.threadId != m_sessionId) {
+        return;
+    }
+    // 服务器重推同一张卡：已经有了就忽略，别叠出一堆
+    if (m_approvalCards.contains(info.serverId)) {
+        return;
+    }
+
+    AgentApprovalCard* card = new AgentApprovalCard(info, this);
+    m_approvalCards.insert(info.serverId, card);
+    // 靠左对齐（AI 侧），插在末尾 stretch 之前
+    m_messagesLayout->insertWidget(m_messagesLayout->count() - 1, card, 0, Qt::AlignLeft);
+    connect(card, &AgentApprovalCard::decisionMade,
+            this, &AgentChatArea::onApprovalDecisionMade);
+    scrollToBottom();
+}
+
+void AgentChatArea::onApprovalDecisionMade(const QString& serverId, bool approved)
+{
+    AgentApprovalCard* card = m_approvalCards.value(serverId, nullptr);
+    if (card == nullptr) {
+        return;   // 卡已经不在了（切会话清过屏），不用回执
+    }
+    // 只回执，本地数据一律不动：真正执行要等服务器的 agent_task_execute
+    emit approveRequested(card->threadId(), serverId, approved);
+}
+
+void AgentChatArea::onApproveAcked(const QString& serverId, bool success, const QString& message)
+{
+    AgentApprovalCard* card = m_approvalCards.value(serverId, nullptr);
+    if (card == nullptr) {
+        return;   // 切走会话时卡片已经清掉，这个回执没处落
+    }
+
+    if (!success) {
+        // 常见是「没有待审批的任务，可能已被处理或已取消」——
+        // 必须显示出来，否则用户以为点成功了
+        card->showSubmitError(message);
+        return;
+    }
+
+    // 成功才收卡：换成一行小字，只留下用户选了什么
+    const QString text = card->approvedChosen()
+            ? QStringLiteral("用户已选择：同意")
+            : QStringLiteral("用户已选择：拒绝");
+    replaceApprovalCardWithLabel(serverId, text);
+}
+
+// 卡片原地换成一行小字：先按位置插入新标签，再把卡片摘掉删掉，视觉上不会跳
+void AgentChatArea::replaceApprovalCardWithLabel(const QString& serverId, const QString& text)
+{
+    AgentApprovalCard* card = m_approvalCards.take(serverId);
+    if (card == nullptr) {
+        return;
+    }
+
+    QLabel* label = new QLabel(text, this);
+    label->setObjectName("approvalDecisionLabel");
+    label->setStyleSheet("color: #8a94a6; font-size: 12px; padding: 2px 4px;");
+
+    const int index = m_messagesLayout->indexOf(card);
+    if (index >= 0) {
+        // insertWidget 会把新控件插到这个位置，卡片顺延一格，再删就干净了
+        m_messagesLayout->insertWidget(index, label, 0, Qt::AlignLeft);
+    } else {
+        m_messagesLayout->insertWidget(m_messagesLayout->count() - 1, label, 0, Qt::AlignLeft);
+    }
+
+    m_messagesLayout->removeWidget(card);
+    card->deleteLater();
+    scrollToBottom();
 }

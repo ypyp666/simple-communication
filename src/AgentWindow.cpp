@@ -49,6 +49,9 @@ AgentWindow::AgentWindow(QWidget *parent, MainBackend* backend) : QWidget(parent
     // ⑦ 结束本轮（点 stop / 切会话 / 离开页面）→ 主后端发 agent_stop 并清掉落库消息 ID
     connect(chatArea, &AgentChatArea::stopAnswer,
             this, &AgentWindow::onStopAnswerRequested);
+    // ⑩ 审批卡上点同意 / 拒绝 → 主后端发 agent_approve（只回执，执行等服务器下发指令）
+    connect(chatArea, &AgentChatArea::approveRequested,
+            this, &AgentWindow::onApproveRequested);
     // ③ 本地库读回的会话列表 → 抽屉；④ 抽屉里点某个会话 → 切换当前会话
     // ⑤ 点笔改名 → 主后端写库；⑥ 点叉删除 → 主后端删库（连同该会话的所有消息）
     connect(sessionList, &AgentSessionList::sessionSelected,
@@ -81,6 +84,17 @@ AgentWindow::AgentWindow(QWidget *parent, MainBackend* backend) : QWidget(parent
                 this, &AgentWindow::onSessionDeleteSucceeded);
         connect(backend, &MainBackend::agentSessionDeleteFailed,
                 this, &AgentWindow::onSessionDeleteFailed);
+        // ⑩ 服务器要求确认某次操作 → 在当前对话末尾插审批卡；
+        // 回执结果 → 成功收成一行小字，失败/超时解锁按钮并把原因显示在卡片上
+        connect(backend, &MainBackend::agentApprovalRequired,
+                chatArea, &AgentChatArea::showApprovalCard);
+        connect(backend, &MainBackend::agentApproveAcked,
+                chatArea, &AgentChatArea::onApproveAcked);
+        // ⑪ 指令执行阶段的提示：不支持的动作 / 执行失败都要让用户看见
+        connect(backend, &MainBackend::agentTaskUnsupported,
+                this, &AgentWindow::onAgentTaskUnsupported);
+        connect(backend, &MainBackend::agentTaskFailed,
+                this, &AgentWindow::onAgentTaskFailed);
         // 首次进来就把已有会话列表拉到抽屉里（异步，回包后再渲染）
         backend->loadAgentSessions();
     }
@@ -432,6 +446,28 @@ void AgentWindow::onStopAnswerRequested(const QString& sessionId)
         return;
     }
     backend->stopAgentMessage(sessionId);
+}
+
+// 审批卡上点了同意 / 拒绝：只把回执交给主后端。
+// 本地数据此刻一律不动——真正执行要等服务器的 agent_task_execute
+void AgentWindow::onApproveRequested(const QString& threadId, const QString& serverId, bool approved)
+{
+    if (!backend) {
+        return;
+    }
+    // note（拒绝理由）当前版本不收，留空符合协议（可空）
+    backend->sendAgentApprove(threadId, serverId, approved, QString());
+}
+
+void AgentWindow::onAgentTaskUnsupported(const QString& action)
+{
+    showToast(QString("这个操作当前版本还不支持（%1）").arg(action));
+}
+
+void AgentWindow::onAgentTaskFailed(const QString& message)
+{
+    // 接口原始 message 直接显示，不自动重试（删除类操作重试可能变成删错人）
+    showToast(message);
 }
 
 // 离开智能体页（pageStack 切走会隐藏本页）：正在回答就先停掉。

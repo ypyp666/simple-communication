@@ -54,6 +54,12 @@ private slots:
     void onSessionRenameFailed(const QString& sessionId, const QString& message);
     void onSessionDeleteSucceeded(const QString& sessionId);
     void onSessionDeleteFailed(const QString& sessionId, const QString& message);
+    // 审批卡上点了同意 / 拒绝：只把回执交给主后端（本地数据此刻一律不动）
+    void onApproveRequested(const QString& threadId, const QString& serverId, bool approved);
+    // 当前版本不支持的动作（如 add_friend）：明确提示，不静默吞掉
+    void onAgentTaskUnsupported(const QString& action);
+    // 智能体指令执行失败：把接口原始 message 显示出来，让用户自己决定要不要重来
+    void onAgentTaskFailed(const QString& message);
     void onToastTimeout();
 
 private:
