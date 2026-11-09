@@ -565,6 +565,10 @@ async def forward_message(target_account: str | int, content: str,
         target_account: 好友的账号ID，必须是 search_friend 返回的那个数字，
             不要把用户说的名字或备注直接传进来
         content: 要发给对方的完整内容，一句一句写清楚，不要带「以下是消息：」这类说明
+        target_name: 好友的用户名，取自 search_friend 的返回结果。只用于在
+            审批框里显示「发给谁」——用户看到「老李（账号 1001）」才敢点同意，
+            只看到一串账号等于没告诉他对象是谁。可以不传，不传就只显示账号。
+            真正发给谁一律以 target_account 为准，这里写错也不会发错人
     """
     if not db_is_configured():
         return "【消息转发工具调用失败】服务端没有配置数据库账号，请联系管理员"
