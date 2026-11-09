@@ -1237,8 +1237,18 @@ void MainBackend::JsonParsing(const QByteArray packet)
         // 服务器发完所有缓存消息后发来的拉取确认包，交给聊天后端处理（停止拉取定时器）
         m_chatBackend->onPullResponse(packet);
     }
-    else if (type == "agent_response") {
-        // 智能体回答包（worker 逐段推回，流式拼接交给 UI）
+    else if (type == "agent_response"
+          || type == "agent_session_response"   // 会话增删改的统一回执，进 AgentBackend 后按 op 再分派
+          || type == "agent_sessions_list"      // 登录后拉回来的会话列表
+          || type == "agent_message_created"    // 提问第一步：服务器分配消息 ID
+          || type == "agent_request_ack"        // 对话请求已受理（启动无输出看门狗）
+          || type == "agent_approval_required"  // 智能体停在审批点（待补 UI 处理）
+          || type == "agent_approve_ack"        // 审批回执已受理（待补 UI 处理）
+          || type == "agent_task_execute"       // 批准后下发的待执行指令（待补 UI 处理）
+          || type == "agent_task_rejected") {   // 用户拒绝（待补 UI 处理）
+        // 智能体一族：本函数只做粗路由，具体分发在 AgentBackend::onTcpDataReceived 里
+        // 按 type / op 完成。这里漏一个分支不会有任何报错——包会被静默丢掉，客户端
+        // 表现成「点了按钮转几秒然后超时」，排查时很难想到是路由漏了，务必成组添加
         m_agentBackend->onTcpDataReceived(packet);
     }
     else if (type == "friend_request_response"

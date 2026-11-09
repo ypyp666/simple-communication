@@ -332,16 +332,24 @@ docstring 里，**不要为了新工具去改提示词**。
 
 #### 客户端要补的代码（按依赖顺序）
 
-**第 1 步：路由。** 在 `MainBackend::JsonParsing` 的 `else if` 链末尾加一条：
+**第 1 步：路由（✅ 已落地）。** 在 `MainBackend::JsonParsing` 的 `else if` 链里，
+把智能体一族的 9 个类型全部转给 `AgentBackend`：
 
 ```cpp
-else if (type == "agent_approval_required"
+else if (type == "agent_response"
+      || type == "agent_session_response"
+      || type == "agent_sessions_list"
+      || type == "agent_message_created"
+      || type == "agent_request_ack"
+      || type == "agent_approval_required"
       || type == "agent_approve_ack"
       || type == "agent_task_execute"
       || type == "agent_task_rejected") {
     m_agentBackend->onTcpDataReceived(packet);
 }
 ```
+
+`AgentBackend::onTcpDataReceived` 内部再按 `type` / `op` 二级分派。
 
 漏一个分支不会报错、不会断言，包会**静默消失**——服务器侧漏掉 `task_execute`
 时就出过这个事故：审批点了，什么也没发生，播报还说「已下发」。
@@ -760,13 +768,17 @@ sequenceDiagram
 
 ### 5.6 当前已知缺口（客户端侧）
 
-| 缺口 | 表现 | 修法 |
+| 缺口 | 表现 | 状态 |
 | :-- | :-- | :-- |
-| `MainBackend::JsonParsing` **只路由了 `agent_response`**，没路由 `agent_session_response` / `agent_sessions_list` / `agent_message_created` / `agent_request_ack` / `agent_approval_required` / `agent_approve_ack` / `agent_task_execute` / `agent_task_rejected` | 服务器明明回了包，客户端却"没反应"，5 秒后超时。**漏分支不报错、不断言，包静默消失** | 在 `else if` 链里加一条把上述 `type` 全部转给 `m_agentBackend->onTcpDataReceived(packet)`；`AgentBackend` 内部已经按 `type`/`op` 分派好了 |
-| `AgentChatArea::requestNewSession` 用 `QUuid` 生成 `sessionId` | 服务器回 `400 会话参数非法`（`ParseSessionId` 要求纯数字、≤10 位、非 0） | 改成 `QString::number(QRandomGenerator::global()->generate())`：`quint32` 天然落在 `1..0xFFFFFFFF`，位数 ≤10；撞车走服务器 `409`，现有失败链路会提示重试 |
+| `MainBackend::JsonParsing` **只路由了 `agent_response`**，其余 8 个 `agent_*` 包静默丢弃 | 服务器明明回了包，客户端却"没反应"，5 秒后超时。**漏分支不报错、不断言，包静默消失** | ✅ 已修：`else if` 链已覆盖全部 9 个 `agent_*` 类型 |
+| `AgentChatArea::requestNewSession` 用 `QUuid` 生成 `sessionId` | 服务器回 `400 会话参数非法`（`ParseSessionId` 要求纯数字、≤10 位、非 0） | ✅ 已修：改用 `QRandomGenerator::global()->generate()`（`quint32` → ≤10 位，0 兜成 1），撞车走服务器 `409` + 现有失败链路 |
+| `AgentBackend::onTcpDataReceived` 尚未处理 `agent_approval_required` / `agent_approve_ack` / `agent_task_execute` / `agent_task_rejected` | 主路由已经把包送到了，但函数走到 `if (responseType != "agent_response") return;` 就返回。表现：审批框不弹，批准后指令不下发 | ❌ 待补：需要 4 个处理函数 + 对应信号 + `AgentChatArea` 的审批弹窗与执行入口 |
+| `AgentBackend` 没有发送 `agent_approve` 的槽 | 用户在弹窗里点"批准/拒绝"后没有出站通道 | ❌ 待补：加 `sendAgentApprove(sessionId, serverId, approved, note)` |
 
-这两条是**互相叠加**的独立缺陷：即便修好路由，UUID 仍会被 400；即便改数字 ID，
-包还是会被主路由丢掉。
+前两条是**互相叠加**的独立缺陷：即便修好路由，UUID 仍会被 400；即便改数字 ID，
+包还是会被主路由丢掉。所以两条必须一起改才有效果——只改一条会得出"改了没用"的错误结论。
+
+后两条不影响「新建会话 / 改名 / 删除 / 拉列表 / 提问 / 停止」，只影响「审批」这一段链路。
 
 ---
 

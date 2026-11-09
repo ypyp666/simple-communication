@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QDateTime>
 #include <QUuid>
+#include <QRandomGenerator>
 #include <QIcon>
 #include <QPixmap>
 #include <QPainter>
@@ -313,8 +314,19 @@ void AgentChatArea::requestNewSession()
     setNewSessionEnabled(false);
 
     // 会话 ID = threadId，由客户端本地生成（服务器只认 (userId, threadId) 联合主键，
-    // 不会下发 ID）；用 UUID 保证唯一，userId 由会话操作包单独携带
-    const QString sessionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // 不会下发 ID）；userId 由会话操作包单独携带。
+    //
+    // 这里必须是纯数字、非 0、不超过 10 位，不能用 UUID：
+    // 服务器的 thread_id 是 INT，而且把请求转给智能体时要把「会话ID + 'n' + 账号」
+    // 拼成一个字符串，只有两段都是纯数字，'n' 才是唯一的分界点。
+    // UUID 会被服务器直接回 400「会话参数非法」，客户端只能看到 5 秒后超时。
+    // generate() 返回 quint32，范围正好是 1..0xFFFFFFFF（最多 10 位）；
+    // 万一撞上已有会话，服务器回 409，走上面的失败链路让用户重试即可
+    quint32 rawSessionId = QRandomGenerator::global()->generate();
+    if (rawSessionId == 0) {
+        rawSessionId = 1;   // 0 会被服务器判非法，这种极端值兜一下
+    }
+    const QString sessionId = QString::number(rawSessionId);
     emit sessionCreateRequested(sessionId, QStringLiteral("新会话"));
 }
 
