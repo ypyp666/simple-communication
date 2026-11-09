@@ -147,7 +147,7 @@ docstring 里，**不要为了新工具去改提示词**。
 | :-- | :-- | :-- |
 | `CHAT_TOOLS` | 聊天专家 | `web_searchquery` |
 | `VISION_TOOLS` | 图片理解专家 | 空 |
-| `TASK_TOOLS` | 任务专家（规划阶段） | `search_friend` |
+| `TASK_TOOLS` | 任务专家（规划阶段） | `search_friend`、`get_chat_history` |
 
 任务专家跑的是手动工具循环（`_plan_with_tools`），最多 `MAX_TOOL_ROUNDS` 轮，
 最后强制收敛成纯文本 JSON，所以工具再调用也不会把规划结果截断。
@@ -159,7 +159,7 @@ docstring 里，**不要为了新工具去改提示词**。
 | 步骤 | 工具 | 状态 |
 | :-- | :-- | :-- |
 | 1 | `search_friend` 查好友账号 | 已实现 |
-| 2 | `get_chat_history` 拉聊天记录 | 待实现（`tool.py` 里有约定说明） |
+| 2 | `get_chat_history` 拉聊天记录 | 已实现 |
 | 3 | `forward_message` 把内容交给服务器转发 | 待实现，有副作用、必须走审批 |
 
 拆开的理由：第 1、2 步只读，可以放心让模型自己调；第 3 步会真的把消息发出去，
@@ -172,6 +172,20 @@ docstring 里，**不要为了新工具去改提示词**。
   工具会把候选列出来并要求模型先问用户，**不允许模型自己挑一个**。
 - `retcode = 2` 没这个人。
 - `retcode = -1` SQL 出错。
+
+`get_chat_history` 走存储过程 `Agent_load_message(in_user_id, in_target_id, out retcode)`：
+
+- `retcode = 1` 有记录，返回 `(send_id, receive_id, context, sentime)`，
+  最多 10 条，双向都包含，已经按时间从早到晚排好。
+- `retcode = 2` 两人之间没有任何聊天记录。
+- `retcode = -1` SQL 出错；这时存储过程被 `EXIT HANDLER` 提前中断，不会回结果集。
+
+工具返回给模型时会做四件事：把多行内容压成一行（免得一条消息被当成好几条）、
+单条超过 300 字截断、按 `send_id` 标出「我」还是「对方」、
+正好 10 条时提示「更早的没取」，避免模型假装知道 10 条以前的内容。
+
+两个工具都吃账号ID，所以**必须先 `search_friend` 再 `get_chat_history`**；
+把名字直接传给 `get_chat_history` 会明确报错（`parse_account_id` 只收正整数）。
 
 业务库账号只被授予存储过程的 `EXECUTE` 权限，**没有表的 `SELECT` 权限**，
 所以工具里一律走 `CALL`，不要改成自己拼 `SELECT`。

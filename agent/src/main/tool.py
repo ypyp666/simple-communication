@@ -111,10 +111,18 @@ async def web_searchquery(query: str, count: int = 5, ori_question: str | None =
 # 提示词里不重复这些细节：工具一多就会把上下文撑爆，而且两份说明还容易不一致。
 # 没写完的工具不要加 @tool，也不要放进注册表，模型看不到就调不到。
 
+# 两个存储过程的返回码约定一致：1 = 查到东西，2 = 没有，-1 = 执行出错
+PROCEDURE_SQL_ERROR = -1
+
 # 好友查询的返回码，来自存储过程 Agent_search_user
 SEARCH_FRIEND_OK = 1
 SEARCH_FRIEND_NOT_FOUND = 2
-SEARCH_FRIEND_SQL_ERROR = -1
+SEARCH_FRIEND_SQL_ERROR = PROCEDURE_SQL_ERROR
+
+# 聊天记录的返回码，来自存储过程 Agent_load_message
+LOAD_MESSAGE_OK = 1
+LOAD_MESSAGE_EMPTY = 2
+LOAD_MESSAGE_SQL_ERROR = PROCEDURE_SQL_ERROR
 
 
 def user_id_from_thread_id(thread_id: str):
@@ -192,37 +200,56 @@ def open_db():
     return connection
 
 
-def call_search_user(own_id: int, target_name: str):
-    """调存储过程 Agent_search_user，返回 (retcode, rows)。"""
+def call_procedure(sql: str, params: tuple):
+    """调一个带 OUT retcode 的存储过程，返回 (retcode, rows)。
+
+    存储过程里的 SELECT 会先回一个结果集，OUT 参数要等结果集读完之后
+    再单独 SELECT @retcode 取。中间那个 nextset() 循环不能省，
+    否则连接里还挂着没读完的结果，下一条 SQL 直接 out of sync。
+    """
     connection = open_db()
     try:
         cursor = connection.cursor()
         try:
-            cursor.execute(
-                "CALL Agent_search_user(%s, %s, @retcode)",
-                (own_id, target_name),
-            )
+            cursor.execute(sql, params)
             rows = []
-            # 存储过程里那句 SELECT 会先回一个结果集
+            # 存储过程里那句 SELECT 会先回一个结果集；
+            # 中途被 EXIT HANDLER 打断或者没走到 SELECT 时，这里是 None
             if cursor.description is not None:
                 rows = cursor.fetchall()
-            # 把剩下的结果集读干净，否则下一条 SQL 会 out of sync
             while cursor.nextset():
                 pass
 
             cursor.execute("SELECT @retcode")
             fetched = cursor.fetchone()
             if fetched is None:
-                retcode = SEARCH_FRIEND_SQL_ERROR
+                retcode = PROCEDURE_SQL_ERROR
             else:
                 retcode = fetched[0]
             if retcode is None:
-                retcode = SEARCH_FRIEND_SQL_ERROR
+                retcode = PROCEDURE_SQL_ERROR
         finally:
             cursor.close()
     finally:
         connection.close()
     return retcode, rows
+
+
+def call_search_user(own_id: int, target_name: str):
+    """调存储过程 Agent_search_user，返回 (retcode, rows)。"""
+    sql = "CALL Agent_search_user(%s, %s, @retcode)"
+    params = (own_id, target_name)
+    return call_procedure(sql, params)
+
+
+def call_load_message(own_id: int, target_id: int):
+    """调存储过程 Agent_load_message，返回 (retcode, rows)。
+
+    取出的是两个人之间最近 10 条双向消息，已经按时间从早到晚排好。
+    """
+    sql = "CALL Agent_load_message(%s, %s, @retcode)"
+    params = (own_id, target_id)
+    return call_procedure(sql, params)
 
 
 def format_friend_rows(rows) -> str:
@@ -312,20 +339,169 @@ async def search_friend(target_name: str, config: RunnableConfig) -> str:
     return format_friend_rows(rows)
 
 
-# ---------------------------------------------------------------- 待实现的两步
-# 下面这两环还只有约定、没有实现，所以故意不给它们加 @tool、也不放进注册表，
-# 模型看不到这些名字，也就不会在它们没做好的时候先向用户乱承诺。
-#
-# get_chat_history(account_id)：
-#   输入 search_friend 返回的账号ID，输出这段会话的聊天记录。
-#   存储过程定下来之后，照 search_friend 的写法补：参数扁平、走 CALL、
-#   返回字符串、异常自己吞掉转成失败文案。记得把「用途 / 链条位置 / 何时调」
-#   一起写进它自己的 docstring，不要回头去改提示词。
+# 存储过程最多只给 10 条，和里面的 LIMIT 10 对应
+MAX_HISTORY_ROWS = 10
+# 单条消息最多给模型 300 字，避免有人发了一整篇文章把上下文吃光
+MAX_CONTEXT_CHARS = 300
+
+
+def parse_account_id(raw):
+    """把模型传进来的账号ID 规整成 int，规整不了返回 None。
+
+    模型有时候会把 ID 写成字符串 "1001"，有时候会直接写 1001，两种都收；
+    但如果它把名字（「张三」）当成了账号传进来，就返回 None 让它重调工具，
+    绝对不在这里把名字猜成一个数字。
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        if raw <= 0:
+            return None
+        return raw
+    if not isinstance(raw, str):
+        return None
+
+    text = raw.strip()
+    if text == "":
+        return None
+    if not text.isascii():
+        return None
+    if not text.isdigit():
+        return None
+
+    value = int(text)
+    if value <= 0:
+        return None
+    return value
+
+
+def format_sentime(value) -> str:
+    """把 DATETIME 列格式化成好读的时间，拿不到就写「时间未知」。"""
+    if value is None:
+        return "时间未知"
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def format_chat_rows(rows, own_id: int) -> str:
+    """把聊天记录拼成模型好读的文本：一条一行，标出谁说的。"""
+    lines = []
+    for row in rows:
+        send_id = row[0]
+        context = row[2]
+        sentime = row[3]
+
+        if context is None:
+            text = ""
+        else:
+            text = str(context)
+        # 多行内容压成一行，免得模型把一条消息当成好几条
+        text = text.replace("\r\n", " ")
+        text = text.replace("\n", " ")
+        text = text.strip()
+        if text == "":
+            text = "（空消息）"
+        if len(text) > MAX_CONTEXT_CHARS:
+            text = text[:MAX_CONTEXT_CHARS] + "…（内容过长，已截断）"
+
+        if send_id == own_id:
+            speaker = "我"
+        else:
+            speaker = "对方"
+
+        when = format_sentime(sentime)
+        lines.append(f"[{when}] {speaker}：{text}")
+
+    body = "\n".join(lines)
+    count = len(rows)
+    if count >= MAX_HISTORY_ROWS:
+        header = (
+            f"最近 {count} 条聊天记录（按时间从早到晚；"
+            f"存储过程只取最近 {MAX_HISTORY_ROWS} 条，更早的没取）："
+        )
+    else:
+        header = f"最近 {count} 条聊天记录（按时间从早到晚）："
+    return header + "\n" + body
+
+
+@tool
+async def get_chat_history(account_id: str | int, config: RunnableConfig) -> str:
+    """读聊天记录：把当前用户和某位好友最近的对话拉出来看。
+
+    【用途】
+    读「我」和某位好友之间最近的聊天记录，最多 10 条，双向的都包含，
+    按时间从早到晚排列。工具只读，不会改动任何数据。
+
+    【在链条中的位置】
+    「帮某位好友恢复/转发消息」这类任务靠多个工具接力完成，本工具是第二环：
+        1. search_friend     拿到好友账号ID        只读
+        2. get_chat_history  读这段会话的聊天记录  <- 本工具，只读
+        3. 把拟好的内容交给服务器转发
+    本工具吃的是账号ID，不是名字。所以调它之前必须先调 search_friend，
+    把名字换成账号ID；名字直接传进来会失败。
+
+    【什么时候调】
+    - 需要先知道「我和这个人之前聊了什么」才能接着往下说的时候；
+    - 用户说「按我们刚才聊的继续」「把之前那些话再发一遍」这类，
+      得先看清上下文再拟内容的时候。
+    只是想给人发一句新消息、不提历史的时候，不用调本工具。
+
+    【返回结果怎么用】
+    - 返回若干行，每行形如 [时间] 我：…… 或 [时间] 对方：……，按时间从早到晚；
+    - 表头写了「只取最近 10 条，更早的没取」，就不要假装知道更早的内容；
+    - 返回「你和这位好友还没有任何聊天记录」：如实说明，不要编内容；
+    - 返回以「【聊天记录工具调用失败】」开头：这是服务端或参数的问题，
+      原样转述给用户，不要当成「没有聊天记录」。
+
+    Args:
+        account_id: 好友的账号ID，必须是 search_friend 返回的那个数字，
+            传数字或数字字符串都行，不要把用户说的名字或备注直接传进来
+    """
+    if not db_is_configured():
+        return "【聊天记录工具调用失败】服务端没有配置数据库账号，请联系管理员"
+
+    own_id = resolve_own_id(config)
+    if own_id is None:
+        return "【聊天记录工具调用失败】拿不到当前用户的账号ID，请让客户端在请求里带上 user_id"
+
+    target_id = parse_account_id(account_id)
+    if target_id is None:
+        return (
+            f"【聊天记录工具调用失败】好友账号ID必须是纯数字，收到的是「{account_id}」。"
+            "请先调用 search_friend 按名字或备注查到账号ID，再调本工具"
+        )
+
+    try:
+        # pymysql 是同步阻塞库，丢线程池，别占住事件循环
+        retcode, rows = await asyncio.to_thread(call_load_message, own_id, target_id)
+    except Exception as exc:
+        return f"【聊天记录工具调用失败】数据库连接或执行异常: {str(exc)}"
+
+    if retcode == LOAD_MESSAGE_EMPTY:
+        return "你和这位好友还没有任何聊天记录。"
+    if retcode == LOAD_MESSAGE_SQL_ERROR:
+        return "【聊天记录工具调用失败】数据库执行出错，存储过程返回 -1"
+    if retcode != LOAD_MESSAGE_OK:
+        return f"【聊天记录工具调用失败】存储过程返回了未知返回码 {retcode}"
+
+    if len(rows) == 0:
+        return "【聊天记录工具调用失败】返回码是「有记录」，但结果集是空的"
+
+    return format_chat_rows(rows, own_id)
+
+
+# ---------------------------------------------------------------- 待实现的一步
+# 下面这环还只有约定、没有实现，所以故意不给它加 @tool、也不放进注册表，
+# 模型看不到这个名字，也就不会在它没做好的时候先向用户乱承诺。
 #
 # forward_message(account_id, content)：
 #   把拟好的回复内容和账号ID交给服务器，由服务器解析后转发。
 #   这一环有副作用，必须挂到审批链路上：先让用户在 examine_expert 确认，
 #   批准之后才允许真正发给服务器。
+#   写的时候照前两个工具的格式：参数扁平、返回字符串、异常自己吞掉转成失败文案，
+#   「用途 / 链条位置 / 何时调 / 返回怎么用」全写在它自己的 docstring 里，
+#   不要回头去改提示词。
 
 
 # ---------------------------------------------------------------- 任务动作
@@ -426,8 +602,8 @@ CHAT_TOOLS = [web_searchquery]
 # 图片理解专家：只描述看到的画面，不需要外部工具
 VISION_TOOLS = []
 
-# 任务专家：查好友这类只读工具可以自己调；
+# 任务专家：查好友、读聊天记录这类只读工具可以自己调；
 # 真正有副作用的操作仍然只输出指令，等 Qt 客户端收到 task_execute 再执行。
-TASK_TOOLS = [search_friend]
+TASK_TOOLS = [search_friend, get_chat_history]
 
 
