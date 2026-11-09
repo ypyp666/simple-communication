@@ -789,14 +789,25 @@ async def _emit_state_effects(graph, config):
 
     interrupts = _collect_interrupts(snapshot)
     if interrupts:
+        # thread_id 必须带上：审批是另一条独立的 HTTP 请求（/approve），
+        # 服务器手上只有这条长连接，不会自己去拆 config，靠这个字段才能续上同一条会话。
+        thread_id = ""
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict):
+            thread_id = configurable.get("thread_id", "")
+
         payload = interrupts[0].value
         if isinstance(payload, dict):
-            event = {"event": "approval_required"}
+            event = {"event": "approval_required", "thread_id": thread_id}
             for key, value in payload.items():
                 event[key] = value
             yield event
         else:
-            yield {"event": "approval_required", "summary": str(payload)}
+            yield {
+                "event": "approval_required",
+                "thread_id": thread_id,
+                "summary": str(payload),
+            }
         return
 
     status = values.get("approval_status")
@@ -861,6 +872,25 @@ def build_human_content(message: str, images: list[str] | None = None):
     return parts
 
 
+def _done_status(snapshot) -> str:
+    """给 done 事件定一个收尾状态，让服务器分得清「真完了」和「停在审批点」。
+
+    为什么非要给：interrupt() 之后图会正常结束，服务器只看 done 的话会以为
+    这一轮已经完整结束，把半截回答当成完整回答推出去，用户也就再也看不到
+    审批框了。这里把「停了但没完」单独标出来。
+    """
+    interrupts = _collect_interrupts(snapshot)
+    if interrupts:
+        return "pending_approval"
+
+    values = snapshot.values
+    if not values:
+        values = {}
+    if values.get("approval_status") == "rejected":
+        return "rejected"
+    return "finished"
+
+
 async def chat_stream(thread_id: str, user_message: str, images: list[str] | None = None,
                       user_id: int | None = None):#新消息入口 `chat_stream`
     """处理一条新消息，逐 token 产出 SSE 事件字典。
@@ -894,7 +924,8 @@ async def chat_stream(thread_id: str, user_message: str, images: list[str] | Non
     else:
         agent_name = route
 
-    yield {"event": "done", "agent": agent_name}
+    # status 让服务器分得清「这一轮真完了」和「停在审批点等用户」
+    yield {"event": "done", "agent": agent_name, "status": _done_status(snapshot)}
 
 
 async def resume_stream(thread_id: str, approved: bool, note: str = "",
@@ -923,4 +954,6 @@ async def resume_stream(thread_id: str, approved: bool, note: str = "",
 
     if not last_agent:
         last_agent = "task_expert"
-    yield {"event": "done", "agent": last_agent}
+
+    snapshot = await graph.aget_state(config)
+    yield {"event": "done", "agent": last_agent, "status": _done_status(snapshot)}

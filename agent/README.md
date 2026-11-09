@@ -100,11 +100,26 @@
 | :-- | :-- | :-- |
 | `session` | `thread_id` | 流的第一条，前端持久化这个 id |
 | `token` | `agent`, `content` | 增量文本，`agent` 为 `chat_expert` / `imagine_expert` / `report_expert` |
-| `approval_required` | `summary`, `steps`, `command` | 需要弹确认框，用户选择后调 `/approve` |
+| `approval_required` | `thread_id`, `summary`, `steps`, `command` | 需要弹确认框，用户选择后调 `/approve` |
 | `task_execute` | `command` | 已批准，客户端据此执行真实操作 |
 | `task_rejected` | — | 已拒绝，任务终止 |
 | `error` | `message` | 异常信息 |
-| `done` | `agent` | 本轮结束，前端收尾 |
+| `done` | `agent`, `status` | 本轮结束，前端收尾 |
+
+`done.status` 取三个值：
+
+| `status` | 含义 |
+| :-- | :-- |
+| `finished` | 真正跑完了 |
+| `pending_approval` | 停在审批点，**没跑完**，等 `/approve` |
+| `rejected` | 用户拒绝了，任务终止 |
+
+为什么 `done` 必须带 `status`：`interrupt()` 之后图会正常结束、SSE 也会正常发 `done`，
+只看到 `done` 是分不出「真完了」和「停在审批点」的。转发层（例如 C++ 服务器）据此
+决定是关掉这一轮的气泡，还是保持待审批状态、把审批框推给客户端。
+
+`approval_required.thread_id` 是给**转发层**用的：审批是**另一条** HTTP 请求（`/approve`），
+转发层手上只有原来那条长连接，不会自己去拆配置，靠这个字段才能续上同一条会话。
 
 `command` 结构示例：
 
