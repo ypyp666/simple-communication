@@ -434,7 +434,343 @@ m_chatBackend->startSendMessage(params.value("targetId").toString(), msg);
 
 ---
 
-## 5. 配置
+## 5. 智能体 TCP 包全表
+
+客户端和服务器之间只有一条连接（和登录、聊天共用），所有智能体交互都靠 JSON 包的
+`type` 字段分派。这一节把**上行 8 个、下行 9 个**包全部列出来，逐个说明它是干什么的、
+字段是什么、以及为什么非这么设计不可。
+
+### 5.1 三条铁律
+
+| # | 铁律 | 违反之后的真实后果 |
+| :-- | :-- | :-- |
+| 1 | 回执必须**原样回显**请求里的 ID | 客户端靠这个 ID 把回执认领给某一次"在飞操作"（定时器表 / 某个气泡）。ID 对不上就**静默丢弃整包**，界面上表现为"转圈 5 秒然后超时"——错误码写得再准也没人看得见 |
+| 2 | 上行包里的 `userId` 一律**不采信** | 服务器只认登录会话里的账号。否则改个包就能往别人账号下建会话、塞消息 |
+| 3 | 真正产生副作用的是**客户端**，服务器只搬运 | 业务处理器都是「校验登录 + 执行 + 回包」三合一，服务器代跑会多推一条用户没请求过的应答；代持身份更糟，"谁发的"就没人能保证了 |
+
+### 5.2 命名陷阱：同一个东西有两个名字
+
+这是整条链路上最容易出错的地方，先记住这两组等价关系：
+
+| 概念 | 哪些包这么叫 | 哪些包那么叫 | 是不是同一个值 |
+| :-- | :-- | :-- | :-- |
+| 会话 ID | `sessionId`：`agent_session_create/rename/delete`、`agent_sessions_pull` 的响应条目、`agent_message_create`、`agent_session_response` | `threadId`：`agent_request`、`agent_stop`、`agent_approve`、`agent_response`、`agent_approval_required`、`agent_task_execute/rejected` | **是**。客户端生成的那一个字符串 |
+| 消息 ID | `messageId`：`agent_message_create` 的响应、`agent_request` 的上行 | `serverId`：`agent_response`、`agent_approval_required`、`agent_approve_ack`、`agent_task_execute/rejected`、`agent_approve` 的上行 | **是**。数据库自增主键 |
+
+改名不是笔误：`threadId` 是"会话"在上行对话类包里的历史叫法，`serverId` 是为了对齐
+服务器协议表里"这个消息在服务器上的编号"。**搬运时照抄，别自己换算**。
+
+### 5.3 上行：客户端 → 服务器
+
+| # | `type` | 必带字段 | 服务器回执 |
+| :-- | :-- | :-- | :-- |
+| 1 | `agent_session_create` | `sessionId`, `title`（`userId` 会被忽略） | `agent_session_response{op:"create"}` |
+| 2 | `agent_session_rename` | `sessionId`, `title` | `agent_session_response{op:"rename"}` |
+| 3 | `agent_session_delete` | `sessionId` | `agent_session_response{op:"delete"}` |
+| 4 | `agent_sessions_pull` | （无，账号取自登录态） | `agent_sessions_list` |
+| 5 | `agent_message_create` | `sessionId` | `agent_message_created` |
+| 6 | `agent_request` | `threadId`, `messageId`, `prompt` | `agent_request_ack` + N 条 `agent_response` |
+| 7 | `agent_stop` | `threadId` | **无回执** |
+| 8 | `agent_approve` | `threadId`, `serverId`, `approved`, `note` | `agent_approve_ack` + 续跑 `agent_response` |
+
+下面逐包说明。
+
+#### 1）`agent_session_create` 新建会话
+
+```json
+{"type": "agent_session_create", "sessionId": "<纯数字，≤10 位，非 0>",
+ "userId": "<可带，服务器不看>", "title": "新会话"}
+```
+
+- **`sessionId` 由客户端生成**，服务器没有发号器。会话在库里是 `(user_id, thread_id)`
+  联合主键，客户端先生成 ID 才能"乐观切进新会话"，不必等一个临时 ID 再对号。
+- **必须是纯数字、≤10 位、非 0**。库里 `thread_id` 是 `INT`，而且发给智能体时要拼成
+  `会话ID + 'n' + 账号`，只有两段都是纯数字，分隔符 `'n'` 才一定不会出现在任何一段里。
+  用 UUID 会被直接回 `400 会话参数非法`——这就是 §5.6 的坑之一。
+- `title` 空串会被服务器兜底成「新会话」（库里是非空列，存空串会出现一条点进去不知道是什么的会话）。
+- `userId` 是历史字段，服务器一律用 `session->account`。
+
+失败码：`400` 参数非法 / `401` 登录失效 / `409` **ID 撞车**（同账号两台设备同时新建，
+客户端应换个 ID 重试，而不是提示"服务器错误"）/ `500` 数据库异常。
+
+#### 2）`agent_session_rename` 改会话名
+
+字段同 create。`title` 为**空串会被拒**（400 会话名称不能为空）——否则等于把用户起的
+名字改没了。失败码同上，另有 `404 会话不存在`（本地已删或别的设备删了，客户端该顺手清本地）。
+
+#### 3）`agent_session_delete` 删会话
+
+只带 `sessionId`（删不需要名字）。`404 会话不存在` 仍然回 `success=false`，让客户端知道
+服务器上本来就没这条记录，可以安心清本地残留。
+
+#### 4）`agent_sessions_pull` 拉会话列表
+
+```json
+{"type": "agent_sessions_pull", "userId": "<可带，服务器不看>"}
+```
+
+- 登录成功后拉一次，用来和本地 SQLite 对账（补插 / 删多余）。
+- 请求叫 `pull`、响应叫 `list`，命名不一致是历史遗留；服务器也兼容旧客户端直接发
+  `agent_sessions_list`。
+- 这一包**不能设超时当作失败处理**：拉不到就跳过对齐，等下次登录，绝不能因为一次没回应
+  就清本地会话。
+
+#### 5）`agent_message_create` 申请消息 ID
+
+```json
+{"type": "agent_message_create", "sessionId": "<纯数字>", "userId": "<会被忽略>"}
+```
+
+- 提问的**第一步**。拿到的 `messageId` 是数据库自增主键，客户端和服务器要靠它对上
+  **同一行**消息——服务器侧凭空造号就没有那一行，用户提问和 AI 回答都无处可写。
+- 为什么要分两步：客户端拿到 ID 后**先本地落库占坑**，再把 ID + 问题正文发 `agent_request`。
+  这样"气泡已经在库里"这件事先于回答到达，不会出现回答先到、本地没行的乱序。
+- 服务器**不校验会话是否存在**：会话 ID 是客户端生成的，"还没建会话就先提问"是允许的，
+  不该在这一步拦。但消息必须真的建行，否则后面 `agent_request` 会回 `404`。
+- `sessionId` 非数字 / 超 10 位 → `400`；这里卡住比等到 `agent_request` 再报错好，
+  因为此时客户端还没落库，失败成本最低。
+
+#### 6）`agent_request` 发起一轮对话
+
+```json
+{"type": "agent_request", "threadId": "<纯数字>", "messageId": "<纯数字>",
+ "prompt": "<≤4000 字>", "userId": "<会被忽略>"}
+```
+
+- **绝不能同步等回答**：客户端心跳 3 秒一发、等 1 秒、连续超 3 次就断线重连；智能体
+  几百毫秒到几十秒才出结果，把调用写在返回路径上，用户看到的就是"发条消息就掉线"。
+- 所以服务器只做四件事：校验 → 提问写库 → 入队 → 立刻回 `agent_request_ack`，真正的
+  回答由 worker 以 `agent_response` 流式推回来。
+- `prompt` 长度按**字**算（4000 字），不按字节——按字节卡的话中文一千多字就被误判超长。
+- 未登录回 `agent_response{success:false, done:true}`（不是 `NotLoginResponse`：
+  那个包没有 `threadId`，客户端会把整包丢掉，然后永远卡在"回答中"）。
+
+#### 7）`agent_stop` 中止本轮
+
+```json
+{"type": "agent_stop", "threadId": "<纯数字>", "userId": "<会被忽略>"}
+```
+
+- **故意没有回执**。停止的含义就是"我不等了"，还要等一条回执才能解锁界面，等于没停。
+  客户端发完立刻自己置回"可输入"状态。
+- 服务器"最好的情况"是精确命中并置取消位，让 curl 立刻收手、worker 不再吐字；
+  抓不到（已经结束 / 已排队被消费）就只打一行日志，**也不回包**——补一条 401 反而会让
+  客户端收到一条它没在等的 `agent_response`。
+- 停止之后服务器可能还会漏几段包过来，客户端必须丢弃：`AgentBackend` 靠清掉
+  `m_pendingSessionId` 做到这一点。
+
+#### 8）`agent_approve` 审批回执
+
+```json
+{"type": "agent_approve", "threadId": "<照抄审批包的>", "serverId": "<照抄审批包的>",
+ "approved": true, "note": ""}
+```
+
+- 用户点「同意 / 拒绝」时发。**这一刻不执行任何东西**，只是把决定交回去让智能体续跑。
+- **必须有回执**（`agent_approve_ack`）：客户端点完要立刻解锁界面，而续跑的执行段可能
+  几百毫秒后才开始吐字，中间没有别的包可等。失败也要回一条 `success=false`，不能默默了事。
+- `note` 是拒绝理由，≤500 字，会进日志；客户端不填就传空串。
+- `404 没有待审批的任务` 的常见原因：重复点了 / 已被停止 / **服务重启把内存里的挂起记录丢了**。
+  客户端要把 `message` 显示出来，别静默关框。
+
+### 5.4 下行：服务器 → 客户端
+
+| # | `type` | 什么时候来 | 客户端必须做什么 |
+| :-- | :-- | :-- | :-- |
+| 1 | `agent_session_response` | 会话三件套的回执 | 按 `op` 分派；用 `sessionId` 认领定时器 |
+| 2 | `agent_sessions_list` | `agent_sessions_pull` 之后 | 和本地库对账（补插 / 删多余） |
+| 3 | `agent_message_created` | `agent_message_create` 之后 | 用 `messageId` 本地落库，再发 `agent_request` |
+| 4 | `agent_request_ack` | `agent_request` 受理成功 | 启动 5 分钟静默看门狗 |
+| 5 | `agent_response` | 流式回答 / 本轮失败 | 拼气泡；`done=true` 收尾解锁 |
+| 6 | `agent_approval_required` | 智能体停在 `interrupt()` | 弹审批框 |
+| 7 | `agent_approve_ack` | `agent_approve` 的受理结果 | 关框 / 报错；超时也要解锁 |
+| 8 | `agent_task_execute` | 用户批准后，智能体发来指令 | **执行 `command`** |
+| 9 | `agent_task_rejected` | 用户拒绝后 | 收掉"等待执行"状态，数据不动 |
+
+#### 1）`agent_session_response` 会话三件套统一回执
+
+```json
+{"type": "agent_session_response", "op": "create|rename|delete",
+ "sessionId": "<原样回显>", "code": 0, "message": "", "success": true}
+```
+
+- **三个操作共用一个包类型 + `op` 分派**：三者的回执形状完全一样（只有成败），
+  没必要拆三个类型。客户端一张表三个 handler 就够了。
+- **回包不带 `title`**。新建/改名成功要落库的那个名字，得客户端自己记着
+  （`AgentBackend` 里的 `m_createSessionTitles` / `m_renameSessionTitles`）——
+  这也意味着**同一次操作不能并发**，连点会被定时器表挡掉。
+- `sessionId` 缺了就是致命伤：客户端会整包丢弃 → "转圈 5 秒超时"。服务器为此在
+  **每一个失败分支**都单独组包回显，包括未登录（不能用 `NotLoginResponse`）。
+
+#### 2）`agent_sessions_list` 会话列表
+
+```json
+{"type": "agent_sessions_list", "sessions": [{"sessionId": "...", "title": "..."}],
+ "code": 0, "message": "", "success": true}
+```
+
+- 这是客户端判断"服务器上到底有哪些会话"的**唯一权威**。
+- 失败时**必须没有 `sessions` 字段且 `success=false`**，绝不能回空数组：客户端一旦收到
+  空列表，就会把本地会话全部按"已删除"清掉——一次网络抖动就能清空用户历史。
+- 条目里 `sessionId` 为空的脏数据客户端要跳过：对账全靠这个 ID。
+
+#### 3）`agent_message_created` 消息 ID 回执
+
+```json
+{"type": "agent_message_created", "sessionId": "<原样回显>", "messageId": "<自增主键>",
+ "code": 0, "message": "", "success": true}
+```
+
+- `messageId` 协议层是字符串，但值就是数据库自增主键，两边直接对得上。
+- **成功和失败都要回显 `sessionId`**：客户端靠它把结果挂回某条会话线的在飞申请。
+  为这个原因，未登录分支也单独组包，不用通用未登录包。
+- 失败时 `messageId` 给空串，客户端据此放弃本次提问（`agentMessageIdAllocateFailed`），
+  **不要**自己去造一个 ID 继续发——服务器没有那一行，后面必然 `404`。
+
+#### 4）`agent_request_ack` 受理确认
+
+```json
+{"type": "agent_request_ack", "code": 0, "message": "", "success": true}
+```
+
+- 只有 4 个字段，**故意不带任何 ID**：客户端收到它只做一件事——启动
+  "5 分钟没有任何新包就自动收尾"的看门狗。越简单越不会出错。
+- `worker` 可能几微秒就出结果，而 ack 要等 handler 返回后才写进 socket，两条路径没有
+  先后保证。所以服务器有一个 **ack 门**：先造一个原子闸门挂到任务上，**ack 真的进了
+  socket** 之后才放行 worker。否则客户端会先看到回答、后启动看门狗，甚至把这条回答
+  当成"上一轮迟到包"丢掉。
+- 顺序上必须 `Submit` 成功后再回 ack：反过来客户端会为一个压根没排上队的请求白等 5 分钟。
+
+#### 5）`agent_response` 流式回答（也是统一的失败包）
+
+```json
+{"type": "agent_response", "threadId": "...", "serverId": "...", "requestId": "...",
+ "answer": "增量文字", "content": "<旧名，兼容>", "done": false, "finished": "<旧名，兼容>",
+ "code": 0, "message": "", "success": true}
+```
+
+| 字段 | 干什么 |
+| :-- | :-- |
+| `threadId` / `serverId` | 原样回显，客户端靠它们把文字挂回正确的会话和气泡 |
+| `requestId` | 服务器内部编号，只供日志排查；客户端可当**不透明去重键**，不要解析 |
+| `answer` | 增量文字（不是全量）。`content` 是旧名字，客户端读 `answer` 优先、空了回退 `content` |
+| `done` | `true` = 本轮结束。`finished` 是旧名字，一并带上做兼容（客户端 `done \|\| finished`） |
+| `success` | 本轮成败。**失败也用同一个包类型**，客户端不必为出错多写一条分支 |
+| `code` | `0` 成功；`400/401/404/413/500/502/503` 见各分支 |
+
+- **失败分支的 `done` 也必须为 `true`**：客户端已经把气泡挂成"思考中"，收不到 `done`
+  这条会话就永久卡在"回答中"，用户再也发不出新问题。
+- 增量已经随到随推，`done=true` 那条的 `answer` 是空串，只负责收尾。
+- **不停在审批点后报错**：审批轮本来就没有正文，服务器会补一条 `done=true, success=true`
+  的空包让客户端关掉看门狗，绝不能掉进"智能体没有返回任何内容"的分支。
+
+#### 6）`agent_approval_required` 待审批
+
+```json
+{"type": "agent_approval_required", "threadId": "...", "serverId": "...", "requestId": "...",
+ "summary": "一句话概述", "steps": ["第一步", "第二步"],
+ "command": {"action": "...", "params": {...}, "risk": "..."},
+ "detail": [{"label": "操作", "value": "发送消息给好友"}, {"label": "对象", "value": "老李（账号 1001）"}]}
+```
+
+| 字段 | 谁写的 | 干什么 |
+| :-- | :-- | :-- |
+| `detail` | 服务端**确定性生成**（`describe_task_command`） | **审批依据**。`[{"label","value"}]` 按顺序渲染两列，客户端不要自己拼中文 |
+| `summary` | 模型 | 一句话副标题，可能很空（"帮你把消息发出去"） |
+| `steps` | 模型 | 分步说明，小字或折叠展示 |
+| `command` | 服务端白名单收敛后 | 真正要执行的指令，用户批准后原样会再发一次（见第 8 个包） |
+
+- 为什么 `detail` 必须由服务端生成：模型写的 `summary` 经常不含对象，用户根本看不出
+  "要发给谁"就点了同意——那这个审批等于白弹。`detail` 全部取自 `command` 的确定字段，
+  模型换什么说法都影响不到它。
+- 为什么服务器**不在收到 SSE 那一行就推**：审批包后面紧跟着"本轮结束"，此刻推给客户端
+  可能造成"先弹框、后收到本轮结束"，两条包顺序反了。所以等流收尾再统一推。
+- `steps` / `command` 在 `agent_tcp` 内部是 JSON 字符串，嵌进外层包前会解回对象；
+  解不出来就原样当字符串给，至少客户端还能显示。
+- 客户端拿到后：`detail` 为空数组时**禁用「同意」**（让用户盲签没有意义）。
+
+#### 7）`agent_approve_ack` 审批受理回执
+
+```json
+{"type": "agent_approve_ack", "threadId": "...", "serverId": "...", "requestId": "...",
+ "approved": true, "code": 0, "message": "", "success": true}
+```
+
+- 和 `agent_request_ack` 一样有 **ack 门**：ack 先进 socket，才放行 worker 续跑，
+  否则续跑的 token 会抢在 ack 前面到，客户端把正在进行的回答当成过期包丢掉。
+- 成功只表示"已受理"，**不代表任务已执行完**。执行结果走 `agent_task_execute`。
+- 失败：`401` 登录失效 / `400` 缺 threadId / `413` note 过长 /
+  `404` 没有待审批的任务（重复点、已停止、服务重启丢了挂起记录）。
+
+#### 8）`agent_task_execute` 下发要执行的指令
+
+```json
+{"type": "agent_task_execute", "threadId": "...", "serverId": "...", "requestId": "...",
+ "command": {"action": "agent_send_message", "params": {...}, "risk": "..."}}
+```
+
+- `command` 是**服务器完全不解析的原文**：里面有哪几个 action、参数怎么命名，是智能体和
+  客户端之间的约定，服务器插一脚只会多出第三个要同步改的地方。
+- **当场推，不等流结束**：保证客户端"先拿到指令、后看到『已按计划下发』的播报"。
+  审批包相反（等收尾），这是两处刻意相反的顺序。
+- 客户端收到后走**自己带登录态的执行路径**（§4 第 3 步那张表），不是自己去连服务器补一个包。
+- 按 `requestId` 幂等去重：重推、重连补拉都可能让同一条指令到两遍，而删除不可逆。
+
+#### 9）`agent_task_rejected` 用户拒绝了
+
+```json
+{"type": "agent_task_rejected", "threadId": "...", "serverId": "...", "requestId": "...",
+ "command": {}}
+```
+
+- 单独一个包类型，**不是**让客户端去读 `command` 里有没有内容来判断该不该执行：
+  那样客户端得先解析再决定行为，多一个能错的地方。
+- 数据上什么都不做；只收掉界面上的"等待执行"状态。
+
+### 5.5 一轮完整问答的时序
+
+```mermaid
+sequenceDiagram
+    participant C as Qt 客户端
+    participant S as C++ 服务器
+    participant A as 智能体(SSE)
+
+    C->>S: agent_message_create{sessionId}
+    S-->>C: agent_message_created{messageId}
+    Note over C: 本地落库占坑
+    C->>S: agent_request{threadId,messageId,prompt}
+    S->>S: 提问写库 + 入队
+    S-->>C: agent_request_ack
+    Note over C: 启动 5 分钟看门狗
+    S->>A: POST /chat (thread_id = 会话ID + 'n' + 账号)
+    A-->>S: event:approval_required{summary,steps,command,detail}
+    S-->>C: agent_approval_required
+    S-->>C: agent_response{done:true}（关看门狗）
+    C->>S: agent_approve{approved:true}
+    S-->>C: agent_approve_ack
+    S->>A: POST /approve（同一条 thread_id）
+    A-->>S: event:task_execute{command}
+    S-->>C: agent_task_execute{command}
+    Note over C: 走自己的 repost/delete_friend 执行
+    A-->>S: event:token（播报）
+    S-->>C: agent_response{answer:增量}
+    A-->>S: event:done
+    S-->>C: agent_response{done:true}
+```
+
+### 5.6 当前已知缺口（客户端侧）
+
+| 缺口 | 表现 | 修法 |
+| :-- | :-- | :-- |
+| `MainBackend::JsonParsing` **只路由了 `agent_response`**，没路由 `agent_session_response` / `agent_sessions_list` / `agent_message_created` / `agent_request_ack` / `agent_approval_required` / `agent_approve_ack` / `agent_task_execute` / `agent_task_rejected` | 服务器明明回了包，客户端却"没反应"，5 秒后超时。**漏分支不报错、不断言，包静默消失** | 在 `else if` 链里加一条把上述 `type` 全部转给 `m_agentBackend->onTcpDataReceived(packet)`；`AgentBackend` 内部已经按 `type`/`op` 分派好了 |
+| `AgentChatArea::requestNewSession` 用 `QUuid` 生成 `sessionId` | 服务器回 `400 会话参数非法`（`ParseSessionId` 要求纯数字、≤10 位、非 0） | 改成 `QString::number(QRandomGenerator::global()->generate())`：`quint32` 天然落在 `1..0xFFFFFFFF`，位数 ≤10；撞车走服务器 `409`，现有失败链路会提示重试 |
+
+这两条是**互相叠加**的独立缺陷：即便修好路由，UUID 仍会被 400；即便改数字 ID，
+包还是会被主路由丢掉。
+
+---
+
+## 6. 配置
 
 复制 `.env.example` 为 `.env` 并填写（`.env` 不要提交）：
 
@@ -456,7 +792,7 @@ m_chatBackend->startSendMessage(params.value("targetId").toString(), msg);
 
 ---
 
-## 6. 运行
+## 7. 运行
 
 ```bash
 uv sync
@@ -467,7 +803,7 @@ uv run python run_server.py     # 或 uv run python -m main.server（需先设�
 
 ---
 
-## 7. 目录
+## 8. 目录
 
 ```
 agent/
@@ -483,7 +819,7 @@ agent/
     └── resources/           # 运行时数据（SQLite 会话库等，不入库）
 ```
 
-## 8. 代码风格约定
+## 9. 代码风格约定
 
 - **所有工具都写在 `tool.py`**，靠文件末尾的 `CHAT_TOOLS` / `VISION_TOOLS` / `TASK_TOOLS`
   注册表暴露，`agent.py` 只负责挑哪个列表给哪个专家，不写工具实现。
