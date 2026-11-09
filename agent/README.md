@@ -307,6 +307,34 @@ docstring 里，**不要为了新工具去改提示词**。
    直接用普通气泡渲染，末尾以 `done` 收尾。
 7. 不要设置过短的低速超时；正常静默最长可能持续数十秒，靠 `: ping` 保活。
 
+### 如果客户端不直连智能体，而是接 C++ 服务器
+
+服务器自己会丢掉 `task_execute` / `task_rejected` 吗？不会——它把这两个事件换成两个
+**服务器级包**转给客户端（`type` 前加了 `agent_` 前缀，和 `agent_response`、
+`agent_approval_required` 保持一族）：
+
+| 服务器推给客户端的包 | 载荷 | 客户端要做什么 |
+| :-- | :-- | :-- |
+| `agent_approval_required` | `threadId`, `serverId`, `requestId`, `summary`, `steps`, `command`, `detail` | 弹审批框；用户选完发 `agent_approve` |
+| `agent_task_execute` | `threadId`, `serverId`, `requestId`, `command` | **执行 `command`**，走自己带登录态的执行路径 |
+| `agent_task_rejected` | `threadId`, `serverId`, `requestId`, `command`（`{}`） | 什么都不用做，可选提示一句 |
+
+`command` 是服务器不解析的原文，和智能体 `task_execute` 里的结构完全一致。
+
+为什么由客户端执行而不是服务器直接做：业务处理器（`Repost` / `DeleteFriend` /
+`SetRemark` …）都是「校验登录态 + 执行 + 回包」三合一的，服务器在智能体 worker 里
+把它们拉起来跑，会往用户连接上多推一条他没请求过的应答；拆开它们又得大改现有代码。
+更要紧的是**发送身份**——客户端走 `repost` 时 `sendId` 由登录会话决定，伪造不了；
+服务器代持身份做这件事，等于把「谁发的」交给服务器自己填，填错了没人发现。
+
+所以这里的分工是：**执行者换成客户端，通道没换。** 客户端的 `repost` 照样打到服务器，
+服务器照样调同一个 `Repost()` 写库 + 推给对方。没有任何一条路绕开服务器。
+
+> 顺序说明：`agent_task_execute` 一到就会被推给客户端（不等流结束），保证客户端
+> **先拿到指令、后看到「已按计划下发」的播报**。审批包相反，要等流收尾再推，
+> 否则客户端可能先弹框、后收到「本轮结束」，两条包先后反了。
+
+
 ---
 
 ## 5. 配置

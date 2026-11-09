@@ -107,6 +107,18 @@ struct AgentApproval
 // 返回 false 表示上层不再需要（客户端已断线），本次传输可以提前收尾。
 using AgentApprovalSink = std::function<bool(const AgentApproval&)>;
 
+// 任务结果回调：解析到 task_execute / task_rejected 时立刻调一次。
+//
+// 为什么这两个事件不能待在 SseResult 里等流收尾：它们带的是「用户已经批准的
+// 那个动作，现在去执行」，客户端执行完要立刻说话。等整条流收完再给，用户会先
+// 看到「已按计划下发执行」，再看到自己那边什么都没发生——先看见结果后看见动作。
+//
+// eventName 是智能体那边的事件名（"task_execute" / "task_rejected"），服务器不解析；
+// payload 是 command 的 JSON 原文，task_rejected 时是 "{}"。
+// 返回 false 表示上层不再需要继续收流（客户端断线），本次传输提前结束。
+using AgentTaskEventSink = std::function<bool(const std::string& eventName,
+                                             const std::string& payload)>;
+
 // ===== 智能体服务端地址 / 超时配置 =====
 // 之所以做成可配置，而不是写死一个常量：
 //   本地调试、内网部署、正式环境三处的地址一定不一样，
@@ -218,7 +230,8 @@ public:
                                  std::string* outThreadId = nullptr,
                                  const std::atomic<bool>* cancel = nullptr,
                                  const AgentDeltaSink& onDelta = nullptr,
-                                 const AgentApprovalSink& onApproval = nullptr);
+                                 const AgentApprovalSink& onApproval = nullptr,
+                                 const AgentTaskEventSink& onTaskEvent = nullptr);
 
     // 审批后续跑：把用户对上一轮 approval_required 的决定交回智能体。
     // 对应的 HTTP 入口不是 /chat 而是 /approve（地址从 endpoint.url 推出来）。
@@ -239,7 +252,8 @@ public:
                                         std::string* outThreadId = nullptr,
                                         const std::atomic<bool>* cancel = nullptr,
                                         const AgentDeltaSink& onDelta = nullptr,
-                                        const AgentApprovalSink& onApproval = nullptr);
+                                        const AgentApprovalSink& onApproval = nullptr,
+                                        const AgentTaskEventSink& onTaskEvent = nullptr);
 
     // 提交一轮「审批后续跑」。
     // 挂起表里找不到就返回 false —— 说明这条会话没有待审批的任务
@@ -288,7 +302,8 @@ private:
                                        std::string* outThreadId,
                                        const std::atomic<bool>* cancel,
                                        const AgentDeltaSink& onDelta,
-                                       const AgentApprovalSink& onApproval);
+                                       const AgentApprovalSink& onApproval,
+                                       const AgentTaskEventSink& onTaskEvent);
 
     // 从 /chat 的地址推 /approve 的地址。
     // 地址配的是完整的 chat 端点（如 http://127.0.0.1:8000/chat），

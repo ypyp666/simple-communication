@@ -47,6 +47,11 @@ namespace
         // 此刻就推给客户端的话，客户端可能先弹框、后收到本轮结束，
         // 两条包先后反了（和 ack 门是同一类问题）。
         AgentApprovalSink onApproval;
+
+        // 任务结果回调，可能为空。
+        // 与审批相反，这个必须当场回调：它带的是「去执行吧」，
+        // 晚一步用户就会先看见「已按计划下发」再看见动作发生。
+        AgentTaskEventSink onTaskEvent;
     };
 
     // 处理一整行 SSE。返回 false 表示要中止本次传输。
@@ -156,6 +161,30 @@ namespace
                 if (event.contains("detail"))
                 {
                     ctx.sse.approvalDetail = event["detail"].dump();
+                }
+            }
+            else if (name == "task_execute" || name == "task_rejected")
+            {
+                // 用户已经批准（或拒绝）完了，智能体把结论发回来。
+                //
+                // 服务器不自己执行：业务处理器（Repost / DeleteFriend / SetRemark …）
+                // 都是「校验登录态 + 执行 + 回包」三合一的，直接把它们拉进来跑，
+                // 会往用户连接上多推一条他没请求过的应答；拆开它们又得动现有代码。
+                // 所以这里只做一件事：把包原样转给客户端，由它走自己那个已经
+                // 带登录态的执行路径。凭据始终是用户自己的会话，不经服务器代持。
+                //
+                // command 不解析，原样搬运：具体有哪几个 action 是智能体和客户端
+                // 之间的约定，服务器插一脚只会变成第三个要同步修改的地方。
+                std::string command = "{}";
+                if (event.contains("command"))
+                {
+                    command = event["command"].dump();
+                }
+
+                if (ctx.onTaskEvent && !ctx.onTaskEvent(name, command))
+                {
+                    // 客户端断线：没人能执行了，继续收流只是白烧 worker
+                    return false;
                 }
             }
             // meta 只用来打日志，这里不需要
@@ -715,6 +744,59 @@ void agent_tcp::WorkerLoop()
             return sess->SendJson(rsp.dump() + "\n");
         };
 
+        // ===== 任务结果回调 =====
+        // 用户批准之后，智能体把「要执行什么」发回来。服务器只做搬运：
+        // 包原样转给客户端，由它走自己那条带登录态的执行路径。
+        //
+        // 为什么不在这里直接调 Repost/DeleteFriend：那些处理器是「校验登录 +
+        // 执行 + 回包」三合一的，拉进来跑会往用户连接上多推一条他没请求过的应答；
+        // 而拆开它们又要动现有代码。代持用户身份去执行更不该做——
+        // 凭据应当始终是用户自己的会话，服务器只转发，不替谁点确认。
+        const AgentTaskEventSink onTaskEvent = [&](const std::string& eventName,
+                                                   const std::string& payload) -> bool
+        {
+            if (!sess)
+            {
+                // 客户端已经下线：这条指令没有执行者了。挂起记录已经由
+                // SubmitApprove 消费掉，不会再补发，所以必须留一条日志，
+                // 否则「批了但没发出去」会变成查不到痕迹的悬案
+                std::cout << "[agent] 客户端已下线，无法下发任务 requestId="
+                          << task.requestId << " threadId=" << task.threadId
+                          << " event=" << eventName << std::endl;
+                return false;
+            }
+
+            nlohmann::json rsp;
+            // 两种结果分两个包类型，客户端按 type 分支即可，
+            // 不用再去读 command 里有没有内容
+            if (eventName == "task_execute")
+            {
+                rsp["type"] = "agent_task_execute";
+            }
+            else
+            {
+                rsp["type"] = "agent_task_rejected";
+            }
+
+            rsp["threadId"]  = task.threadId;
+            rsp["serverId"]  = task.messageId;
+            rsp["requestId"] = std::to_string(task.requestId);
+
+            // command 原样搬运：里面有哪几个 action、参数怎么命名，
+            // 是智能体和客户端之间的约定，服务器插一脚只会多出第三个要同步改的地方
+            rsp["command"] = nlohmann::json::parse(payload, nullptr, false);
+            if (rsp["command"].is_discarded())
+            {
+                rsp["command"] = payload;
+            }
+
+            std::cout << "[agent] 下发任务 requestId=" << task.requestId
+                      << " threadId=" << task.threadId
+                      << " event=" << eventName << std::endl;
+
+            return sess->SendJson(rsp.dump() + "\n");
+        };
+
         // 智能体可能回一个新的 thread_id（首次对话时），所以这里留一个可变副本
         std::string agentThreadId = agentThread;
 
@@ -765,12 +847,13 @@ void agent_tcp::WorkerLoop()
             answer = CallAgentApprove(task.agentThreadId, task.account, task.approved,
                                       task.approvalNote, approveEndpoint, error,
                                       &agentThreadId, task.cancelled.get(),
-                                      onDelta, onApproval);
+                                      onDelta, onApproval, onTaskEvent);
         }
         else
         {
             answer = CallAgent(task.prompt, agentThread, task.account, endpoint, error,
-                               &agentThreadId, task.cancelled.get(), onDelta, onApproval);
+                               &agentThreadId, task.cancelled.get(), onDelta, onApproval,
+                               onTaskEvent);
         }
 
         if (!agentThreadId.empty())
@@ -876,7 +959,8 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
                                  std::string* outThreadId,
                                  const std::atomic<bool>* cancel,
                                  const AgentDeltaSink& onDelta,
-                                 const AgentApprovalSink& onApproval)
+                                 const AgentApprovalSink& onApproval,
+                                 const AgentTaskEventSink& onTaskEvent)
 {
     outError.clear();
 
@@ -908,7 +992,7 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // 建 handle、设超时、边收边解析这一段和 /approve 完全一样，
     // 统一放在 PostAgentStream 里，这里只负责把 /chat 的请求体拼好。
     return PostAgentStream(endpoint.url, bodyText, endpoint, outError, outThreadId,
-                           cancel, onDelta, onApproval);
+                           cancel, onDelta, onApproval, onTaskEvent);
 }
 
 std::string agent_tcp::PostAgentStream(const std::string& url,
@@ -918,7 +1002,8 @@ std::string agent_tcp::PostAgentStream(const std::string& url,
                                        std::string* outThreadId,
                                        const std::atomic<bool>* cancel,
                                        const AgentDeltaSink& onDelta,
-                                       const AgentApprovalSink& onApproval)
+                                       const AgentApprovalSink& onApproval,
+                                       const AgentTaskEventSink& onTaskEvent)
 {
     outError.clear();
 
@@ -939,6 +1024,7 @@ std::string agent_tcp::PostAgentStream(const std::string& url,
     StreamContext ctx;
     ctx.onDelta = onDelta;
     ctx.onApproval = onApproval;
+    ctx.onTaskEvent = onTaskEvent;
     ctx.rawBody.reserve(4096);
 
     curl_slist* headers = nullptr;
@@ -1151,7 +1237,8 @@ std::string agent_tcp::CallAgentApprove(const std::string& agentThreadId,
                                         std::string* outThreadId,
                                         const std::atomic<bool>* cancel,
                                         const AgentDeltaSink& onDelta,
-                                        const AgentApprovalSink& onApproval)
+                                        const AgentApprovalSink& onApproval,
+                                        const AgentTaskEventSink& onTaskEvent)
 {
     outError.clear();
 
@@ -1173,7 +1260,7 @@ std::string agent_tcp::CallAgentApprove(const std::string& agentThreadId,
     const std::string bodyText = body.dump();
 
     return PostAgentStream(endpoint.url, bodyText, endpoint, outError, outThreadId,
-                           cancel, onDelta, onApproval);
+                           cancel, onDelta, onApproval, onTaskEvent);
 }
 
 bool agent_tcp::SubmitApprove(const std::string& account,
