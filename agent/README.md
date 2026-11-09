@@ -64,20 +64,30 @@
 {
   "message": "帮我把好友张三删掉",
   "thread_id": "会话标识，首次可为空，服务端会自动生成并通过 session 事件返回",
-  "images": ["base64 或 http(s) 图片地址，最多 4 张"]
+  "images": ["base64 或 http(s) 图片地址，最多 4 张"],
+  "user_id": 1001
 }
 ```
 
 `message` 与 `images` 至少提供一个，否则返回 422。
 
+**`user_id` 是当前登录用户的账号ID**，工具查库时要用（比如查好友必须知道「谁的」好友）。
+两条来源，显式的优先：
+
+1. 请求里带 `user_id`（推荐，契约清晰）；
+2. 没带就从 `thread_id` 解析 —— 约定 `thread_id = 会话id + "n" + user_id`，
+   取最后一个 `n` 右边、且必须是纯数字，否则当作没给。
+
+两条都拿不到时，需要用户身份的工具会返回一条明确的失败文案，**不会**随便猜一个 id 去查库。
+
 ### `POST /approve`
 对挂起的任务表态。
 
 ```json
-{ "thread_id": "http-1", "approved": true, "note": "确认删除" }
+{ "thread_id": "http-1", "approved": true, "note": "确认删除", "user_id": 1001 }
 ```
 
-`approved=false` 会终止该任务，不会执行任何操作。
+`approved=false` 会终止该任务，不会执行任何操作。`user_id` 规则同 `/chat`。
 
 ---
 
@@ -118,6 +128,43 @@ Qt 端新增一个可执行操作时，要同步做两件事：
 
 服务端不需要再改别的地方——`TASK_PROMPT` 里的动作清单是由 `list_task_actions()` 现算的。
 
+### 工具怎么挂
+
+工具全部写在 `tool.py`，靠文件末尾的三个注册表决定谁能用：
+
+| 注册表 | 使用者 | 现有内容 |
+| :-- | :-- | :-- |
+| `CHAT_TOOLS` | 聊天专家 | `web_searchquery` |
+| `VISION_TOOLS` | 图片理解专家 | 空 |
+| `TASK_TOOLS` | 任务专家（规划阶段） | `search_friend` |
+
+任务专家跑的是手动工具循环（`_plan_with_tools`），最多 `MAX_TOOL_ROUNDS` 轮，
+最后强制收敛成纯文本 JSON，所以工具再调用也不会把规划结果截断。
+
+### 好友消息恢复：三步链路
+
+目标是「帮某位好友恢复/转发消息」。拆成三个工具，而不是一个大工具：
+
+| 步骤 | 工具 | 状态 |
+| :-- | :-- | :-- |
+| 1 | `search_friend` 查好友账号 | 已实现 |
+| 2 | `get_chat_history` 拉聊天记录 | 待实现（`tool.py` 里有约定说明） |
+| 3 | `forward_message` 把内容交给服务器转发 | 待实现，有副作用、必须走审批 |
+
+拆开的理由：第 1、2 步只读，可以放心让模型自己调；第 3 步会真的把消息发出去，
+必须挂在 `examine_expert` 后面。合成一个大工具的话整条链都得审批，
+而且失败时只剩一句「失败」，分不清是没查到人还是没发出去。
+
+`search_friend` 走存储过程 `Agent_search_user(in_user_id, in_target_name, out retcode)`：
+
+- `retcode = 1` 查到，返回 `(target_id, user_name, mark)` 若干行；查到多人时
+  工具会把候选列出来并要求模型先问用户，**不允许模型自己挑一个**。
+- `retcode = 2` 没这个人。
+- `retcode = -1` SQL 出错。
+
+业务库账号只被授予存储过程的 `EXECUTE` 权限，**没有表的 `SELECT` 权限**，
+所以工具里一律走 `CALL`，不要改成自己拼 `SELECT`。
+
 ---
 
 ## 4. Qt 客户端接入要点
@@ -146,6 +193,10 @@ Qt 端新增一个可执行操作时，要同步做两件事：
 | `DEEPSEEK_MODEL` | 主模型，默认 `deepseek-flash` |
 | `DEEPSEEK_VISION_MODEL` | 图片理解用的模型，留空则复用主模型 |
 | `AGENT_HOST` / `AGENT_PORT` | 监听地址，默认 `127.0.0.1:8000`（只本机可连） |
+| `AGENT_DB_HOST` / `AGENT_DB_PORT` | 业务库地址，默认 `192.168.20.128:3306` |
+| `AGENT_DB_USER` / `AGENT_DB_PASSWORD` | 业务库账号，**只需要存储过程 EXECUTE 权限**，必填 |
+| `AGENT_DB_NAME` | 业务库名，默认 `User` |
+| `AGENT_DB_CONNECT_TIMEOUT` | 连库超时秒数，默认 5，别设太大否则会卡住对话 |
 
 > 注意：本网关**不支持** `response_format=json_schema`，因此路由与任务规划都是
 > 「纯文本输出 + 本地解析」，不要改回 `with_structured_output`。

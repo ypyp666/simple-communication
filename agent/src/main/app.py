@@ -32,12 +32,16 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None
     # 图片：支持 https URL、data:image/... 或裸 base64
     images: list[str] = Field(default_factory=list, max_length=4)
+    # 当前登录用户的账号ID。工具查库时需要用，模型猜不出来。
+    # 不传也不报错：服务端会从 thread_id（会话id + "n" + user_id）里解析。
+    user_id: int | None = None
 
 
 class ApproveRequest(BaseModel):
     thread_id: str
     approved: bool
     note: str = ""
+    user_id: int | None = None
 
 
 """
@@ -115,7 +119,7 @@ async def create_chat(request: ChatRequest) -> StreamingResponse:
             # 这里套一跳心跳：模型思考、联网搜索期间一个 token 都不会有，
             # 没有心跳的话 C++ 侧的低速超时会把这种「正常的安静」判成卡死。
             async for item in with_keepalive(
-                chat_stream(thread_id, request.message, request.images)
+                chat_stream(thread_id, request.message, request.images, request.user_id)
             ):
                 if item is None:
                     # SSE 注释行：规范规定客户端必须忽略，只用来「表示这条连接还活着」。
@@ -137,7 +141,8 @@ async def approve(request: ApproveRequest) -> StreamingResponse:
         yield sse({"event": "session", "thread_id": request.thread_id})
         try:
             async for item in with_keepalive(
-                resume_stream(request.thread_id, request.approved, request.note)
+                resume_stream(request.thread_id, request.approved, request.note,
+                              request.user_id)
             ):
                 if item is None:
                     yield ": ping\n\n"

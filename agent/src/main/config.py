@@ -27,6 +27,28 @@ DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL") or DEEPSEEK_MODEL
 HOST = os.getenv("AGENT_HOST", "127.0.0.1")
 PORT = int(os.getenv("AGENT_PORT", "8000"))
 
+# ---------------------------------------------------------------- 业务数据库
+# 智能体要用业务库里的数据才能干活（查好友、拉聊天记录等）。
+# 这些账号只被授予了 EXECUTE 存储过程的权限，没有直接 SELECT 表，
+# 所以工具里一律走 CALL，不要自己拼 SELECT。
+DB_HOST = os.getenv("AGENT_DB_HOST", "192.168.20.128")
+DB_PORT = int(os.getenv("AGENT_DB_PORT", "3306"))
+DB_USER = os.getenv("AGENT_DB_USER", "dbuser")
+DB_PASSWORD = os.getenv("AGENT_DB_PASSWORD", "")
+DB_NAME = os.getenv("AGENT_DB_NAME", "User")
+# 连不上库时不要卡住整个对话流，超时给短一点
+DB_CONNECT_TIMEOUT = int(os.getenv("AGENT_DB_CONNECT_TIMEOUT", "5"))
+
+
+def db_is_configured() -> bool:
+    """工具开跑前先问一句：库的账号配全了吗。
+
+    没配就返回明确的失败文案，而不是抛异常把整条对话流打断。
+    """
+    if not DB_HOST or not DB_USER or not DB_PASSWORD or not DB_NAME:
+        return False
+    return True
+
 
 def require(name: str, value: str | None) -> str:
     if not value:

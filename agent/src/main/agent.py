@@ -29,7 +29,8 @@ import json
 import aiosqlite
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -47,6 +48,7 @@ from main.config import (
 )
 from main.tool import (
     CHAT_TOOLS,
+    TASK_TOOLS,
     VISION_TOOLS,
     list_task_actions,
     normalize_task_command,
@@ -126,6 +128,13 @@ TASK_PROMPT = (
     "- 高风险或不可逆操作（删除、清空、批量修改）标记 risk=\"high\"。\n"
     "\n可用动作只有下面这些，不要自己编造新的：\n"
     f"{list_task_actions()}\n"
+    "\n你手上还有一个只读工具 search_friend：\n"
+    "- 用户只说了好友的名字或备注（比如「张三」「老李」），而动作需要真实账号时，先调它查。\n"
+    "- 查回来的账号ID放进 command.params，不要再把名字当账号用。\n"
+    "- 查到多个人时不要自己挑，把候选写进 summary 让用户确认，steps 留空。\n"
+    "- 查不到就如实说查不到，不要编一个账号出来，并且 command 必须是空对象 {}。\n"
+    "- 只要对象还没确定（没查到、或查到多个人），command 就留空 {}，不要给半成品指令。\n"
+    "- 工具是只读的，可以放心调；真正的操作仍然只输出指令，由客户端执行。\n"
     "\n输出要求：只输出一个 JSON 对象，不要输出解释、不要加 markdown 代码块，字段如下：\n"
     '{"summary": "向用户确认这次要做什么，口语化一句话",\n'
     ' "steps": ["第一步", "第二步"],\n'
@@ -167,7 +176,19 @@ imagine_expert = create_agent(
 # 注意：本网关不支持 response_format=json_schema（with_structured_output 会直接 400），
 # 所以结构化信息统一走「纯文本输出 + 自己解析」这条最稳的路。
 supervisor_llm = model
-task_planner = model
+
+# 任务专家要能自己调只读工具（比如查好友账号），才能把用户嘴里的名字
+# 换成真实的账号ID。bind_tools 只是把工具清单挂给模型，真正的执行
+# 由下面的 task_expert_node 手动控制，方便限制轮数、也方便拿到 config。
+task_planner = model.bind_tools(TASK_TOOLS)
+
+# 工具名 -> 工具对象，执行模型发起的工具调用时按名字查
+TASK_TOOL_MAP = {}
+for _tool in TASK_TOOLS:
+    TASK_TOOL_MAP[_tool.name] = _tool
+
+# 规划阶段最多允许模型连续调几轮工具，防止它反复查同一个名字陷入死循环
+MAX_TOOL_ROUNDS = 3
 
 
 # ---------------------------------------------------------------- 小工具
@@ -341,7 +362,48 @@ def make_expert_node(agent, name: str):
     return node
 
 
-async def task_expert_node(state: AgentState) -> dict:
+async def _plan_with_tools(history, config):
+    """让模型做规划，期间允许它自己调只读工具。
+
+    做成小循环而不是交给 create_agent，是为了三件事：
+    1. 限制轮数，防止模型反复查同一个名字打转；
+    2. 工具执行时的 config 由我们自己传，user_id 才能带到库里；
+    3. 最后一定要收敛成纯文本 JSON，不能被工具调用半路截断。
+    """
+    messages = list(history)
+
+    for _round in range(MAX_TOOL_ROUNDS):
+        reply = await task_planner.ainvoke(messages, config)
+        tool_calls = getattr(reply, "tool_calls", None)
+        if not tool_calls:
+            return reply
+
+        messages.append(reply)
+        for call in tool_calls:
+            name = call.get("name")
+            args = call.get("args")
+            call_id = call.get("id")
+            if not isinstance(args, dict):
+                args = {}
+
+            target = TASK_TOOL_MAP.get(name)
+            if target is None:
+                content = f"没有名为 {name} 的工具，不要再用它。"
+            else:
+                try:
+                    content = await target.ainvoke(args, config)
+                except Exception as exc:  # noqa: BLE001
+                    content = f"工具 {name} 执行失败：{exc}"
+                if not isinstance(content, str):
+                    content = str(content)
+
+            messages.append(ToolMessage(content=content, tool_call_id=call_id))
+
+    # 轮数用完还没收敛，最后强制要一次纯文本，不给它再调工具的机会
+    return await model.ainvoke(messages)
+
+
+async def task_expert_node(state: AgentState, config) -> dict:
     """任务专家，两段式：先规划，批准后才产出可执行指令。"""
     if state.get("approval_status") == "approved":
         # 第二段：用户已批准。真正的副作用由客户端收到 task_execute 后执行，
@@ -366,7 +428,7 @@ async def task_expert_node(state: AgentState) -> dict:
             history.append(msg)
 
     try:
-        reply = await task_planner.ainvoke(history)
+        reply = await _plan_with_tools(history, config)
         raw = _text_of(reply.content)
         plan = _extract_json(raw)
 
@@ -400,10 +462,20 @@ async def task_expert_node(state: AgentState) -> dict:
 
 
 def route_after_task(state: AgentState) -> str:
-    """未表态就送去审批；已批准（执行完）或已拒绝都要去做结果播报。"""
+    """未表态就送去审批；已批准（执行完）或已拒绝都要去做结果播报。
+
+    还有一种情况：规划阶段根本没收敛出可执行指令（比如查不到好友、或者
+    好友同名需要用户先确认）。这时候没什么可审批的，硬弹审批框只会让用户
+    对一个空任务点「同意」，所以直接去播报，把追问的话交给用户。
+    """
     status = state.get("approval_status")
     if status == "approved" or status == "rejected":
         return "report_expert"
+
+    command = state.get("task_command")
+    if not command:
+        return "report_expert"
+
     return "examine_expert"
 
 
@@ -620,12 +692,21 @@ ROUTE_TO_NODE = {
 }
 
 
-def _config_for(thread_id: str) -> dict:
+def _config_for(thread_id: str, user_id=None) -> dict:
     """每次执行图都必须带的两个配置：
 - `thread_id`：Checkpoint 的会话标识，同一个 id 共享状态、中断可恢复。
-- `recursion_limit`：递归深度限制，防止图死循环（比如任务→审批→任务的循环）把服务跑挂。"""
+- `recursion_limit`：递归深度限制，防止图死循环（比如任务→审批→任务的循环）把服务跑挂。
+
+额外的 `user_id` 不属于 LangGraph，是我们自己塞进去的：
+工具里需要知道「当前登录用户是谁」才能查库，而模型是不可能知道这个值的，
+所以从请求一路带到这里，工具再用 resolve_own_id 取出来。
+"""
+    configurable = {"thread_id": thread_id}
+    if user_id is not None:
+        configurable["user_id"] = user_id
+
     return {
-        "configurable": {"thread_id": thread_id},
+        "configurable": configurable,
         "recursion_limit": MAX_RECURSION,
     }
 
@@ -740,13 +821,14 @@ def build_human_content(message: str, images: list[str] | None = None):
     return parts
 
 
-async def chat_stream(thread_id: str, user_message: str, images: list[str] | None = None):#新消息入口 `chat_stream`
+async def chat_stream(thread_id: str, user_message: str, images: list[str] | None = None,
+                      user_id: int | None = None):#新消息入口 `chat_stream`
     """处理一条新消息，逐 token 产出 SSE 事件字典。
 
     事件类型：token / approval_required / task_execute / task_rejected / done
     """
     graph = await get_supervisor_graph()
-    config = _config_for(thread_id)
+    config = _config_for(thread_id, user_id)
 # 1. 组装用户消息
     content = build_human_content(user_message, images)
     payload = {"messages": [HumanMessage(content=content)]}
@@ -775,13 +857,14 @@ async def chat_stream(thread_id: str, user_message: str, images: list[str] | Non
     yield {"event": "done", "agent": agent_name}
 
 
-async def resume_stream(thread_id: str, approved: bool, note: str = ""):
+async def resume_stream(thread_id: str, approved: bool, note: str = "",
+                        user_id: int | None = None):
     """审批后续跑：用 Command(resume=...) 恢复被 interrupt 挂起的会话。
     **前置校验**：先读状态，确认这个会话确实停在审批点，避免重复提交、无效调用。
     **`Command(resume=...)`**：LangGraph 的标准恢复方式，把审批结果传给 `interrupt()` 的返回值，图就会从挂起的位置继续往下走。
      **复用 `_run_graph`**：恢复执行的流式输出、收尾事件逻辑和新消息完全一致，不用写两套。"""
     graph = await get_supervisor_graph()
-    config = _config_for(thread_id)
+    config = _config_for(thread_id, user_id)
 
 # 1. 前置校验：有没有待审批的任务
     snapshot = await graph.aget_state(config)
