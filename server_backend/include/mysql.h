@@ -185,6 +185,23 @@ public:
     //结果集列顺序：thread_id, thread_name（过程内按 thread_id 升序输出）
     bool callLoadThreads(uint32_t userId, std::vector<AgentThreadInfo>& outThreads, int& retCode);
 
+    // ===== 智能体消息落库相关数据库过程 =====
+    // 两步走：先建空行拿到自增主键，用户发提问时再写入问题正文。
+    // 为什么要拆成两步：客户端会先要一个消息ID、本地落库成功之后才发 agent_request，
+    // 而提问正文要等 agent_request 才带过来。一条 INSERT 做不完，只能占位 + 写入。
+
+    //对外接口28：创建智能体消息占位行（过程Create_agent_message）
+    //过程内部 INSERT agent_message(thread_id, user_id, user_message='', datetime)
+    //retcode：1=创建成功，-1=过程内部异常
+    //成功时 outMessageId 带回自增主键（agent_message.message_id）
+    bool callCreateAgentMessage(uint32_t threadId, uint32_t userId,
+                                uint32_t& outMessageId, int& retCode);
+
+    //对外接口29：把用户提问写入消息行（过程Insert_agent_message）
+    //userMessage 是用户发的提问正文，属于用户可见内容，进SQL前必须转义
+    //retcode：1=写入成功，2=消息不存在（占位行没建成功或已被删），-1=过程内部异常
+    bool callInsertAgentMessage(uint32_t messageId, const std::string& userMessage, int& retCode);
+
     //注意：本类不做任何直接SELECT。数据库账号dbuser只有EXECUTE权限，
     //直接查表会报ERROR 1142，所有读操作必须走存储过程，因此没有"按账号查昵称"的接口。
 

@@ -959,9 +959,9 @@ std::string HandleExamine(const json& req, mysqlconn&, SessionPtr session)
 // 而客户端心跳是 3 秒一发、等 1 秒、连续超 3 次就断线重连，
 // 把调用写在返回路径上，用户一定会看到"发了条消息然后就掉线"。
 //
-// 所以这里只做三件事：校验 -> 入队 -> 立刻回 ack，
+// 所以这里只做三件事：校验 -> 用户提问入库 -> 入队并立刻回 ack，
 // 真正的答案稍后由 worker 以 agent_response 推送回同一个连接。
-std::string HandleAgentRequest(const json& req, mysqlconn&, SessionPtr session)
+std::string HandleAgentRequest(const json& req, mysqlconn& conn, SessionPtr session)
 {
     if (!IsLoggedIn(session))
     {
@@ -1027,6 +1027,40 @@ std::string HandleAgentRequest(const json& req, mysqlconn&, SessionPtr session)
         return replyFail(413, "问题内容过长");
     }
 
+    // ===== 用户提问入库 =====
+    // 客户端的两步流程：
+    //   1) 先发 agent_message_create，服务器调 Create_agent_message 建一行
+    //      （thread_id/user_id 已填，user_message 为空）并把自增主键回给客户端；
+    //   2) 客户端拿这个ID 本地落库占坑，再带着它 + 问题正文发 agent_request。
+    // 所以这一步要做的是把问题正文回填进那一行（过程 Insert_agent_message）。
+    //
+    // 智能体的回答不入库：服务器不做消息持久化，回答只实时推给客户端，
+    // 由客户端自己存本地库。同一段文字存两遍必然会有对不上的一天。
+    //
+    // 必须放在 Submit 之前：worker 一旦跑起来就可能开始回包，
+    // 而入库是"这条消息存在"的唯一凭据，比任何回包都早算数。
+    uint32_t numericMessageId = 0;
+    if (!ParseUint32(messageId, numericMessageId))
+    {
+        return replyFail(400, "消息ID超出范围");
+    }
+
+    int persistCode = -1;
+    if (!conn.callInsertAgentMessage(numericMessageId, prompt, persistCode))
+    {
+        return replyFail(500, "服务器异常，保存消息失败");
+    }
+    // retCode=2 表示占位行不存在：客户端跳过了 agent_message_create，
+    // 或者会话被删时连带清了消息。属于业务性缺失，不算服务器故障
+    if (persistCode == 2)
+    {
+        return replyFail(404, "消息不存在，请重新发起提问");
+    }
+    if (persistCode != 1)
+    {
+        return replyFail(500, "服务器异常，保存消息失败");
+    }
+
     AgentTask task;
     // 账号只认登录会话，请求里那个 userId 一概不看：
     // 否则改个包就能拿别人的身份往别人的会话里塞消息
@@ -1090,7 +1124,12 @@ std::string HandleAgentRequest(const json& req, mysqlconn&, SessionPtr session)
 // 提问第一步：向服务器申请一条消息ID。
 // 客户端拿到 agent_message_created 里的 messageId 才本地落库，再带着它发 agent_request，
 // 所以这个包失败时客户端不会继续提问——success=false 必须给出原因。
-std::string HandleAgentMessageCreate(const json& req, mysqlconn&, SessionPtr session)
+//
+// 这里的 messageId 必须来自数据库自增主键（过程 Create_agent_message），
+// 不能像以前那样在内存里造一个"时间戳+序号"：
+// 客户端和服务器要靠同一个号对上同一行消息，服务器侧凭空造号就没有那一行，
+// 用户提问和 AI 回答也就无处可写 —— 表现就是消息永远不入库。
+std::string HandleAgentMessageCreate(const json& req, mysqlconn& conn, SessionPtr session)
 {
     // 这个包里它叫 sessionId，和 agent_request 里的 threadId 是同一个东西
     const std::string sessionId = req.value<std::string>("sessionId", "");
@@ -1127,17 +1166,64 @@ std::string HandleAgentMessageCreate(const json& req, mysqlconn&, SessionPtr ses
         return rsp.dump();
     }
 
-    // 这里不查库：会话ID 是客户端生成的，服务器只负责存储，
+    // 这里不查会话表：会话ID 是客户端生成的，服务器只负责存储，
     // "会话还没建就先提问"是允许的，不该在这一步拦
-    const std::string messageId = agent_tcp::AllocateMessageId();
+    //
+    // 但消息本身必须真的建行：客户端接下来会拿这个ID本地落库并开始对话，
+    // 服务器这边没有对应的行，用户提问就永远落不了库（正文无处回填）。
+    uint32_t threadId = 0;
+    if (!ParseUint32(sessionId, threadId))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 400;
+        rsp["message"]   = "会话ID超出范围";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 账号只认登录会话，请求里的 userId 一概不看：否则改个包就能往别人账号下建消息
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 401;
+        rsp["message"]   = "当前登录状态异常请重新登录";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 失败也要回显 sessionId：客户端靠它匹配在飞的申请，缺了就整个包丢弃
+    uint32_t messageId = 0;
+    int retCode = -1;
+    if (!conn.callCreateAgentMessage(threadId, userId, messageId, retCode))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 500;
+        rsp["message"]   = "服务器异常，创建消息失败";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+    if (retCode != 1 || messageId == 0)
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 500;
+        rsp["message"]   = "服务器异常，创建消息失败";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
 
     rsp["sessionId"] = sessionId;
-    rsp["messageId"] = messageId;
+    // 协议层是字符串，但值就是数据库的自增主键，两边直接对得上
+    rsp["messageId"] = std::to_string(messageId);
     rsp["code"]      = 0;
     rsp["message"]   = "";
     rsp["success"]   = true;
 
-    std::cout << "[agent] 分配消息ID account=" << session->account
+    std::cout << "[agent] 创建消息 account=" << session->account
               << " sessionId=" << sessionId
               << " messageId=" << messageId << std::endl;
     return rsp.dump();

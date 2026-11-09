@@ -314,7 +314,7 @@ bool mysqlconn::callMessage(nlohmann::json& rsp, uint32_t& outMessageId)
     escaped_sendTime.resize(sendTimeLength);
 
     // 拼接调用存储过程的SQL：PROCEDURE只能用CALL调用，字符串字段用单引号包裹
-    std::string sql = "CALL Message('" + escaped_content + "'"
+    std::string sql = "CALL AddMessage('" + escaped_content + "'"
                     + ", " + std::to_string(sendIdValue)
                     + ", " + std::to_string(targetIdValue)
                     + ", '" + escaped_sendTime + "', @out_msg_id)";
@@ -1716,6 +1716,116 @@ bool mysqlconn::callLoadThreads(uint32_t userId, std::vector<AgentThreadInfo>& o
 
     std::cout << "[Load_thread] userId=" << userId
               << ", 会话数=" << outThreads.size()
+              << ", retCode=" << retCode << std::endl;
+    return true;
+}
+
+// ============================================================================
+// 智能体消息落库：创建占位行 / 回填回答正文
+// ============================================================================
+
+// 第一步：建一条正文为空的占位行，把自增主键带回来。
+// 这一步必须真的走库，不能像以前那样在内存里造一个"时间戳+序号"：
+// 客户端拿这个ID当主键落本地库，服务器这边也要有一行能对上，
+// 否则两边各有一套自己的号，AI 消息永远落不了库（正文无处可写）。
+bool mysqlconn::callCreateAgentMessage(uint32_t threadId, uint32_t userId,
+                                       uint32_t& outMessageId, int& retCode)
+{
+    outMessageId = 0;
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    // 会话ID、账号都是 INT，0 在库里当无效值用，传进去只会建出一行脏数据
+    if (threadId == 0 || userId == 0)
+    {
+        std::cerr << "创建智能体消息失败：参数无效" << std::endl;
+        return false;
+    }
+
+    // 过程签名：Create_agent_message(IN in_thread_id INT, IN in_user_id INT,
+    //                                OUT out_message_id INT, OUT retcode INT)
+    const std::string sql = "CALL Create_agent_message(" + std::to_string(threadId)
+                          + ", " + std::to_string(userId)
+                          + ", @out_message_id, @retcode)";
+    std::cout << "[Create_agent_message] 执行SQL: " << sql << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用创建智能体消息过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[Create_agent_message] 失败SQL: " << sql << std::endl;
+        return false;
+    }
+
+    // 过程只写表不回吐结果集，排空后读OUT参数
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    // retcode=1 才是成功；其余情况过程自己已经回滚，没有新行可返回
+    if (retCode != 1)
+    {
+        std::cout << "[Create_agent_message] 过程返回失败 threadId=" << threadId
+                  << ", userId=" << userId
+                  << ", retCode=" << retCode << std::endl;
+        return true;
+    }
+
+    int messageId = 0;
+    if (!fetchOutParameter("@out_message_id", messageId) || messageId <= 0)
+    {
+        std::cerr << "[Create_agent_message] 自增主键无效" << std::endl;
+        return false;
+    }
+
+    outMessageId = static_cast<uint32_t>(messageId);
+    std::cout << "[Create_agent_message] threadId=" << threadId
+              << ", userId=" << userId
+              << ", messageId=" << outMessageId << std::endl;
+    return true;
+}
+
+// 第二步：回答收完后把正文回填到占位行。
+// 只在 worker 线程调用，且每轮问答只调一次（见 agent_tcp::WorkerLoop）。
+bool mysqlconn::callInsertAgentMessage(uint32_t messageId, const std::string& userMessage, int& retCode)
+{
+    retCode = -1;
+    if (!mysql)
+    {
+        std::cerr << "数据库未连接" << std::endl;
+        return false;
+    }
+    if (messageId == 0)
+    {
+        std::cerr << "写入用户提问失败：消息ID无效" << std::endl;
+        return false;
+    }
+
+    // 过程签名：Insert_agent_message(IN in_message_id INT, IN in_user_message TEXT,
+    //                                OUT retcode INT)
+    const std::string sql = "CALL Insert_agent_message(" + std::to_string(messageId)
+                          + ", '" + EscapeSqlText(mysql, userMessage) + "', @retcode)";
+
+    // 提问正文可能很长，日志里只打长度，别把整段内容刷到终端
+    std::cout << "[Insert_agent_message] messageId=" << messageId
+              << ", 提问字节数=" << userMessage.size() << std::endl;
+
+    if (mysql_query(mysql, sql.c_str()) != 0)
+    {
+        std::cerr << "调用写入用户提问过程失败: " << mysql_error(mysql) << std::endl;
+        std::cerr << "[Insert_agent_message] 失败SQL长度=" << sql.size() << std::endl;
+        return false;
+    }
+
+    if (!drainCallResults() || !fetchOutParameter("@retcode", retCode))
+    {
+        return false;
+    }
+
+    std::cout << "[Insert_agent_message] messageId=" << messageId
               << ", retCode=" << retCode << std::endl;
     return true;
 }

@@ -36,11 +36,13 @@ struct AgentTask
     uint64_t    requestId = 0;      // 服务器内部编号，只用于日志排查（客户端ID一律由客户端生成）
     std::string account;            // 发起人账号，打日志用，也是取消键的一半
     std::string threadId;           // 客户端生成的会话ID，原样回显；也是取消键的另一半
-    // 正式消息ID：由服务器在 agent_message_create 里分配，客户端先本地落库、
-    // 再带着它发 agent_request。服务器只负责原样带回（agent_response 里的 serverId），
-    // 不参与任何判断，也不解析它的内容。
-    // 为什么不让客户端自己生成：客户端的ID没法保证跨设备/重装后不重复，
-    // 服务器分配才能保证全局单调，万一以后要做分页或去重，才有依据。
+    // 正式消息ID：由服务器在 agent_message_create 里调 Create_agent_message 分配，
+    // 就是 agent_message.message_id（自增主键）。客户端先按它本地落库，
+    // 再带着它发 agent_request；服务器收到 agent_request 时按这个号写入用户提问。
+    // 为什么不能让客户端自己生成、也不能在内存里造号：
+    //   本地库和服务器库要靠这一个号对上同一行，两边各生成一套就永远对不上，
+    //   用户提问也就没法落库（没有那一行可写）。
+    // 智能体的回答不入库：服务器不做消息持久化，回答只实时推给客户端。
     std::string messageId;
     std::string prompt;             // 用户问题
     std::weak_ptr<Session> session; // 结果往哪儿推
@@ -131,14 +133,6 @@ public:
     //   否则任何人拿一个会话ID就能打断别人的回答。
     bool Cancel(const std::string& account, const std::string& threadId);
 
-    // 分配一个正式消息ID（对应 agent_message_create）。
-    // 形如“13 位毫秒时间戳 + 3 位序号”，长度固定 16 位、全字符：
-    //   客户端要拿它当主键落库，服务器要拿它上线排序、排查日志，两家都靠它对应同一行。
-    // 用时间戳前缀而不是纯自增，是为了让ID本身带上“先后关系”（会话内直接按字符串排就是消息顺序），
-    // 重启后也不会从0重来、和旧消息撞号。
-    // 后面拼序号是为了防同一毫秒并发分配时重复。
-    static std::string AllocateMessageId();
-
     // ===== 智能体侧 thread_id 的拼装与还原 =====
     // 分隔符就一个字母 'n'。为什么敢用这么普通的字符：
     //   两边的值（会话ID、账号）都是纯数字，数字串里永远不会出现 'n'，
@@ -161,10 +155,12 @@ public:
     // 真正和智能体通信的入口：一次 HTTP POST + 读完整个 SSE 响应。
     // 成功返回拼好的完整回答；失败返回空串，失败原因写进 outError。
     //
-    // 注意字段映射：智能体服务（FastAPI）的请求体是 {"message","thread_id"}，
+    // 注意字段映射：智能体服务（FastAPI）的请求体是 {"message","user_id","thread_id"}，
     // 其中 thread_id 是 langchain 那边的**全局唯一**线程标识，为空则由智能体新开一个。
-    // ❗所以本参数不能直接传客户端的会话ID，必须传 MakeAgentThreadId() 拼好的值，
+    // ❗所以 threadId 参数不能直接传客户端的会话ID，必须传 MakeAgentThreadId() 拼好的值，
     //   否则不同用户的同名会话会在智能体那边变成同一条对话线。
+    // userId 是当前登录账号（只取自登录会话），明着带一份给智能体做个性化用，
+    //   省得它去猜 threadId 里那个分隔符的语义。
     // 若 outThreadId 非空，会把智能体回传的 thread_id 带出来（做上下文续接时要用）。
     //
     // cancel 非空时注册 curl 进度回调：回调一旦读到取消位就返回非0，
@@ -176,6 +172,7 @@ public:
     // 返回值仍然把完整回答拼好返回，方便日志和"非流式接口"的兜底。
     static std::string CallAgent(const std::string& prompt,
                                  const std::string& threadId,
+                                 const std::string& userId,
                                  const AgentEndpoint& endpoint,
                                  std::string& outError,
                                  std::string* outThreadId = nullptr,

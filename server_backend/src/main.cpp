@@ -54,6 +54,7 @@ int main() {
     }
 
     agent_tcp::Instance().Configure(endpoint);
+
     agent_tcp::Instance().Start();
 
     // Start 内部阻塞在 accept 循环里，只有监听起不来（端口被占、fd 耗尽等）才会立刻返回 false。

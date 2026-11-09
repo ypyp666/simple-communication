@@ -199,6 +199,30 @@ namespace
         }
         return body;
     }
+
+    // 把协议里的字符串消息ID转成库里的 INT 主键。
+    // agent_request 已经校验过纯数字，这里只需要处理溢出这一种失败
+    bool ParseMessageId(const std::string& text, uint32_t& out)
+    {
+        if (text.empty())
+        {
+            return false;
+        }
+        try
+        {
+            const unsigned long long parsed = std::stoull(text);
+            if (parsed == 0 || parsed > 0xFFFFFFFFULL)
+            {
+                return false;
+            }
+            out = static_cast<uint32_t>(parsed);
+            return true;
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
 }
 
 agent_tcp& agent_tcp::Instance()
@@ -349,26 +373,6 @@ bool agent_tcp::Cancel(const std::string& account, const std::string& threadId)
     std::cout << "[agent] 已置取消位：account=" << account
               << " threadId=" << threadId << std::endl;
     return true;
-}
-
-std::string agent_tcp::AllocateMessageId()
-{
-    // 序号只在同毫秒内起作用，取模 1000 保证不会把位宽拉长；
-    // 真凑到单毫秒 1000 条以上会回绕撞号，但那种量级已经远超当前单机承载
-    static std::atomic<uint64_t> seq{0};
-
-    const auto millis = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-
-    const uint64_t tail = seq.fetch_add(1, std::memory_order_relaxed) % 1000;
-
-    // 序号补零对齐：不补零的话 "1699999999999" + "7" 和 "1699999999999" + "70"
-    // 只差一位，排序会把 7 排到 70 后面
-    std::string id = std::to_string(millis);
-    id += std::to_string(1000 + tail).substr(1);   // 1000+tail 必为 4 位，取后 3 位就是补零
-
-    return id;
 }
 
 std::string agent_tcp::MakeAgentThreadId(const std::string& threadId, const std::string& userId)
@@ -619,7 +623,7 @@ void agent_tcp::WorkerLoop()
         }
         else
         {
-            answer = CallAgent(task.prompt, agentThread, endpoint, error,
+            answer = CallAgent(task.prompt, agentThread, task.account, endpoint, error,
                                &agentThreadId, task.cancelled.get(), onDelta);
         }
 
@@ -647,6 +651,12 @@ void agent_tcp::WorkerLoop()
                           << agentThreadId << std::endl;
             }
         }
+
+        // ===== 回答不入库 =====
+        // 服务器不做消息持久化：用户提问在 agent_request 处理时就已经写进 agent_message 了，
+        // 智能体的回答只实时推给客户端，由客户端自己落本地库。
+        // 以前这里还有一段“把正文回填进占位行”的逻辑，那是把两边的职责搞反了：
+        // 服务器写回答、客户端写回答，同一段文字存两遍，还多了一次必然对不上的机会。
 
         // 被 agent_stop 打断的那一轮不再回包：停止回执已由 Handler 发过，
         // 再推一条迟到的答案会把用户已经停掉的气泡又改回去
@@ -701,6 +711,7 @@ void agent_tcp::WorkerLoop()
 
 std::string agent_tcp::CallAgent(const std::string& prompt,
                                  const std::string& threadId,
+                                 const std::string& userId,
                                  const AgentEndpoint& endpoint,
                                  std::string& outError,
                                  std::string* outThreadId,
@@ -716,6 +727,13 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // thread_id 为空要给 null，不能给空字符串 —— 有些框架会把 "" 当成合法 id 去查历史。
     nlohmann::json body;
     body["message"] = prompt;
+
+    // 当前用户ID 明着带一份：thread_id 里虽然已经拼了账号，但那是两段粘在一起的
+    // 复合键，智能体得自己拆才知道「谁在问」。单独给一个 user_id 字段，
+    // 智能体侧直接拿去查偏好、做个性化，不用猜分隔符。
+    // 值只取自登录会话（task.account），客户端传的 userId 一概不采信。
+    body["user_id"] = userId;
+
     if (threadId.empty())
     {
         body["thread_id"] = nullptr;
