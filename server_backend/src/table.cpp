@@ -118,6 +118,8 @@ CmdType JsonToCmdType(std::string type) {
     if (type=="agent_sessions_pull") return CmdType::AgentSessionsList;
     // 旧名字保底：早期客户端发的是 agent_sessions_list，别让它们掉进 Unknown
     if (type=="agent_sessions_list") return CmdType::AgentSessionsList;
+    // 审批回执：客户端对 agent_approval_required 做了决定，服务器据此续跑那一轮
+    if (type=="agent_approve") return CmdType::AgentApprove;
 
     return CmdType::Unknown;
 }
@@ -1286,6 +1288,98 @@ std::string HandleAgentStop(const json& req, mysqlconn&, SessionPtr session)
     std::cout << "[agent_stop] account=" << session->account
               << " threadId=" << threadId
               << " 结果=" << (taken ? "已中止，worker 不再推送" : "无可中止任务") << std::endl;
+    return "";
+}
+
+// 审批回执：客户端对 agent_approval_required 做了决定（同意 / 拒绝），服务器据此续跑那一轮。
+//
+// 和 agent_stop 不同，这一包**必须有回执**：客户端点完按钮要立刻解锁界面，
+// 而续跑的执行段可能几百毫秒之后才开始吐字，中间没有别的包可等。
+// 所以失败也回一条 agent_approve_ack{success=false, message}，让客户端能正常收尾。
+//
+// 真正的“把决定发回智能体”这段不在这里：按项目分层，table 只做参数校验和组包，
+// 提交动作交给 agent_tcp（它本来就是干这个的），和 agent_request 保持一个口径。
+std::string HandleAgentApprove(const json& req, mysqlconn&, SessionPtr session)
+{
+    const std::string threadId  = req.value<std::string>("threadId", "");
+    const std::string messageId = req.value<std::string>("serverId", "");
+    const std::string note      = req.value<std::string>("note", "");
+    const bool        approved  = req.value<bool>("approved", false);
+
+    // 失败回执统一走这里：客户端一定要收到一条 ack 才能解锁，不能默默了事
+    const auto failAck = [&](int code, const std::string& message) -> std::string
+    {
+        json ack;
+        ack["type"]     = "agent_approve_ack";
+        ack["threadId"] = threadId;
+        ack["serverId"] = messageId;
+        ack["code"]     = code;
+        ack["message"]  = message;
+        ack["success"]  = false;
+        return ack.dump();
+    };
+
+    if (!IsLoggedIn(session))
+    {
+        return failAck(401, "登录已失效，请重新登录");
+    }
+    if (threadId.empty())
+    {
+        return failAck(400, "会话ID不能为空");
+    }
+    // 拒绝理由要进日志和提示，长度按“字”卡，和 prompt 一个口径
+    if (Utf8Length(note) > 500)
+    {
+        return failAck(413, "审批说明过长");
+    }
+
+    // ===== ack 门 =====
+    // 和 agent_request 完全一样的理由：SubmitApprove 一返回 worker 就可能开始推包，
+    // 而 ack 要等本函数返回后才写进 socket。续跑的 token 抢在 ack 前面到，
+    // 客户端就会把正在进行的回答当成过期包直接丢掉。
+    const auto ackSent = std::make_shared<std::atomic<bool>>(false);
+
+    uint64_t requestId = 0;
+    const bool submitted = agent_tcp::Instance().SubmitApprove(
+        session->account, threadId, messageId, approved, note, session, ackSent, requestId);
+
+    if (!submitted)
+    {
+        // 两种可能：这条会话根本没有待审批任务（重复点了 / 已被停止 /
+        // 服务重启把内存里的挂起记录丢了），或者队列满被拒。
+        // 客户端拿到这条就知道按钮点空了，可以提示用户重新发起
+        return failAck(404, "没有待审批的任务，可能已被处理或已取消");
+    }
+
+    json ack;
+    ack["type"]      = "agent_approve_ack";
+    ack["threadId"]  = threadId;
+    ack["serverId"]  = messageId;
+    // 服务器内部编号，只供日志排查，客户端可以忽略
+    ack["requestId"] = std::to_string(requestId);
+    ack["approved"]  = approved;
+    ack["code"]      = 0;
+    ack["message"]   = "";
+    ack["success"]   = true;
+
+    std::cout << "[agent_approve] 已受理 requestId=" << requestId
+              << " account=" << session->account
+              << " threadId=" << threadId
+              << " approved=" << (approved ? "true" : "false") << std::endl;
+
+    // 和 agent_request 一样：当场写 socket，写完再放行 worker。
+    // 只有 ack 真的进了 socket 才能让执行段开始推包
+    if (!session->SendJson(ack.dump() + "\n"))
+    {
+        std::cout << "[agent_approve] ack 发送失败（连接可能已断）requestId="
+                  << requestId << std::endl;
+    }
+
+    // 发不出去也必须放行：客户端断线了看门狗也没意义，
+    // 但 worker 不能因为这一位没人置真而永远卡在闸门上白占一个线程
+    ackSent->store(true, std::memory_order_release);
+
+    // 返回空串 = 应答已经自己发完了，JsonParsing 不会再组包
     return "";
 }
 

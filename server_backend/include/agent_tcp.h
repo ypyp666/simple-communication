@@ -65,7 +65,42 @@ struct AgentTask
     //   1) 任务在队列和 m_inFlight 里各有一份副本，必须是同一个对象才能共享同一个位；
     //   2) 裸 atomic 不可拷贝，会把 AgentTask 变成不可拷贝类型，而现有容器都靠拷贝入表。
     std::shared_ptr<std::atomic<bool>> ackSent;
+
+    // ===== HITL 审批续跑（新增）=====
+    // 为 true 时这一轮不是「新提问」，而是把用户对上一轮审批的决定交回智能体，
+    // 走的是 /approve 而不是 /chat，prompt 字段这一轮不用。
+    // 为什么把两种请求塞进同一个任务结构、同一个队列：
+    //   续跑同样是一次几百毫秒到几十秒的 HTTP 长连接，同样要占一个 worker、
+    //   同样要受队列限流和 agent_stop 约束。新开一套线程池只会多出一份同样的代码。
+    bool        approveResume = false;
+    bool        approved      = false;
+    std::string approvalNote;        // 用户拒绝时可能带一句理由，批准时为空
+
+    // 智能体确认过的 thread_id。续跑必须原样交回去，不能重新拼：
+    // 智能体可能在自己的那份上加过后缀，重新拼一个就对不上原来那条对话线，
+    // 挂在 interrupt() 上的状态也就找不回来了。
+    std::string agentThreadId;
 };
+
+// ===== 一次审批请求（HITL）=====
+// 智能体跑到需要用户点头才能往下走的那一步，会先发 approval_required，
+// 然后这一轮就停在 interrupt() 上。服务器不能替用户决定，
+// 所以必须把这一轮挂起、把内容原样转给客户端，等客户端回执了再续跑。
+//
+// 这里只搬字段、不做任何解释：summary / steps / command 具体长什么样由
+// table 层决定怎么组包，agent_tcp 不去理解业务语义。
+struct AgentApproval
+{
+    std::string threadId;   // 智能体侧的 thread_id（“会话ID + n + 账号”），续跑时原样交回去
+    std::string summary;    // 要用户确认的那句话
+    std::string steps;      // JSON 数组原文；智能体没给就是 "[]"
+    std::string command;    // JSON 对象原文；智能体没给就是 "{}"
+};
+
+// 审批回调：agent_tcp 解析到 approval_required 时调一次，
+// 由上层负责“记挂起表 + 推给客户端”。
+// 返回 false 表示上层不再需要（客户端已断线），本次传输可以提前收尾。
+using AgentApprovalSink = std::function<bool(const AgentApproval&)>;
 
 // ===== 智能体服务端地址 / 超时配置 =====
 // 之所以做成可配置，而不是写死一个常量：
@@ -177,7 +212,49 @@ public:
                                  std::string& outError,
                                  std::string* outThreadId = nullptr,
                                  const std::atomic<bool>* cancel = nullptr,
-                                 const AgentDeltaSink& onDelta = nullptr);
+                                 const AgentDeltaSink& onDelta = nullptr,
+                                 const AgentApprovalSink& onApproval = nullptr);
+
+    // 审批后续跑：把用户对上一轮 approval_required 的决定交回智能体。
+    // 对应的 HTTP 入口不是 /chat 而是 /approve（地址从 endpoint.url 推出来）。
+    //
+    // agentThreadId 必须是**智能体在 approval_required 里回传的那个**，
+    // 不能拿客户端会话ID 重新拼：interrupt() 的状态是挂在那一条 thread 上的，
+    // 换一个 thread_id 就等于换了一条对话线，图里根本没有可恢复的中断点。
+    //
+    // 其余参数（onDelta / cancel / onApproval）和 CallAgent 语义完全一致：
+    // 批准后的执行段同样会吐 token，同样可能被 agent_stop 打断，
+    // 也理论上可能再次要审批（多步任务），所以三条通道都得留着。
+    static std::string CallAgentApprove(const std::string& agentThreadId,
+                                        const std::string& userId,
+                                        bool approved,
+                                        const std::string& note,
+                                        const AgentEndpoint& endpoint,
+                                        std::string& outError,
+                                        std::string* outThreadId = nullptr,
+                                        const std::atomic<bool>* cancel = nullptr,
+                                        const AgentDeltaSink& onDelta = nullptr,
+                                        const AgentApprovalSink& onApproval = nullptr);
+
+    // 提交一轮「审批后续跑」。
+    // 挂起表里找不到就返回 false —— 说明这条会话没有待审批的任务
+    // （客户端重复点了、或者服务重启把内存里的挂起记录丢了），
+    // 调用方据此回一个明确的错误，不要默默排队。
+    //
+    // ackSent 和 Submit 的同名字段是一回事：客户端收到 agent_approve_ack 才启动看门狗，
+    // 必须先于任何 agent_response 抵达，所以闸门在外层造、这里只顺手挂上。
+    bool SubmitApprove(const std::string& account,
+                       const std::string& threadId,
+                       const std::string& messageId,
+                       bool approved,
+                       const std::string& note,
+                       const SessionPtr& session,
+                       const std::shared_ptr<std::atomic<bool>>& ackSent,
+                       uint64_t& outRequestId);
+
+    // 这条会话当前是不是停在审批点上（客户端重连后想恢复审批框时用）。
+    // 只读查询，查不到一律当「没有」，不抛异常。
+    bool HasPendingApproval(const std::string& account, const std::string& threadId);
 
     // 纯本地模拟，不依赖网络。压测队列 / 智能体还没起来时用
     static std::string MockAgent(const std::string& prompt, const std::string& agentId);
@@ -194,6 +271,26 @@ private:
     // 取消键：账号和会话ID拼成一个键，避免为两级键单独写哈希
     static std::string CancelKey(const std::string& account, const std::string& threadId);
 
+    // ===== 两个 HTTP 入口共用的那一段（新增）=====
+    // /chat 和 /approve 的请求体不同、地址不同，但“建 handle -> 设回调 -> 设超时 ->
+    // 边收边解析 -> 收尾”这整段是一模一样的。
+    // 抽出来纯粹是为了不把同一段 curl 代码拄两遍（拄两遍的结果一定是只改一边），
+    // 行为与原来 CallAgent 里的实现逐行一致。
+    static std::string PostAgentStream(const std::string& url,
+                                       const std::string& bodyText,
+                                       const AgentEndpoint& endpoint,
+                                       std::string& outError,
+                                       std::string* outThreadId,
+                                       const std::atomic<bool>* cancel,
+                                       const AgentDeltaSink& onDelta,
+                                       const AgentApprovalSink& onApproval);
+
+    // 从 /chat 的地址推 /approve 的地址。
+    // 地址配的是完整的 chat 端点（如 http://127.0.0.1:8000/chat），
+    // 把最后那段 /chat 换成 /approve 即可；不含 /chat 的地址退化成同目录下加 /approve。
+    // 做成推导而不是加一个新配置项：部署时少填一个字段就少一处填错的机会。
+    static std::string DeriveApproveUrl(const std::string& chatUrl);
+
     std::mutex              m_mtx;
     std::condition_variable m_cv;// 条件变量：队列空时 worker 睡在上面，Submit 时 notify_one 唤醒一个  
     //条件变量不能单独用，强制绑定一个 mutex；它本身不保存信号：提供内核级、低开销的线程间事件通知原语，用来解决「线程等待某个共享状态满足，直到别的线程修改状态并通知它」这个经典生产者 - 消费者同步问题。
@@ -201,6 +298,14 @@ private:
     std::unordered_map<uint64_t, AgentTask> m_inFlight; // 在途表：已取出、未完成
     // 取消表：(账号|会话ID) -> 该轮的取消标志。Submit 登记，worker 收尾时摘除
     std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> m_cancel;
+
+    // 待审批表：(账号|会话ID) -> 那一轮挂在 interrupt() 上的审批内容。
+    // 生命周期和取消表不一样，所以必须单独一张表：worker 收尾时**不能**摘它，
+    // 因为收尾意味着“这一轮停住了”，而它恰恰是下一步续跑的唯一凭据。
+    // 只有 SubmitApprove 成功把它换成新任务时才摘（或者任务被 agent_stop 打断时由
+    // HandleAgentStop 一并清掉，那一轮已经放弃了，留着只会让用户点同意时莫名重启一个旧任务）。
+    std::unordered_map<std::string, AgentApproval> m_pendingApproval;
+
     std::vector<std::thread> m_workers;
     std::atomic<bool>       m_running{false};//原子变量：对这个变量的读、写操作，不会出现 “半写、撕裂”，CPU 保证这一次操作是不可分割的，要么做完，要么完全没做，解决的就是cpu缓存问题
     std::atomic<uint64_t>   m_nextId{1};                // 请求编号发号器（1 起，0 作无效值）

@@ -17,6 +17,14 @@ namespace
         std::string threadId;  // 智能体分配的会话 id，下一轮带上它就有上下文了
         std::string error;     // 智能体主动报的错误
         bool        finished = false;   // 是否收到过 done / [DONE]
+
+        // ===== HITL 审批（新增）=====
+        // 智能体要求用户点头才能往下走时为 true。这一轮通常没有正文，
+        // 所以 answer 为空是正常的，不能当「智能体没返回内容」报错。
+        bool        approvalRequired = false;
+        std::string approvalSummary;   // 要用户确认的那句话
+        std::string approvalSteps;     // JSON 数组原文
+        std::string approvalCommand;   // JSON 对象原文
     };
 
     // 一次流式下载的上下文：既是 curl 的 userdata，也是“半行缓冲 + 累积结果”的容器。
@@ -31,6 +39,11 @@ namespace
         std::string    rawBody;   // 完整响应体，只给“不是 SSE”的兜底解析用
         SseResult      sse;
         AgentDeltaSink onDelta;   // 增量回调，可能为空（只要最终结果，不要流）
+        // 审批回调，可能为空。注意：不在这里当场回调，
+        // 而是等流收了尾再统一交给上层——审批包到达时后面的 done 还没来，
+        // 此刻就推给客户端的话，客户端可能先弹框、后收到本轮结束，
+        // 两条包先后反了（和 ack 门是同一类问题）。
+        AgentApprovalSink onApproval;
     };
 
     // 处理一整行 SSE。返回 false 表示要中止本次传输。
@@ -91,6 +104,14 @@ namespace
             else if (name == "done")
             {
                 ctx.sse.finished = true;
+
+                // 智能体把「这一轮停在审批点、还没完」也标在 done.status 里。
+                // 正常情况下 approval_required 会先到，这里只是兜底，
+                // 免得两条包顺序反了就把待审批误当成已完成。
+                if (event.value("status", std::string()) == "pending_approval")
+                {
+                    ctx.sse.approvalRequired = true;
+                }
             }
             else if (name == "error")
             {
@@ -98,6 +119,33 @@ namespace
                 // 不能把已经收到的半截回答当成功推出去
                 ctx.sse.error = event.value("message", std::string("智能体内部错误"));
                 return false;
+            }
+            else if (name == "approval_required")
+            {
+                // 智能体要用户点头才能往下走，这一轮就停在 interrupt() 上了。
+                //
+                // 服务器不替用户做决定，也不在这里弹框：只把内容原样记下来，
+                // 等流收了尾再统一交给上层（见 PostAgentStream 的收尾段）。
+                // 为什么不在这一行就回调：审批包后面紧跟着本轮结束，
+                // 此刻就推给客户端的话，客户端可能先弹框、后收到「这一轮结束」，
+                // 两条包先后反了（和 ack 门是同一类问题）。
+                //
+                // 字段名（summary / steps / command）是智能体那边定的，
+                // 服务器不解析内部语义，只保证原样搬运。
+                ctx.sse.approvalRequired = true;
+                ctx.sse.approvalSummary  = event.value("summary", std::string());
+
+                ctx.sse.approvalSteps = "[]";
+                if (event.contains("steps"))
+                {
+                    ctx.sse.approvalSteps = event["steps"].dump();
+                }
+
+                ctx.sse.approvalCommand = "{}";
+                if (event.contains("command"))
+                {
+                    ctx.sse.approvalCommand = event["command"].dump();
+                }
             }
             // meta 只用来打日志，这里不需要
         }
@@ -302,6 +350,9 @@ void agent_tcp::Stop()
         m_queue.clear();
         m_inFlight.clear();
         m_cancel.clear(); 
+        // 挂起表也要一起清：编译期内存里的审批内容已经没人能续跑了，
+        // 留着只会让客户端重启后点「同意」时回一个莫名其妙的错误
+        m_pendingApproval.clear();
     }
 
     // 所有 worker 都已 join，此时不会再有线程用 curl，可以安全清理
@@ -364,6 +415,18 @@ bool agent_tcp::Cancel(const std::string& account, const std::string& threadId)
     const auto it = m_cancel.find(CancelKey(account, threadId));
     if (it == m_cancel.end() || !it->second)
     {
+        // 没有在途回答，但可能正停在审批点上：用户点停止就是放弃这一轮，
+        // 把挂起记录一并清掉。不清的后果是：他过一会儿再点「同意」，
+        // 服务器会默默把一个他已经不要的任务又启起来，而且会真的执行副作用。
+        const auto pendingIt = m_pendingApproval.find(CancelKey(account, threadId));
+        if (pendingIt != m_pendingApproval.end())
+        {
+            m_pendingApproval.erase(pendingIt);
+            std::cout << "[agent] 已放弃待审批任务：account=" << account
+                      << " threadId=" << threadId << std::endl;
+            return true;
+        }
+
         std::cout << "[agent] 取消请求未命中：account=" << account
                   << " threadId=" << threadId << "（该会话没有在途回答）" << std::endl;
         return false;
@@ -582,6 +645,57 @@ void agent_tcp::WorkerLoop()
             return true;
         };
 
+        // ===== 审批回调（HITL）=====
+        // 智能体跑到需要用户点头的那一步时，这里被调一次。
+        // 只做两件事：把内容存进挂起表（续跑的唯一凭据）+ 转发给客户端。
+        // 真正“做什么”由客户端确认，服务器不替用户决定。
+        bool approvalPending = false;
+        const AgentApprovalSink onApproval = [&](const AgentApproval& approval) -> bool
+        {
+            approvalPending = true;
+
+            // 先登记再推包，顺序不能反：客户端回执可能比推包还快（同机回环），
+            // 反过来就会出现「点了同意却找不到待审批任务」。
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_pendingApproval[CancelKey(task.account, task.threadId)] = approval;
+            }
+
+            std::cout << "[agent] 本轮停在审批点 requestId=" << task.requestId
+                      << " threadId=" << task.threadId << std::endl;
+
+            if (!sess)
+            {
+                // 客户端已经下线：没人能续跑了，提前收尾不再白占 worker。
+                // 挂起记录先留着，重连后还能查到
+                return false;
+            }
+
+            nlohmann::json rsp;
+            rsp["type"]      = "agent_approval_required";
+            rsp["threadId"]  = task.threadId;
+            rsp["serverId"]  = task.messageId;
+            rsp["requestId"] = std::to_string(task.requestId);
+            rsp["summary"]   = approval.summary;
+
+            // steps / command 在 agent_tcp 里一直是 JSON 原文（字符串），
+            // 为嵌进外层包得先解回来；解不出来就原样当字符串给，
+            // 至少客户端还能显示，不至于整包丢掉。
+            rsp["steps"] = nlohmann::json::parse(approval.steps, nullptr, false);
+            if (rsp["steps"].is_discarded())
+            {
+                rsp["steps"] = approval.steps;
+            }
+
+            rsp["command"] = nlohmann::json::parse(approval.command, nullptr, false);
+            if (rsp["command"].is_discarded())
+            {
+                rsp["command"] = approval.command;
+            }
+
+            return sess->SendJson(rsp.dump() + "\n");
+        };
+
         // 智能体可能回一个新的 thread_id（首次对话时），所以这里留一个可变副本
         std::string agentThreadId = agentThread;
 
@@ -621,10 +735,23 @@ void agent_tcp::WorkerLoop()
                 std::this_thread::sleep_for(std::chrono::milliseconds(60));
             }
         }
+        else if (task.approveResume)
+        {
+            // ===== 审批后续跑 =====
+            // 地址换成 /approve（从 /chat 的地址推），thread_id 用智能体当初回传的那个：
+            // interrupt() 的状态是挂在那一条 thread 上的，重新拼一个就等于换了一条对话线。
+            AgentEndpoint approveEndpoint = endpoint;
+            approveEndpoint.url = DeriveApproveUrl(endpoint.url);
+
+            answer = CallAgentApprove(task.agentThreadId, task.account, task.approved,
+                                      task.approvalNote, approveEndpoint, error,
+                                      &agentThreadId, task.cancelled.get(),
+                                      onDelta, onApproval);
+        }
         else
         {
             answer = CallAgent(task.prompt, agentThread, task.account, endpoint, error,
-                               &agentThreadId, task.cancelled.get(), onDelta);
+                               &agentThreadId, task.cancelled.get(), onDelta, onApproval);
         }
 
         if (!agentThreadId.empty())
@@ -679,6 +806,19 @@ void agent_tcp::WorkerLoop()
             continue;
         }
 
+        // ===== 停在审批点 =====
+        // 审批包已经在 onApproval 里推过了，这里只补一条收尾包让客户端关掉看门狗。
+        // 绝不能掉到下面 answer.empty() 的分支里去报「智能体没有返回任何内容」——
+        // 审批轮本来就没有正文，那不是错误。
+        if (approvalPending)
+        {
+            pushResponse("", true, true, 0, "");
+            std::cout << "[agent] 已推送审批请求 requestId=" << task.requestId
+                      << " threadId=" << task.threadId << std::endl;
+            finishTask();
+            continue;
+        }
+
         if (answer.empty())
         {
             // answer 和 error 同时为空（智能体返回 200 但内容里没有可用文本）
@@ -716,7 +856,8 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
                                  std::string& outError,
                                  std::string* outThreadId,
                                  const std::atomic<bool>* cancel,
-                                 const AgentDeltaSink& onDelta)
+                                 const AgentDeltaSink& onDelta,
+                                 const AgentApprovalSink& onApproval)
 {
     outError.clear();
 
@@ -744,7 +885,25 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     }
     const std::string bodyText = body.dump();
 
-    // ===== 2. 每个请求一个独立的 easy handle =====
+    // ===== 2. 真的发出去 =====
+    // 建 handle、设超时、边收边解析这一段和 /approve 完全一样，
+    // 统一放在 PostAgentStream 里，这里只负责把 /chat 的请求体拼好。
+    return PostAgentStream(endpoint.url, bodyText, endpoint, outError, outThreadId,
+                           cancel, onDelta, onApproval);
+}
+
+std::string agent_tcp::PostAgentStream(const std::string& url,
+                                       const std::string& bodyText,
+                                       const AgentEndpoint& endpoint,
+                                       std::string& outError,
+                                       std::string* outThreadId,
+                                       const std::atomic<bool>* cancel,
+                                       const AgentDeltaSink& onDelta,
+                                       const AgentApprovalSink& onApproval)
+{
+    outError.clear();
+
+    // ===== 一个请求一个独立的 easy handle =====
     // 不共享 handle：curl 的 easy handle 不是线程安全的，
     // 3 个 worker 共用一个会互相踩。后面要提性能可以按 worker 各留一个长期复用。
     CURL* curl = curl_easy_init();
@@ -760,6 +919,7 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // 注意它必须活到 curl_easy_cleanup 之后 —— 它是 WRITEDATA 指向的对象
     StreamContext ctx;
     ctx.onDelta = onDelta;
+    ctx.onApproval = onApproval;
     ctx.rawBody.reserve(4096);
 
     curl_slist* headers = nullptr;
@@ -767,7 +927,7 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
     // 告诉智能体我们接受流式响应（它的 /chat 就是流式的）
     headers = curl_slist_append(headers, "Accept: text/event-stream");//定义请求头
 
-    curl_easy_setopt(curl, CURLOPT_URL, endpoint.url.c_str());//设置请求的URL
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());//设置请求的URL
     curl_easy_setopt(curl, CURLOPT_POST, 1L);//设置请求方式为POST，默认是GET
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, bodyText.c_str());//设置POST请求的内容，POST请求体的数据指针
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(bodyText.size()));//设置POST请求的内容长度，POST请求体的数据长度
@@ -905,6 +1065,33 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
         return ctx.sse.answer;
     }
 
+    // 停在审批点：这一轮本来就没有正文，answer 为空是正常的，
+    // 不能掉到下面「内容为空」的兜底里去报错。
+    // 先把审批内容交给上层（挂起这一轮 + 转给客户端），再正常返回。
+    if (ctx.sse.approvalRequired)
+    {
+        if (outThreadId != nullptr)
+        {
+            *outThreadId = ctx.sse.threadId;
+        }
+
+        if (onApproval)
+        {
+            AgentApproval approval;
+            approval.threadId = ctx.sse.threadId;
+            approval.summary  = ctx.sse.approvalSummary;
+            approval.steps    = ctx.sse.approvalSteps;
+            approval.command  = ctx.sse.approvalCommand;
+
+            if (!onApproval(approval))
+            {
+                // 上层已经不想要了（客户端断线）：这一轮直接收，不推审批包
+                return "";
+            }
+        }
+        return "";
+    }
+
     // 走到这里说明不是 SSE（或者流是空的），退回普通 JSON 解析，
     // 这样将来换成非流式接口也不用改代码
     const std::string plain = ExtractAnswer(ctx.rawBody);
@@ -915,6 +1102,120 @@ std::string agent_tcp::CallAgent(const std::string& prompt,
         return "";
     }
     return plain;
+}
+
+std::string agent_tcp::DeriveApproveUrl(const std::string& chatUrl)
+{
+    const std::string suffix = "/chat";
+    if (chatUrl.size() >= suffix.size()
+        && chatUrl.compare(chatUrl.size() - suffix.size(), suffix.size(), suffix) == 0)
+    {
+        return chatUrl.substr(0, chatUrl.size() - suffix.size()) + "/approve";
+    }
+
+    // 地址不含 /chat（有人会直接配完整端点），退化成同目录下加 /approve。
+    // 做成推导而不是新增一个配置项：部署时少填一个字段，就少一处填错的机会。
+    if (!chatUrl.empty() && chatUrl.back() == '/')
+    {
+        return chatUrl + "approve";
+    }
+    return chatUrl + "/approve";
+}
+
+std::string agent_tcp::CallAgentApprove(const std::string& agentThreadId,
+                                        const std::string& userId,
+                                        bool approved,
+                                        const std::string& note,
+                                        const AgentEndpoint& endpoint,
+                                        std::string& outError,
+                                        std::string* outThreadId,
+                                        const std::atomic<bool>* cancel,
+                                        const AgentDeltaSink& onDelta,
+                                        const AgentApprovalSink& onApproval)
+{
+    outError.clear();
+
+    if (agentThreadId.empty())
+    {
+        // 空 thread_id 打过去，智能体那边只会在历史里乱找，不如当场拒掉
+        outError = "缺少待续跑的会话标识";
+        return "";
+    }
+
+    // 请求体字段名跟智能体的 /approve 接口表对齐；
+    // user_id 只取自登录会话，客户端传的一概不采信，和 /chat 一个口径。
+    nlohmann::json body;
+    body["thread_id"] = agentThreadId;
+    body["approved"]  = approved;
+    body["note"]      = note;
+    body["user_id"]   = userId;
+
+    const std::string bodyText = body.dump();
+
+    return PostAgentStream(endpoint.url, bodyText, endpoint, outError, outThreadId,
+                           cancel, onDelta, onApproval);
+}
+
+bool agent_tcp::SubmitApprove(const std::string& account,
+                              const std::string& threadId,
+                              const std::string& messageId,
+                              bool approved,
+                              const std::string& note,
+                              const SessionPtr& session,
+                              const std::shared_ptr<std::atomic<bool>>& ackSent,
+                              uint64_t& outRequestId)
+{
+    outRequestId = 0;
+
+    AgentApproval approval;
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        const auto it = m_pendingApproval.find(CancelKey(account, threadId));
+        if (it == m_pendingApproval.end())
+        {
+            return false;
+        }
+
+        approval = it->second;
+
+        // 先摘掉再提交：一轮审批只能续跑一次。
+        // 不摘的话，客户端重复点「同意」会把执行段跑两遍，而那一段是有副作用的。
+        // 同时也把取消表里的旧记录当作已结束，避免 agent_stop 打到已经续跑的新一轮。
+        m_pendingApproval.erase(it);
+    }
+
+    AgentTask task;
+    task.account       = account;
+    task.threadId      = threadId;
+    task.messageId     = messageId;
+    task.session       = session;
+    task.ackSent       = ackSent;
+    task.approveResume = true;
+    task.approved      = approved;
+    task.approvalNote  = note;
+    task.agentThreadId = approval.threadId;
+
+    if (!Submit(std::move(task), outRequestId))
+    {
+        // 队列满了：把挂起记录放回去，用户还能再点一次。
+        // 不能就这么丢掉 —— 那条记录是智能体 wait 在那里的一轮状态，
+        // 丢了就只能从头再问一遍。
+        std::lock_guard<std::mutex> lock(m_mtx);
+        m_pendingApproval[CancelKey(account, threadId)] = approval;
+        return false;
+    }
+
+    std::cout << "[agent] 提交审批续跑 account=" << account
+              << " threadId=" << threadId
+              << " approved=" << (approved ? "true" : "false") << std::endl;
+    return true;
+}
+
+bool agent_tcp::HasPendingApproval(const std::string& account, const std::string& threadId)
+{
+    std::lock_guard<std::mutex> lock(m_mtx);
+    const auto it = m_pendingApproval.find(CancelKey(account, threadId));
+    return it != m_pendingApproval.end();
 }
 
 std::string agent_tcp::MockAgent(const std::string& prompt, const std::string& agentId)

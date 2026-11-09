@@ -37,6 +37,7 @@ enum class  CmdType {
     AgentSessionRename,//智能体会话改名
     AgentSessionDelete,//删除智能体会话
     AgentSessionsList,//登录后拉取本账号的全部智能体会话（请求叫 pull，响应包叫 list）
+    AgentApprove,//用户对智能体的阻断审批回执（同意 / 拒绝），服务器据此续跑那一轮
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -72,6 +73,7 @@ enum class  CmdType {
     std::string HandleAgentSessionRename(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAgentSessionDelete(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAgentSessionsList(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentApprove(const json& req, mysqlconn& conn, SessionPtr session);
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
@@ -106,6 +108,9 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::AgentSessionRename, HandleAgentSessionRename},
     {CmdType::AgentSessionDelete, HandleAgentSessionDelete},
     {CmdType::AgentSessionsList, HandleAgentSessionsList},
+    // 审批回执也是一条普通命令：客户端发 agent_approve，服务器异步续跑。
+    // 登记在这里的意义和上面那些完全一样 —— 漏了就是一个空包，请求直接消失
+    {CmdType::AgentApprove, HandleAgentApprove},
 };
 
 #endif //UNTITLED_TABLE_H
