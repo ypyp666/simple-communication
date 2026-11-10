@@ -75,9 +75,11 @@ public:
     void onApproveAcked(const QString& serverId, bool success, const QString& message);
 
 signals:
-    // 用户点发送：只带会话 ID 和内容。消息 ID 由服务器分配，主后端拿到后
-    // 先落库、再发 agent_request（气泡上那个 ID 只是本地显示用的）
-    void sendMessage(const QString& sessionId, const QString& content);
+    // 用户点发送：带会话 ID、内容和本地临时消息 ID。
+    // 主后端先用这个临时 ID 落库（自己发出去的消息先存本地），
+    // 服务器分到正式 ID 后只替换库里的主键，界面不用跟着改
+    void sendMessage(const QString& sessionId, const QString& content,
+                     const QString& localId);
     // 请求新建会话：把本地生成的 thread_id + 默认名字交给上层（服务器先建，
     // 成功后本地才入库；结果由上层用 onSessionCreateSucceeded/Failed 回调回来）
     void sessionCreateRequested(const QString& sessionId, const QString& title);
@@ -106,6 +108,8 @@ private:
     void appendMessageWidget(const QString& content, bool isSelf, const QString& id);
     void clearMessages();
     void scrollToBottom();
+    // 本轮结束/失败时把气泡缓冲里最后一段立刻落屏（否则要等 30ms 合流窗口）
+    void flushStreamItem();
     QString newMessageId();
     // 审批卡被"确认"了：原地换成一行小字（卡片消失，只留下用户选了什么）
     void replaceApprovalCardWithLabel(const QString& serverId, const QString& text);
@@ -131,6 +135,7 @@ private:
     QHash<QString, AgentApprovalCard*> m_approvalCards;
     QString m_sessionId;                        // 当前会话 ID（切会话/新建时改变）
     QString m_streamMessageId;                  // 正在接收的 AI 气泡 ID（空=本轮还没开始）
+    bool m_scrollPending = false;               // 滚动已排队（一轮事件里的多次滚动合成一次）
     // 发送按钮当前处于哪种状态：false=发送态（发 agent_request），true=停止态（本轮还在回答）。
     // 同一颗按钮两种语义对应两种包，必须把状态记在这，发的时候才知道该发哪种
     bool m_sending = false;

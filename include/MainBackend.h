@@ -156,6 +156,9 @@ signals:
     // 指令执行失败：把接口原始 message 交给界面提示，不自动重试
     //（删除类操作重试可能变成删错人，必须由用户决定）
     void agentTaskFailed(const QString& message);
+    // 指令执行成功：也要说一声。只有失败才提示的话，用户点完「同意」、后台默默办完，
+    // 界面上没有任何变化，根本分不清是「办成了」还是「压根没执行」
+    void agentTaskSucceeded(const QString& message);
 
     // === 数据库异步请求信号（主线程发出 → 后台DB线程执行）===
     void dbSaveMessageRequested(const MessageInfo& message);
@@ -192,6 +195,9 @@ signals:
                                        const QDateTime& createdAt);
     void dbSaveAgentMessageRequested(const QString& sessionId, const QString& messageId,
                                      const QString& content, const QDateTime& createdAt);
+    // 服务器分配正式 ID 后，把本地先存的那行（临时 ID）原地改成正式 ID
+    void dbReplaceAgentMessageIdRequested(const QString& sessionId, const QString& oldId,
+                                          const QString& newId);
     // AI 回答的一段（同一回答共用一个 messageId，分块序号由 DB 层自增）
     void dbSaveAgentMessageChunkRequested(const QString& sessionId, const QString& messageId,
                                           const QString& content, const QDateTime& createdAt);
@@ -266,9 +272,10 @@ public slots:
     void loadAgentSessions();
     // 新建一个智能体会话：写库后立刻重拉列表（"写后必读"，抽屉马上出现新行）
     void createAgentSession(const QString& sessionId, const QString& title);
-    // 发一条用户消息：先向服务器要消息 ID → 落库成功 → 才发 agent_request。
-    // UI 只给会话 ID 和内容，消息 ID 统一由服务器分配
-    void sendAgentMessage(const QString& sessionId, const QString& content);
+    // 发一条用户消息：本地先落库（临时 ID，离线也能看到自己发过什么）→
+    // 向服务器要正式 ID → 替换本地主键 → 才发 agent_request
+    void sendAgentMessage(const QString& sessionId, const QString& content,
+                          const QString& localId);
     // 回读某个会话的历史消息（最近 50 条），结果由 agentMessagesLoaded 回传
     void loadAgentMessages(const QString& sessionId);
     // 停止当前会话正在回答的那一轮：发 agent_stop，并把这轮落库用的消息 ID 清掉
@@ -324,12 +331,14 @@ private slots:
     void onAgentMessageReceived(const QString& sessionId, const QString& content, bool finished);
 
     // === 提问三段式（在主线程串起来）===
-    // ① 服务器分配了消息 ID → 让后台 DB 线程按这个 ID 存用户消息
-    void onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId);
-    // ①' 申请 ID 失败（未连接 / 服务器拒绝）→ 取消这一轮，把发送状态还给界面
-    void onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message);
-    // ② 落库结果：成功才发 agent_request（带消息ID / 会话ID / 用户ID / 问题）
+    // ① 本地先存下用户这条消息（临时 ID）→ 存成功才向服务器申请正式 ID
     void onAgentMessageSaved(const QString& sessionId, const QString& messageId, bool success);
+    // ② 服务器分配了正式 ID → 让后台 DB 线程把本地那行改成正式 ID
+    void onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId);
+    // ③ 替换成功 → 发 agent_request（带消息ID / 会话ID / 用户ID / 问题）
+    void onAgentMessageIdReplaced(const QString& sessionId, const QString& newId, bool success);
+    // 申请 ID 失败（未连接 / 服务器拒绝）→ 本地那条保留，把发送状态还给界面
+    void onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message);
 
     // 会话三件套的服务器回执（在主线程执行）：这里是本地库唯一的"写入口"——
     // 三件都是服务器确认成功后才动本地，失败时本地什么都不用回滚。
@@ -404,9 +413,11 @@ private:
     // 每个会话"当前正在流式输出的 AI 回答"的 messageId（会话ID → 消息ID）。
     // 第一段到达时生成 UUID，finished 后清掉；同一回答的所有分块靠它归组
     QHash<QString, QString> m_agentReplyIds;
-    // 提问在"申请 ID → 落库 → 发对话请求"之间要暂存的用户问题（会话ID → 问题）。
-    // 落库成功、真正发出去后清掉；申请 ID 失败也清掉
+    // 提问在"本地先存 → 申请 ID → 替换 ID → 发对话请求"之间要暂存的东西（会话ID → 值）。
+    // 发出去后清掉；申请 ID / 替换失败也清掉
     QHash<QString, QString> m_pendingPrompts;
+    // 本地先存时用的临时 ID（= UI 气泡 ID），拿到服务器正式 ID 后用它定位要改的那一行
+    QHash<QString, QString> m_pendingLocalIds;
 
     // === 智能体指令（HITL 执行阶段）===
     // 已执行过的 requestId：服务器重推 / 重连补拉都可能让同一条指令到两遍，
@@ -420,6 +431,9 @@ private:
     QSet<QString> m_agentPendingSends;
     QSet<QString> m_agentPendingDeletes;
     QSet<QString> m_agentPendingRemarks;
+    // tempId → 收信人显示名。成功提示要能说出「发给谁了」，而发送回包只带 tempId，
+    // 名字只能从下发的指令参数里提前记下
+    QHash<QString, QString> m_agentPendingSendNames;
 
     // 注册登录后端（登录/修改密码）的信号连接，从构造函数抽出，避免构造函数越堆越长
     void setupLoginConnections();

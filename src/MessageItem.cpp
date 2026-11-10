@@ -140,7 +140,7 @@ void MessageItem::setupUI(const MessageInfo& message)
          *      保证"量宽 = 设宽 = 排版宽"三者统一（历史上就是三者各说各话才导致提前折行）
          */
          //`QTimer::singleShot` 是个 静态成员函数 （`static` ）
-        QTimer::singleShot(10, this, [contentEdit, bubbleWidget]()
+        QTimer::singleShot(10, this, [this, contentEdit, bubbleWidget]()
          {
             /*QTextEdit 只是个显示器，真正算换行/排版的是它内部的QTextDocument。 后面所有计算都在这货身上做 ，所以先把它取出来
             你想要文字要多宽度但你只能问 QTextDocument 要尺寸，而 document 的尺寸，必须"你先给它宽度"，它才能算出来
@@ -166,7 +166,19 @@ void MessageItem::setupUI(const MessageInfo& message)
             // 2. 只有超过上限才需要折行，没超过就按文字的实际宽度撑开。
             //    +1 是防取整的余量：量出来是整数（可能比真实 advance 小 0.5px 以内），
             //    而排版用的是浮点 advance，不给余量就会出现"差一丝就折行"
-            const int maxTextWidth = 780;   // + 气泡左右内边距 10×2 → 气泡最大宽度 800
+            //
+            //    上限不能写死成 780：窗口被拉窄时，消息容器本身可能还不到 800，
+            //    写死的话气泡会比可视区域还宽，被 QScrollArea 横向裁掉（右侧圆角和文字看不见），
+            //    底部还会多出一条横向滚动条。这里按容器当前宽度算真实可用宽度：
+            //    容器宽 - 本条左右外边距 15×2 - 头像 40 - 头像间距 10 - 气泡内边距 10×2 - 取整余量 10
+            int maxTextWidth = 780;   // 宽窗口下的封顶值（+ 气泡左右内边距 10×2 → 气泡最大 800）
+            const QWidget* container = this->parentWidget();   // 10ms 后这条已经被插进消息容器
+            // >200 才认：控件还没被布局算过时宽度只是个默认值（100），
+            // 拿它来算会把气泡压成一条窄条，反而不如用 780
+            if (container != nullptr && container->width() > 200) {
+                maxTextWidth = qMin(maxTextWidth, container->width() - 110);
+            }
+            maxTextWidth = qMax(maxTextWidth, 120);   // 窗口极窄时兜底，避免算出负宽度
             const int wrapWidth = qMin(textWidth, maxTextWidth) + 1;
 
             // 3. 让文档按这个宽度排版，量出它真实需要的高度

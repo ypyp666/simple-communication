@@ -58,7 +58,7 @@ signals:
 
 public slots:
     // sessionId 只用于本地把回答对回发起它的会话；messageId 是服务器分配的消息 ID
-    //（先 requestAgentMessageId 拿到、本地落库成功之后才调这里）；
+    //（本地已先用临时 ID 存过，拿到正式 ID 并替换成功后调这里）；
     // prompt 就是用户输入的问题（服务器限制非空、长度 <= 4000）
     void sendAgentRequest(const QString& sessionId, const QString& messageId, const QString& prompt);
     // 停止本轮回答：给服务器发 agent_stop，同时本地立刻放掉"在飞"标记

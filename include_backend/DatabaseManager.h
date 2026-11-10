@@ -85,6 +85,10 @@ public slots:
     bool createAgentSession(const QString& sessionId, const QString& title, const QDateTime& createdAt);
     bool saveAgentMessage(const QString& sessionId, const QString& messageId,
                           const QString& content, const QDateTime& createdAt);
+    // 服务器分配了正式消息 ID 之后，把本地先存的那一行（临时 ID）改成正式 ID。
+    // 主键是 (session_id, message_id, chunk_seq)，这里只动 message_id 一列
+    bool replaceAgentMessageId(const QString& sessionId, const QString& oldId,
+                               const QString& newId);
     // 存 AI 回答的一段（is_self=0，chunk_seq 由库内自增）；不碰会话快照
     bool saveAgentMessageChunk(const QString& sessionId, const QString& messageId,
                                const QString& content, const QDateTime& createdAt);
@@ -129,6 +133,8 @@ signals:
     void agentMessagesLoaded(const QString& sessionId, const QList<AgentMessageInfo>& messages);
     // 用户提问落库结果：主后端靠它决定"入库成功才发对话请求"（含原样的 sessionId/messageId）
     void agentMessageSaved(const QString& sessionId, const QString& messageId, bool success);
+    // 临时 ID → 正式 ID 的替换结果：成功后才发 agent_request（库里那行已是正式 ID）
+    void agentMessageIdReplaced(const QString& sessionId, const QString& newId, bool success);
     // 分页查询结果（后台线程发出，主线程的 MainBackend 接收后转发 UI）。
     // hasMore：返回条数 == pageSize 就认为历史还没翻到底（最后一页恰好整页时
     // 会多查一次空页，无害）；UI 据此决定"滚到顶部还拉不拉更早一页"

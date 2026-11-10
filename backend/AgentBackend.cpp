@@ -578,6 +578,26 @@ void AgentBackend::handleApproveAck(const QJsonObject& response)
     if (!success && message.isEmpty()) {
         message = QStringLiteral("审批提交失败");
     }
+
+    // 批准/拒绝之后服务器会立刻续跑同一轮（走 /approve），把智能体的收尾播报
+    // 当成普通流式片段推回来。这些包不带会话字段，只能靠 m_pendingSessionId
+    // 路由；不登记的话它们会被全部丢弃 —— 表现就是用户点完「同意」以后界面再无动静。
+    //
+    // 为什么敢在这里登记（发起回执时不登记）：服务器有 ack 门，ack 真写进 socket
+    // 之后才放行 worker 去推续跑的包，所以登记一定早于第一个片段到达，不会抢跑。
+    //
+    // 失败时不能登记：那种情况根本没有续跑轮次，登记了只会等满看门狗再报一次假故障
+    if (success) {
+        const QString threadId = response["threadId"].toString();
+        if (!threadId.isEmpty()) {
+            m_pendingSessionId = threadId;
+            // 一并占住会话：续跑期间用户再提问会被明确拒绝，
+            // 否则那一轮的回答会拼到新问题的气泡里（续跑没有 prompt，值填空串）
+            m_inFlightSessions[threadId] = QString();
+            m_streamWatchdog->start(kStreamTimeoutMs);
+        }
+    }
+
     emit agentApproveAcked(serverId, success, message);
 }
 

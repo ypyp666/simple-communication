@@ -64,13 +64,13 @@ struct MessageInfo {
     QString content;       // 消息文本内容
     QString fileName;       // 文件名（如果有）
     QString filePath;       // 文件路径（如果有）
-    qint64 fileSize;       // 文件大小
+    qint64 fileSize = 0;    // 文件大小（必须给默认值：局部对象不填就是栈垃圾值）
     QDateTime sendTime;    // 发送时间
     QString remark;        // 备注（可为空）
-    bool isSelf;           // 是否为自己发送
-    bool isRead;           // 对方发来的消息是否已读（自己发的无意义）
-    bool isFile;           // 是否为文件消息
-    bool isOffline;        // 是否为离线消息
+    bool isSelf = false;    // 是否为自己发送
+    bool isRead = false;    // 对方发来的消息是否已读（自己发的无意义）
+    bool isFile = false;    // 是否为文件消息
+    bool isOffline = false; // 是否为离线消息
 };
 
 // 发送给服务器的消息结构体（与本地存储结构不同）
