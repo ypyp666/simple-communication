@@ -798,7 +798,7 @@ sequenceDiagram
 | `DEEPSEEK_SEARCH_URL` | 联网搜索服务地址，缺失时搜索工具会明确返回未配置 |
 | `DEEPSEEK_MODEL` | 主模型，默认 `deepseek-flash` |
 | `DEEPSEEK_VISION_MODEL` | 图片理解用的模型，留空则复用主模型 |
-| `AGENT_HOST` / `AGENT_PORT` | 监听地址，默认 `127.0.0.1:8000`（只本机可连） |
+| `AGENT_HOST` / `AGENT_PORT` | 监听地址，默认 `127.0.0.1:9000`（只本机可连） |
 | `AGENT_DB_HOST` / `AGENT_DB_PORT` | 业务库地址，默认 `192.168.20.128:3306` |
 | `AGENT_DB_USER` / `AGENT_DB_PASSWORD` | 业务库账号，**只需要存储过程 EXECUTE 权限**，必填 |
 | `AGENT_DB_NAME` | 业务库名，默认 `User` |

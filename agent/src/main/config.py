@@ -25,7 +25,7 @@ DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL") or DEEPSEEK_MODEL
 
 # 服务监听参数，Qt 客户端与后端约定这两个值即可
 HOST = os.getenv("AGENT_HOST", "127.0.0.1")
-PORT = int(os.getenv("AGENT_PORT", "8000"))
+PORT = int(os.getenv("AGENT_PORT", "9000"))
 
 # ---------------------------------------------------------------- 业务数据库
 # 智能体要用业务库里的数据才能干活（查好友、拉聊天记录等）。

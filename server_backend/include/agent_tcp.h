@@ -126,7 +126,8 @@ using AgentTaskEventSink = std::function<bool(const std::string& eventName,
 struct AgentEndpoint
 {
     // 智能体进程的 HTTP 接口。留空则自动降级为本地模拟（不连网也能跑通整条链路）
-    std::string url = "http://127.0.0.1:8000/chat";
+    // 端口与 agent/src/main/config.py 的 AGENT_PORT 保持一致（统一 9000）
+    std::string url = "http://127.0.0.1:9000/chat";
 
     // 连接超时：智能体进程挂掉/机器不可达时，别让 worker 卡在 TCP 握手上
     long connectTimeoutSec = 5;
@@ -306,7 +307,7 @@ private:
                                        const AgentTaskEventSink& onTaskEvent);
 
     // 从 /chat 的地址推 /approve 的地址。
-    // 地址配的是完整的 chat 端点（如 http://127.0.0.1:8000/chat），
+    // 地址配的是完整的 chat 端点（如 http://127.0.0.1:9000/chat），
     // 把最后那段 /chat 换成 /approve 即可；不含 /chat 的地址退化成同目录下加 /approve。
     // 做成推导而不是加一个新配置项：部署时少填一个字段就少一处填错的机会。
     static std::string DeriveApproveUrl(const std::string& chatUrl);
