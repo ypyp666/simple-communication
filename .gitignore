@@ -37,3 +37,6 @@ simple-communication/
 
 # ===== Trae IDE 本地元数据 =====
 .trae/
+
+# ===== 权限工具生成的 ACL 备份 / 报告（本地保留，不进仓库）=====
+.acl-recovery/
