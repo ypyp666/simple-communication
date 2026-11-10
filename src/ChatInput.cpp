@@ -3,6 +3,42 @@
 #include <QtMath>
 #include <QKeyEvent>
 #include <QInputMethodEvent>
+#include <QIcon>
+
+namespace {
+// 平时态：蓝色圆角长条 + "发送"两个字
+const char* kSendButtonQss = R"(
+        QPushButton {
+            border: none;
+            border-radius: 15px;
+            background-color: #4a90d9;
+            color: white;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        QPushButton:hover {
+            background-color: #3a80c9;
+        }
+        QPushButton:disabled {
+            background-color: #a0a0a0;
+        }
+    )";
+
+// 回答中：方形按钮（固定 30×30、半径 15 = 正圆）+ 蓝色底 + 原色 stop 图标（不染色）
+const char* kStopButtonQss = R"(
+        QPushButton {
+            border: none;
+            border-radius: 15px;
+            background-color: #4a90d9;
+        }
+        QPushButton:hover {
+            background-color: #3a80c9;
+        }
+        QPushButton:pressed {
+            background-color: #356ea8;
+        }
+    )";
+}
 
 ChatInput::ChatInput(QWidget *parent) : QWidget(parent)
 {
@@ -131,22 +167,7 @@ ChatInput::ChatInput(QWidget *parent) : QWidget(parent)
     // ===== 2 行：发送按钮行（固定高，靠右）=====
     sendButton = new QPushButton("发送", this);
     sendButton->setFixedSize(60, 30);
-    sendButton->setStyleSheet(R"(
-        QPushButton {
-            border: none;
-            border-radius: 15px;
-            background-color: #4a90d9;
-            color: white;
-            font-size: 14px;
-            font-weight: 500;
-        }
-        QPushButton:hover {
-            background-color: #3a80c9;
-        }
-        QPushButton:disabled {
-            background-color: #a0a0a0;
-        }
-    )");
+    sendButton->setStyleSheet(kSendButtonQss);
     sendButton->setEnabled(false);
     layout->addWidget(sendButton, 2, 1, 1, 1, Qt::AlignRight | Qt::AlignVCenter);
     layout->setRowStretch(2, 0);   // 固定行
@@ -183,20 +204,55 @@ ChatInput::ChatInput(QWidget *parent) : QWidget(parent)
     // 注意 adjustHeight 之前漏连了，输入框从来不会自动长高（文本一多就被布局硬挤）
     connect(inputEdit, &QTextEdit::textChanged, this, [this]() {
         adjustHeight();
-        sendButton->setEnabled(!inputEdit->toPlainText().trimmed().isEmpty());
+        // 回答中（停图标态）按钮常亮，不受输入内容影响
+        sendButton->setEnabled(m_sending || !inputEdit->toPlainText().trimmed().isEmpty());
     });
 
     // 初始高度按"空内容"算一次，保证最小高度生效
     adjustHeight();
 }
 
+void ChatInput::setSendingState(bool sending)
+{
+    if (m_sending == sending) {
+        
+        return;
+    }
+    m_sending = sending;
+
+    if (sending) {
+        // 去掉"发送"两个字，换成圆形 stop 图标：30×30 + 半径 15 正好是圆。
+        // 背景仍是原来的蓝底，图标用 svg 原色（黑），不做染色
+        sendButton->setText(QString());
+        sendButton->setIcon(QIcon(":/res/icon/stop.svg"));
+        sendButton->setIconSize(QSize(18, 18));
+        sendButton->setFixedSize(30, 30);
+        sendButton->setStyleSheet(kStopButtonQss);
+        sendButton->setEnabled(true);   // 回答中要能点（停止本轮），不能被"输入为空"关掉
+    } else {
+        sendButton->setIcon(QIcon());
+        sendButton->setText("发送");
+        sendButton->setFixedSize(60, 30);
+        sendButton->setStyleSheet(kSendButtonQss);
+        sendButton->setEnabled(!inputEdit->toPlainText().trimmed().isEmpty());
+    }
+}
+
 void ChatInput::onSendClicked()
 {
+    // 停止态：按钮现在的语义是"停止本轮"，不能当成发送（也不清空用户已经打的字）。
+    // 这里只喊一声，真正发停止包 / 改状态由页面自己做（输入框不碰业务）
+    if (m_sending) {
+        emit stopRequested();
+        return;
+    }
+
     QString content = inputEdit->toPlainText().trimmed();//去掉首尾空格
     if (!content.isEmpty()) {
         emit sendMessage(content);
         inputEdit->clear();
-        sendButton->setEnabled(false);
+        // 回答中切到停图标态后按钮保持常亮（见 setSendingState），这里别一刀切关掉
+        sendButton->setEnabled(m_sending);
     }
 }
 
@@ -327,6 +383,10 @@ bool ChatInput::eventFilter(QObject* watched, QEvent* event)
 
 void ChatInput::onEnterPressed()
 {
+    // 停止态下回车不算发送（同 onSendClicked 的理由）
+    if (m_sending) {
+        return;
+    }
     if (sendButton->isEnabled()) {
         onSendClicked();
     }

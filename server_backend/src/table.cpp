@@ -1,5 +1,6 @@
 #include "table.h"
 #include"FunctionalFunction.h"
+#include "agent_tcp.h"
 #include <limits>
 
 namespace
@@ -105,6 +106,20 @@ CmdType JsonToCmdType(std::string type) {
     if (type=="pull_delete_friend_cache") return CmdType::PullDelFriendCache;
     if (type=="ack_delete_friend_cache") return CmdType::AckDelFriendCache;
     if (type=="examine") return CmdType::Examine;
+    if (type=="agent_request") return CmdType::AgentRequest;
+    // 注意这里全部用下划线风格，和 agent_request 保持一致；
+    // 大小写不统一是本项目的历史包袱（login 小写、ModifyNam 驼峰），新增的别再添乱
+    if (type=="agent_message_create") return CmdType::AgentMessageCreate;
+    if (type=="agent_stop") return CmdType::AgentStop;
+    if (type=="agent_session_create") return CmdType::AgentSessionCreate;
+    if (type=="agent_session_rename") return CmdType::AgentSessionRename;
+    if (type=="agent_session_delete") return CmdType::AgentSessionDelete;
+    // 请求叫 pull，响应包类型才叫 agent_sessions_list，按协议表的命名分别写死
+    if (type=="agent_sessions_pull") return CmdType::AgentSessionsList;
+    // 旧名字保底：早期客户端发的是 agent_sessions_list，别让它们掉进 Unknown
+    if (type=="agent_sessions_list") return CmdType::AgentSessionsList;
+    // 审批回执：客户端对 agent_approval_required 做了决定，服务器据此续跑那一轮
+    if (type=="agent_approve") return CmdType::AgentApprove;
 
     return CmdType::Unknown;
 }
@@ -127,6 +142,9 @@ std::string HandleLogin(const json& req, mysqlconn& conn, SessionPtr session)
             session->account = account;
             session->login_state = true;
             OnlineSessionManager::Instance().addSession(account, session);
+            // 登录成功即停止未登录计数：清空限流窗口
+            session->limit_time = 0;
+            session->unlogin_count = 0;
             // 正常登录：签发一个全新的16位临时令牌（同账号旧令牌立即作废，键存在即覆盖、不存在即新建），
             // 随登录响应一起下发给客户端
             rsp["token"] = OnlineSessionManager::Instance().issueNewToken(account);
@@ -195,6 +213,9 @@ std::string HandleReconnectLogin(const json& req, mysqlconn&, SessionPtr session
         session->account = account;
         session->login_state = true;
         OnlineSessionManager::Instance().addSession(account, session);
+        // 重连成功同样停止未登录计数
+        session->limit_time = 0;
+        session->unlogin_count = 0;
     }
 
     std::cout << rsp.dump();
@@ -931,5 +952,552 @@ std::string HandleExamine(const json& req, mysqlconn&, SessionPtr session)
     rsp["success"] = true;
 
     std::cout << "[Examine心跳] 回带 examineId=" << rsp["examineId"].dump() << std::endl;
+    return rsp.dump();
+}
+
+// 智能体请求：前端发起一次对话。
+//
+// 关键点：这里绝不能在客户端线程里直接调智能体——那是至少几百毫秒、多则几十秒的阻塞，
+// 而客户端心跳是 3 秒一发、等 1 秒、连续超 3 次就断线重连，
+// 把调用写在返回路径上，用户一定会看到"发了条消息然后就掉线"。
+//
+// 所以这里只做三件事：校验 -> 用户提问入库 -> 入队并立刻回 ack，
+// 真正的答案稍后由 worker 以 agent_response 推送回同一个连接。
+std::string HandleAgentRequest(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("agent_response");
+    }
+
+    // 协议要求三个字段全带：会话ID（客户端生成）、消息ID（agent_message_create 分配的）、
+    // 问题正文。先全部取出来，后面每条失败回包都要回显它们，
+    // 客户端才能把"这条报错"归到某条会话线、某个气泡上
+    const std::string threadId  = req.value<std::string>("threadId", "");
+    const std::string messageId = req.value<std::string>("messageId", "");
+    const std::string prompt    = req.value<std::string>("prompt", "");
+
+    // 每个失败分支都必须带 done=true：客户端已经把气泡挂成"思考中"，
+    // 收不到 done 这条会话就永久卡在"回答中"，用户再也发不出新问题
+    auto replyFail = [threadId, messageId](int code, const std::string& message)
+    {//lambda函数固定格式:[捕获列表](参数列表) -> 返回类型 { 函数体 }`[]` 捕获列表：**创建 lambda 的时候，就把值 “封包固定下来” 的上下文变量**（环境变量）
+        json rsp;
+        rsp["type"]     = "agent_response";
+        rsp["threadId"] = threadId;
+        rsp["serverId"] = messageId;   // 客户端会忽略，带着方便抓包定位
+        rsp["answer"]   = "";
+        rsp["content"]  = "";
+        rsp["code"]     = code;
+        rsp["message"]  = message;
+        rsp["success"]  = false;
+        rsp["done"]     = true;
+        rsp["finished"] = true;
+        return rsp.dump();
+    };
+
+    if (threadId.empty())
+    {
+        return replyFail(400, "会话ID不能为空");
+    }
+    // 会话ID 必须是纯数字。这不只是数据校验，还是"智能体 thread_id 拼接"能成立的前提：
+    // 发给智能体的是 "会话ID + 'n' + 账号"，只有两段都是纯数字，
+    // 字母 'n' 才一定不会出现在任何一段里，解包时取第一个 'n' 才是唯一分界点。
+    // 放进来一个带 'n' 的会话ID，拼出来的串就有两个 'n'，还原时会拆错位置。
+    // （会话建表那边也是按 INT 存的，这里卡住和库侧语义一致）
+    if (!IsAllDigits(threadId))
+    {
+        return replyFail(400, "会话ID格式非法");
+    }
+    if (messageId.empty())
+    {
+        return replyFail(400, "消息ID不能为空");
+    }
+    // 消息ID 只可能来自服务器自己发的号（纯数字），
+    // 这里卡一道既能挡住乱塞的内容，也能在将来落库时直接当整数用
+    if (!IsAllDigits(messageId))
+    {
+        return replyFail(400, "消息ID格式非法");
+    }
+    if (prompt.empty())
+    {
+        return replyFail(400, "问题内容不能为空");
+    }
+    // 长度按"字"算而不是按字节：协议写的是 4000 字，
+    // 按字节卡的话中文一千多字就会被误判超长
+    if (Utf8Length(prompt) > 4000)
+    {
+        return replyFail(413, "问题内容过长");
+    }
+
+    // ===== 用户提问入库 =====
+    // 客户端的两步流程：
+    //   1) 先发 agent_message_create，服务器调 Create_agent_message 建一行
+    //      （thread_id/user_id 已填，user_message 为空）并把自增主键回给客户端；
+    //   2) 客户端拿这个ID 本地落库占坑，再带着它 + 问题正文发 agent_request。
+    // 所以这一步要做的是把问题正文回填进那一行（过程 Insert_agent_message）。
+    //
+    // 智能体的回答不入库：服务器不做消息持久化，回答只实时推给客户端，
+    // 由客户端自己存本地库。同一段文字存两遍必然会有对不上的一天。
+    //
+    // 必须放在 Submit 之前：worker 一旦跑起来就可能开始回包，
+    // 而入库是"这条消息存在"的唯一凭据，比任何回包都早算数。
+    uint32_t numericMessageId = 0;
+    if (!ParseUint32(messageId, numericMessageId))
+    {
+        return replyFail(400, "消息ID超出范围");
+    }
+
+    int persistCode = -1;
+    if (!conn.callInsertAgentMessage(numericMessageId, prompt, persistCode))
+    {
+        return replyFail(500, "服务器异常，保存消息失败");
+    }
+    // retCode=2 表示占位行不存在：客户端跳过了 agent_message_create，
+    // 或者会话被删时连带清了消息。属于业务性缺失，不算服务器故障
+    if (persistCode == 2)
+    {
+        return replyFail(404, "消息不存在，请重新发起提问");
+    }
+    if (persistCode != 1)
+    {
+        return replyFail(500, "服务器异常，保存消息失败");
+    }
+
+    AgentTask task;
+    // 账号只认登录会话，请求里那个 userId 一概不看：
+    // 否则改个包就能拿别人的身份往别人的会话里塞消息
+    task.account   = session->account;
+    task.threadId  = threadId;
+    task.messageId = messageId;
+    task.prompt    = prompt;
+    // 存 weak_ptr：worker 只在推送时短暂持有，不会拖住会话对象的生命周期
+    task.session   = session;
+
+    // ===== ack 门 =====
+    // 先造好闸门（初值 false）挂到任务上，worker 靠它判断"能不能开始推包"。
+    // 为什么必须要有这个闸门：Submit 一返回 worker 就可能开始跑，而 ack 要等本函数
+    // 返回后由 ClientWork 才写进 socket —— 两条路径没有任何先后保证。
+    // mock 分支几微秒就出结果，几乎必然抢在 ack 前面，客户端就会先看到回答、后启动看门狗，
+    // 甚至把这条回答当成"上一轮迟到包"直接丢掉。
+    const auto ackSent = std::make_shared<std::atomic<bool>>(false);
+    task.ackSent = ackSent;
+
+    uint64_t requestId = 0;
+    if (!agent_tcp::Instance().Submit(std::move(task), requestId))
+    {
+        // 队列已满 = 后端拒不住了，直接告诉客户端稍后再试（背压）。
+        // 这里没提交成功，worker 永远不会来等这个闸门，所以直接丢掉就行
+        return replyFail(503, "服务器繁忙，请稍后再试");
+    }
+
+    // 受理确认。协议里这一包"只需 type"——客户端收到它才启动
+    // "5 分钟没有新包就自动收尾"的看门狗，所以只带成功标记，越简单越不会出错。
+    // 顺序很重要：必须 Submit 成功后再回 ack。反过来客户端会为一个压根没排上队的
+    // 请求启动看门狗，白等 5 分钟再自己发 agent_stop
+    json ack;
+    ack["type"]    = "agent_request_ack";
+    ack["code"]    = 0;
+    ack["message"] = "";
+    ack["success"] = true;
+
+    std::cout << "[agent] 已受理 requestId=" << requestId
+              << " account=" << session->account
+              << " threadId=" << threadId
+              << " messageId=" << messageId << std::endl;
+
+    // 这一包不走"返回字符串让 ClientWork 发"的老路，而是当场自己写 socket：
+    // 只有 ack 真的落进 socket 之后才能放行 worker，而返回值要等本函数返回后
+    // 才轮到 ClientWork 去发，中间隔着一次函数返回，放行时机就说不准了。
+    // SendJson 内部持 sendMtx 并检查 closed，和 worker 的推送不会拼出半行 JSON。
+    if (!session->SendJson(ack.dump() + "\n"))
+    {
+        std::cout << "[agent] ack 发送失败（连接可能已断）requestId=" << requestId << std::endl;
+    }
+
+    // 无论 ack 发没发出去都必须放行：连接断了客户端的看门狗也没意义了，
+    // 但 worker 不能因为这一位没人置真而永远卡在闸门上白占一个线程
+    ackSent->store(true, std::memory_order_release);
+
+    // 返回空串 = 本条请求的应答已经自己发完了。
+    // JsonParsing 见空串就不再组包，ClientWork 也不会重复发送
+    return "";
+}
+
+// 提问第一步：向服务器申请一条消息ID。
+// 客户端拿到 agent_message_created 里的 messageId 才本地落库，再带着它发 agent_request，
+// 所以这个包失败时客户端不会继续提问——success=false 必须给出原因。
+//
+// 这里的 messageId 必须来自数据库自增主键（过程 Create_agent_message），
+// 不能像以前那样在内存里造一个"时间戳+序号"：
+// 客户端和服务器要靠同一个号对上同一行消息，服务器侧凭空造号就没有那一行，
+// 用户提问和 AI 回答也就无处可写 —— 表现就是消息永远不入库。
+std::string HandleAgentMessageCreate(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    // 这个包里它叫 sessionId，和 agent_request 里的 threadId 是同一个东西
+    const std::string sessionId = req.value<std::string>("sessionId", "");
+
+    // 未登录也走自己的组包（不能用 NotLoginResponse）：协议要求
+    // agent_message_created 无论成败都回显 sessionId，缺了客户端就丢弃整个包
+    if (!IsLoggedIn(session))
+    {
+        json rsp;
+        rsp["type"]      = "agent_message_created";
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 401;
+        rsp["message"]   = "当前登录状态异常请重新登录";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    json rsp;
+    rsp["type"] = "agent_message_created";
+
+    // 会话ID 必须是纯数字：库里 thread_id 是 INT，而且发给智能体时
+    // 要用它拼 "会话ID + 'n' + 账号"，非数字会让拼接串出现多个 'n' 拆不回来。
+    // 卡在这一步（而不是等 agent_request 再报错）是因为此时客户端还没落库，
+    // 失败成本最低
+    if (sessionId.empty() || sessionId.size() > 10 || !IsAllDigits(sessionId))
+    {
+        // 失败也要回显 sessionId：客户端靠它匹配在飞的申请，缺了就整个包丢弃
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 400;
+        rsp["message"]   = "会话ID非法";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 这里不查会话表：会话ID 是客户端生成的，服务器只负责存储，
+    // "会话还没建就先提问"是允许的，不该在这一步拦
+    //
+    // 但消息本身必须真的建行：客户端接下来会拿这个ID本地落库并开始对话，
+    // 服务器这边没有对应的行，用户提问就永远落不了库（正文无处回填）。
+    uint32_t threadId = 0;
+    if (!ParseUint32(sessionId, threadId))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 400;
+        rsp["message"]   = "会话ID超出范围";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 账号只认登录会话，请求里的 userId 一概不看：否则改个包就能往别人账号下建消息
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 401;
+        rsp["message"]   = "当前登录状态异常请重新登录";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 失败也要回显 sessionId：客户端靠它匹配在飞的申请，缺了就整个包丢弃
+    uint32_t messageId = 0;
+    int retCode = -1;
+    if (!conn.callCreateAgentMessage(threadId, userId, messageId, retCode))
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 500;
+        rsp["message"]   = "服务器异常，创建消息失败";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+    if (retCode != 1 || messageId == 0)
+    {
+        rsp["sessionId"] = sessionId;
+        rsp["messageId"] = "";
+        rsp["code"]      = 500;
+        rsp["message"]   = "服务器异常，创建消息失败";
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    rsp["sessionId"] = sessionId;
+    // 协议层是字符串，但值就是数据库的自增主键，两边直接对得上
+    rsp["messageId"] = std::to_string(messageId);
+    rsp["code"]      = 0;
+    rsp["message"]   = "";
+    rsp["success"]   = true;
+
+    std::cout << "[agent] 创建消息 account=" << session->account
+              << " sessionId=" << sessionId
+              << " messageId=" << messageId << std::endl;
+    return rsp.dump();
+}
+
+namespace
+{
+    // 会话操作（create/rename/delete）的失败包。
+    // 三件事必须同时成立：包类型对、op 对、sessionId 原样回显。
+    // 少了 sessionId 客户端会直接丢弃这个包，用户看到的就是"操作转圈5秒后失败"
+    std::string SessionFailResponse(const std::string& op, const std::string& sessionId,
+                                    int code, const std::string& message)
+    {
+        json rsp;
+        rsp["type"]      = "agent_session_response";
+        rsp["op"]        = op;
+        rsp["sessionId"] = sessionId;
+        rsp["code"]      = code;
+        rsp["message"]   = message;
+        rsp["success"]   = false;
+        return rsp.dump();
+    }
+
+    // 会话操作公共前置校验：会话ID 非空 + 名称按 UTF-8 字符数不超过 varchar(255)
+    // 返回空串表示通过，否则就是要直接回给客户端的原因
+    std::string CheckSessionArgs(const std::string& sessionId, const std::string& title)
+    {
+        if (sessionId.empty())
+        {
+            return "会话ID不能为空";
+        }
+        if (Utf8Length(title) > 255)
+        {
+            return "会话名称过长";
+        }
+        return "";
+    }
+}
+
+// 中止当前会话正在进行（或还在排队）的回答。
+// 协议规定这一包无回执：客户端发出即自行解锁，不等服务器应答；
+// 服务器之后漏发过来的 agent_response 也会被客户端直接丢弃。
+// 所以这里故意返回空串——JsonParsing 见到空串就不组包，ClientWork 也不会 send。
+std::string HandleAgentStop(const json& req, mysqlconn&, SessionPtr session)
+{
+    const std::string threadId = req.value<std::string>("threadId", "");
+
+    // 未登录或参数不全也照样不回包：这一条本来就没有应答，
+    // 补一个 401 反而会让客户端收到一条它没在等的 agent_response
+    if (!IsLoggedIn(session) || threadId.empty())
+    {
+        std::cout << "[agent_stop] 忽略：未登录或会话ID为空" << std::endl;
+        return "";
+    }
+
+    // 账号取自登录会话，和 agent_request 入队时用的键是同一个，
+    // 这样才能精确命中那条任务
+    const bool taken = agent_tcp::Instance().Cancel(session->account, threadId);
+
+    std::cout << "[agent_stop] account=" << session->account
+              << " threadId=" << threadId
+              << " 结果=" << (taken ? "已中止，worker 不再推送" : "无可中止任务") << std::endl;
+    return "";
+}
+
+// 审批回执：客户端对 agent_approval_required 做了决定（同意 / 拒绝），服务器据此续跑那一轮。
+//
+// 和 agent_stop 不同，这一包**必须有回执**：客户端点完按钮要立刻解锁界面，
+// 而续跑的执行段可能几百毫秒之后才开始吐字，中间没有别的包可等。
+// 所以失败也回一条 agent_approve_ack{success=false, message}，让客户端能正常收尾。
+//
+// 真正的“把决定发回智能体”这段不在这里：按项目分层，table 只做参数校验和组包，
+// 提交动作交给 agent_tcp（它本来就是干这个的），和 agent_request 保持一个口径。
+std::string HandleAgentApprove(const json& req, mysqlconn&, SessionPtr session)
+{
+    const std::string threadId  = req.value<std::string>("threadId", "");
+    const std::string messageId = req.value<std::string>("serverId", "");
+    const std::string note      = req.value<std::string>("note", "");
+    const bool        approved  = req.value<bool>("approved", false);
+
+    // 失败回执统一走这里：客户端一定要收到一条 ack 才能解锁，不能默默了事
+    const auto failAck = [&](int code, const std::string& message) -> std::string
+    {
+        json ack;
+        ack["type"]     = "agent_approve_ack";
+        ack["threadId"] = threadId;
+        ack["serverId"] = messageId;
+        ack["code"]     = code;
+        ack["message"]  = message;
+        ack["success"]  = false;
+        return ack.dump();
+    };
+
+    if (!IsLoggedIn(session))
+    {
+        return failAck(401, "登录已失效，请重新登录");
+    }
+    if (threadId.empty())
+    {
+        return failAck(400, "会话ID不能为空");
+    }
+    // 拒绝理由要进日志和提示，长度按“字”卡，和 prompt 一个口径
+    if (Utf8Length(note) > 500)
+    {
+        return failAck(413, "审批说明过长");
+    }
+
+    // ===== ack 门 =====
+    // 和 agent_request 完全一样的理由：SubmitApprove 一返回 worker 就可能开始推包，
+    // 而 ack 要等本函数返回后才写进 socket。续跑的 token 抢在 ack 前面到，
+    // 客户端就会把正在进行的回答当成过期包直接丢掉。
+    const auto ackSent = std::make_shared<std::atomic<bool>>(false);
+
+    uint64_t requestId = 0;
+    const bool submitted = agent_tcp::Instance().SubmitApprove(
+        session->account, threadId, messageId, approved, note, session, ackSent, requestId);
+
+    if (!submitted)
+    {
+        // 两种可能：这条会话根本没有待审批任务（重复点了 / 已被停止 /
+        // 服务重启把内存里的挂起记录丢了），或者队列满被拒。
+        // 客户端拿到这条就知道按钮点空了，可以提示用户重新发起
+        return failAck(404, "没有待审批的任务，可能已被处理或已取消");
+    }
+
+    json ack;
+    ack["type"]      = "agent_approve_ack";
+    ack["threadId"]  = threadId;
+    ack["serverId"]  = messageId;
+    // 服务器内部编号，只供日志排查，客户端可以忽略
+    ack["requestId"] = std::to_string(requestId);
+    ack["approved"]  = approved;
+    ack["code"]      = 0;
+    ack["message"]   = "";
+    ack["success"]   = true;
+
+    std::cout << "[agent_approve] 已受理 requestId=" << requestId
+              << " account=" << session->account
+              << " threadId=" << threadId
+              << " approved=" << (approved ? "true" : "false") << std::endl;
+
+    // 和 agent_request 一样：当场写 socket，写完再放行 worker。
+    // 只有 ack 真的进了 socket 才能让执行段开始推包
+    if (!session->SendJson(ack.dump() + "\n"))
+    {
+        std::cout << "[agent_approve] ack 发送失败（连接可能已断）requestId="
+                  << requestId << std::endl;
+    }
+
+    // 发不出去也必须放行：客户端断线了看门狗也没意义，
+    // 但 worker 不能因为这一位没人置真而永远卡在闸门上白占一个线程
+    ackSent->store(true, std::memory_order_release);
+
+    // 返回空串 = 应答已经自己发完了，JsonParsing 不会再组包
+    return "";
+}
+
+// 新建会话。userId 从请求里读的那份一律丢掉，只用登录会话里的账号：
+// 否则谁都能往别人账号下塞会话
+std::string HandleAgentSessionCreate(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    const std::string sessionId = req.value<std::string>("sessionId", "");
+
+    // 未登录也不能用 NotLoginResponse：那个包里没有 sessionId，
+    // 而协议要求三件套必须原样回显 sessionId，缺了客户端会整个包丢弃，
+    // 用户看到的就是"转圈 5 秒后操作失败"
+    if (!IsLoggedIn(session))
+    {
+        return SessionFailResponse("create", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    const std::string title = req.value<std::string>("title", "");   // 空则业务层补"新会话"
+
+    const std::string invalid = CheckSessionArgs(sessionId, title);
+    if (!invalid.empty())
+    {
+        return SessionFailResponse("create", sessionId, 400, invalid);
+    }
+
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        return SessionFailResponse("create", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    json rsp;
+    CreateAgentSession(rsp, userId, sessionId, title, conn);
+    return rsp.dump();
+}
+
+std::string HandleAgentSessionRename(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    const std::string sessionId = req.value<std::string>("sessionId", "");
+
+    // 同上：未登录也要回显 sessionId，否则客户端匹配不上这条在飞请求
+    if (!IsLoggedIn(session))
+    {
+        return SessionFailResponse("rename", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    const std::string title = req.value<std::string>("title", "");
+
+    const std::string invalid = CheckSessionArgs(sessionId, title);
+    if (!invalid.empty())
+    {
+        return SessionFailResponse("rename", sessionId, 400, invalid);
+    }
+
+    // 重命名必须真的给个名字，否则会把会话改成"新会话"，等于把用户起的名字弄丢了
+    if (title.empty())
+    {
+        return SessionFailResponse("rename", sessionId, 400, "会话名称不能为空");
+    }
+
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        return SessionFailResponse("rename", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    json rsp;
+    RenameAgentSession(rsp, userId, sessionId, title, conn);
+    return rsp.dump();
+}
+
+std::string HandleAgentSessionDelete(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    const std::string sessionId = req.value<std::string>("sessionId", "");
+
+    // 同上：未登录也要回显 sessionId
+    if (!IsLoggedIn(session))
+    {
+        return SessionFailResponse("delete", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    if (sessionId.empty())
+    {
+        return SessionFailResponse("delete", sessionId, 400, "会话ID不能为空");
+    }
+
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        return SessionFailResponse("delete", sessionId, 401, "当前登录状态异常请重新登录");
+    }
+
+    json rsp;
+    DeleteAgentSession(rsp, userId, sessionId, conn);
+    return rsp.dump();
+}
+
+// 拉取全部会话列表。这一份是客户端判断"服务器上到底有哪些会话"的唯一依据，
+// 所以失败时必须明确 success=false，不能回空列表（否则客户端会把本地会话清空）
+std::string HandleAgentSessionsList(const json& req, mysqlconn& conn, SessionPtr session)
+{
+    if (!IsLoggedIn(session))
+    {
+        return NotLoginResponse("agent_sessions_list");
+    }
+
+    uint32_t userId = 0;
+    if (!ParseUint32(session->account, userId))
+    {
+        json rsp;
+        rsp["type"]    = "agent_sessions_list";
+        rsp["code"]    = 401;
+        rsp["message"] = "当前登录状态异常请重新登录";
+        rsp["success"] = false;
+        return rsp.dump();
+    }
+
+    json rsp;
+    LoadAgentSessions(rsp, userId, conn);
     return rsp.dump();
 }

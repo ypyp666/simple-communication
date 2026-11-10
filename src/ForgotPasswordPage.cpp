@@ -391,6 +391,7 @@ void ForgotPasswordPage::setupUI()
     connect(m_backend, &MainBackend::modifyPwdWaiting, this, &ForgotPasswordPage::onModifyPwdWaiting);
     connect(m_backend, &MainBackend::modifyPwdSuccess, this, &ForgotPasswordPage::onModifyPwdSuccess);
     connect(m_backend, &MainBackend::modifyPwdFailed, this, &ForgotPasswordPage::onModifyPwdFailed);
+    connect(m_backend, &MainBackend::modifyPwdRateLimited, this, &ForgotPasswordPage::onModifyPwdRateLimited);
     // 网络层连不上（服务器没跑/断网）与"服务器拒绝"分开：信号带 reason，槽用不到，靠参数少的槽自动丢弃
     connect(m_backend, &MainBackend::modifyPwdNetworkError, this, &ForgotPasswordPage::onModifyPwdNetworkError);
     connect(m_backend, &MainBackend::modifyPwdTimeout, this, &ForgotPasswordPage::onModifyPwdTimeout);
@@ -791,6 +792,17 @@ void ForgotPasswordPage::onModifyPwdNetworkError()
     fSubmitBtn->setText(m_originalSubmitText);
 
     triggerErrorFeedback("无法连接服务器，请检查网络或稍后再试");
+}
+
+// 修改密码被服务器限流（code=429，点得太频繁）：收尾动作与失败分支相同（停动画/解锁/复位按钮），
+// 只有提示语区分开——不是账号问题，是点得太频繁
+void ForgotPasswordPage::onModifyPwdRateLimited()
+{
+    m_modifyPwdAnimTimer->stop();
+    setInputsEnabled(true);
+    fSubmitBtn->setText(m_originalSubmitText);
+
+    triggerErrorFeedback("操作过于频繁，请稍后再试");
 }
 
 void ForgotPasswordPage::updateSubmitButtonAnimation()

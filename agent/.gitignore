@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE
+.idea/
+
+# 本地密钥与运行期数据（只提交 .env.example）
+.env
+src/resources/*.db
+src/resources/*.db-shm
+src/resources/*.db-wal

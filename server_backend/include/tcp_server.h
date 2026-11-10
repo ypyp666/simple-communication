@@ -2,13 +2,11 @@
 #define UNTITLED_TCP_SERVER_H
 #include<iostream>
 #include <string>
-#include <queue>
 #include <pthread.h>
 
 struct ClientArg {
     int client_fd;
     std::string client_ip;
-    std::queue<char> msg_cache;
 };
 
 class TcpServer {

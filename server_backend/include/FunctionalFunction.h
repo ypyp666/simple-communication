@@ -52,4 +52,25 @@ void PullDeleteFriendCache(json& res, SessionPtr session, mysqlconn& conn);
 // deleterIds为客户端刚在本地删掉的那些联系人账号，也就是墓碑里的发起者(删除者)
 void AckDeleteFriendCache(json& res, SessionPtr session, const std::vector<uint32_t>& deleterIds, mysqlconn& conn);
 
+// ===== 智能体会话管理业务函数 =====
+// 会话ID由客户端生成，服务器只存储、不改写：库里是它，回包也得原样回它，
+// 客户端拿这个ID配对本地记录，服务器一旦改写就等于把本地记录和服务器记录拆散了
+
+// 新建会话。成功回 agent_session_response{op=create, sessionId, success=true}
+// 失败时同样回 sessionId：客户端靠它认领这次操作，拿到不带ID的包会直接丢弃
+void CreateAgentSession(json& res, uint32_t userId, const std::string& sessionId,
+                        const std::string& title, mysqlconn& conn);
+
+// 重命名会话。会话不存在时 success=false，message 写明原因
+void RenameAgentSession(json& res, uint32_t userId, const std::string& sessionId,
+                        const std::string& title, mysqlconn& conn);
+
+// 删除会话。只删自己的（数据库过程 WHERE 带 user_id）
+void DeleteAgentSession(json& res, uint32_t userId, const std::string& sessionId, mysqlconn& conn);
+
+// 拉取全部会话。回 agent_sessions_list{success, sessions[{sessionId, title}]}；
+// 查库失败必须 success=false —— 不能回一个空数组，客户端把空列表当成
+// “服务器上没有会话”，会直接把本地会话全删掉
+void LoadAgentSessions(json& res, uint32_t userId, mysqlconn& conn);
+
 #endif //UNTITLED_FUNCTIONALFUNCTION_H
