@@ -39,11 +39,11 @@ AgentWindow::AgentWindow(QWidget *parent, MainBackend* backend) : QWidget(parent
     //    （之前是"本地先落库再发服务器"，现已改成服务器优先，失败时本地什么都不用回滚）
     connect(chatArea, &AgentChatArea::sessionCreateRequested,
             this, &AgentWindow::onSessionCreateRequested);
-    // ② 用户发消息 → 服务器分配消息 ID → 落库成功 → 才发 agent_request（主后端串这条链）
+    // ② 用户发消息 → 本地先落库（临时 ID）→ 服务器分配正式 ID → 替换本地主键 → 才发 agent_request
     connect(chatArea, &AgentChatArea::sendMessage, this,
-            [this](const QString& sessionId, const QString& content) {
+            [this](const QString& sessionId, const QString& content, const QString& localId) {
         if (this->backend) {
-            this->backend->sendAgentMessage(sessionId, content);
+            this->backend->sendAgentMessage(sessionId, content, localId);
         }
     });
     // ⑦ 结束本轮（点 stop / 切会话 / 离开页面）→ 主后端发 agent_stop 并清掉落库消息 ID
@@ -95,6 +95,9 @@ AgentWindow::AgentWindow(QWidget *parent, MainBackend* backend) : QWidget(parent
                 this, &AgentWindow::onAgentTaskUnsupported);
         connect(backend, &MainBackend::agentTaskFailed,
                 this, &AgentWindow::onAgentTaskFailed);
+        // 成功也提示：没有这一条，用户点完「同意」就只能靠猜结果
+        connect(backend, &MainBackend::agentTaskSucceeded,
+                this, &AgentWindow::onAgentTaskSucceeded);
         // 首次进来就把已有会话列表拉到抽屉里（异步，回包后再渲染）
         backend->loadAgentSessions();
     }
@@ -467,6 +470,13 @@ void AgentWindow::onAgentTaskUnsupported(const QString& action)
 void AgentWindow::onAgentTaskFailed(const QString& message)
 {
     // 接口原始 message 直接显示，不自动重试（删除类操作重试可能变成删错人）
+    showToast(message);
+}
+
+void AgentWindow::onAgentTaskSucceeded(const QString& message)
+{
+    // 成功也必须出声：审批卡收掉以后界面上没有任何变化，
+    // 用户分不清是办成了还是根本没执行
     showToast(message);
 }
 

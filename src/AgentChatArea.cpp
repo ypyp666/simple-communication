@@ -427,12 +427,14 @@ void AgentChatArea::onInputSend(const QString& content)
     // 下一次回答也不会被拼进上一轮那个气泡里
     m_streamMessageId.clear();
 
-    // 气泡上那个 ID 只用于本屏渲染；真正落库的消息 ID 由服务器分配（见 MainBackend）
-    appendMessageWidget(content, true, newMessageId());
+    // 这个本地 ID 同时用于两件事：本屏气泡的 key、主后端"先落库"的临时主键。
+    // 服务器分到正式 ID 后只替换库里的主键，界面这边不用改
+    const QString localId = newMessageId();
+    appendMessageWidget(content, true, localId);
     scrollToBottom();
     // 先切"回答中"再发：发送被拒（同会话在跑 / 未连接）时，失败回调会同步把按钮切回来
     setSendingState(true);
-    emit sendMessage(m_sessionId, content);
+    emit sendMessage(m_sessionId, content, localId);
 }
 
 // 服务器回答逐段到达：第一段先开一个 AI 气泡，之后都拼进同一个气泡；
@@ -441,6 +443,16 @@ void AgentChatArea::receiveAgentChunk(const QString& sessionId, const QString& c
 {
     if (sessionId != m_sessionId) {
         return;   // 回答属于别的会话（比如用户已经新建/切走），当前页面不显示
+    }
+
+    // 没有正文就别开气泡。审批轮的最后一条是 done（answer 为空），按老逻辑会
+    // 建一个空气泡再把空内容拼进去 —— 屏幕上多出一个空白圆角框，用户根本不知道
+    // 它代表什么。这里提前挡住：这一轮本来就没有话要说，只把"回答中"状态收掉即可
+    if (content.isEmpty() && m_streamMessageId.isEmpty()) {
+        if (finished) {
+            setSendingState(false);   // 本轮结束，按钮从 stop 图标回到"发送"
+        }
+        return;
     }
 
     if (m_streamMessageId.isEmpty()) {
@@ -452,9 +464,21 @@ void AgentChatArea::receiveAgentChunk(const QString& sessionId, const QString& c
         scrollToBottom();
     }
     if (finished) {
+        // 收尾前把缓冲里最后一段强制落屏：合流是 30ms 一批，不 flush 的话
+        // 最后几个字会卡在缓冲里，用户看到"回答已结束但末尾少一截"
+        flushStreamItem();
         m_streamMessageId.clear();
         setSendingState(false);   // 本轮结束，按钮从 stop 图标回到"发送"
     }
+}
+
+void AgentChatArea::flushStreamItem()
+{
+    auto it = m_items.find(m_streamMessageId);
+    if (it == m_items.end()) {
+        return;   // 气泡已经不在（清屏 / 切会话），缓冲随控件一起销毁
+    }
+    it.value()->flushPending();
 }
 
 void AgentChatArea::receiveAgentFailure(const QString& sessionId, const QString& message)
@@ -462,6 +486,7 @@ void AgentChatArea::receiveAgentFailure(const QString& sessionId, const QString&
     if (sessionId != m_sessionId) {
         return;
     }
+    flushStreamItem();
     m_streamMessageId.clear();
     setSendingState(false);   // 本轮失败即结束，按钮回"发送"
     addMessage(QString("请求失败：%1").arg(message), false);
@@ -528,8 +553,15 @@ void AgentChatArea::clearMessages()
 
 void AgentChatArea::scrollToBottom()
 {
+    // 滚动合流：流式期间每批增量都会喊一次"滚到底"，每次都新建一个单次定时器
+    // 会堆出几十个待执行任务。这里只让第一个排一次，后面的调用全部合并掉
+    if (m_scrollPending) {
+        return;
+    }
+    m_scrollPending = true;
     // 延迟到布局算完再滚，否则拿到的 maximum 还是旧值
     QTimer::singleShot(10, this, [this]() {
+        m_scrollPending = false;
         QScrollBar* scrollBar = m_scrollArea->verticalScrollBar();
         if (scrollBar == nullptr) {
             return;

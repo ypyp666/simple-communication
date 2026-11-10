@@ -87,6 +87,8 @@ MainBackend::MainBackend(QObject* parent)
             m_databaseManager, &DatabaseManager::createAgentSession);
     connect(this, &MainBackend::dbSaveAgentMessageRequested,
             m_databaseManager, &DatabaseManager::saveAgentMessage);
+    connect(this, &MainBackend::dbReplaceAgentMessageIdRequested,
+            m_databaseManager, &DatabaseManager::replaceAgentMessageId);
     connect(this, &MainBackend::dbSaveAgentMessageChunkRequested,
             m_databaseManager, &DatabaseManager::saveAgentMessageChunk);
     connect(this, &MainBackend::dbLoadAgentMessagesRequested,
@@ -223,6 +225,8 @@ MainBackend::MainBackend(QObject* parent)
             this, &MainBackend::onAgentMessageIdAllocateFailed);
     connect(m_databaseManager, &DatabaseManager::agentMessageSaved,
             this, &MainBackend::onAgentMessageSaved);
+    connect(m_databaseManager, &DatabaseManager::agentMessageIdReplaced,
+            this, &MainBackend::onAgentMessageIdReplaced);
     // 登录后拉回的服务器会话列表：纯转发到 DB 线程做核对，主线程不做任何判断，
     // 所以信号对信号直接接
     connect(m_agentBackend, &AgentBackend::agentSessionsPulled,
@@ -712,8 +716,10 @@ void MainBackend::onSetRemarkSuccess(const QString& targetId)
     emit setContactRemarkSuccess(contactId, m_pendingRemark);      // 通知详情页把旧值刷成新值
     m_pendingRemarkContactId.clear();
     m_pendingRemark.clear();
-    // 这条如果是智能体指令发起的，成功就把它从"等结果"里摘掉（不用提示）
-    m_agentPendingRemarks.remove(contactId);
+    // 这条如果是智能体指令发起的，成功也要说一声（失败会单独提示，见 onSetRemarkFailed）
+    if (m_agentPendingRemarks.remove(contactId) > 0) {
+        emit agentTaskSucceeded(QStringLiteral("好友备注已更新"));
+    }
 }
 
 // 改备注失败：回包不带 remark（也不一定带 targetId），把发出时记下的补上再上抛，
@@ -769,8 +775,10 @@ void MainBackend::onFriendDeleteSuccess(const QString& targetId)
     emit dbDeleteContactRequested(targetId);  // 删本地库
     loadContacts();                           // 重拉通讯录 → ContactList 自动刷新
     emit friendDeleted(targetId);             // 通知 UI：主界面接去删掉该好友的会话（见 MainWindow ⑩）
-    // 这条如果是智能体指令发起的，成功就摘掉（不用提示）
-    m_agentPendingDeletes.remove(targetId);
+    // 这条如果是智能体指令发起的，成功也要说一声（删除不可逆，用户更要确认结果）
+    if (m_agentPendingDeletes.remove(targetId) > 0) {
+        emit agentTaskSucceeded(QStringLiteral("已按你的要求删除该好友"));
+    }
 }
 
 // 服务器侧的"删好友"落到本地：离线墓碑与在线被删推送共用这一份逻辑，
@@ -1070,53 +1078,78 @@ void MainBackend::createAgentSession(const QString& sessionId, const QString& ti
     m_agentBackend->sendAgentSessionCreate(sessionId, title);
 }
 
-// 提问第一阶段：只先把问题暂存下来，向服务器申请这条消息的 ID。
-// 真正的落库 + 发对话请求都在拿到 ID 之后（见 onAgentMessageIdAllocated / onAgentMessageSaved）
-void MainBackend::sendAgentMessage(const QString& sessionId, const QString& content)
+// 提问第一阶段：本地先存（用 UI 生成的临时 ID），存成功才去服务器要正式 ID。
+// 这样"自己发出去的消息"一定是先落在本地的——断线、崩溃、服务器拒绝都不会让
+// 本地历史里少掉这条提问（离线也能看到自己发过什么）
+void MainBackend::sendAgentMessage(const QString& sessionId, const QString& content,
+                                   const QString& localId)
 {
-    if (sessionId.isEmpty()) {
+    if (sessionId.isEmpty() || localId.isEmpty()) {
         return;
     }
 
     m_pendingPrompts.insert(sessionId, content);
-    m_agentBackend->requestAgentMessageId(sessionId);
+    m_pendingLocalIds.insert(sessionId, localId);
+    emit dbSaveAgentMessageRequested(sessionId, localId, content, QDateTime::currentDateTime());
 }
 
-// 服务器给了消息 ID：按这个 ID 先"空创建"一条用户消息（内容是用户刚输入的问题），
-// 落库结果回来后才发对话请求
-void MainBackend::onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId)
-{
-    const QString prompt = m_pendingPrompts.value(sessionId);
-    emit dbSaveAgentMessageRequested(sessionId, messageId, prompt, QDateTime::currentDateTime());
-}
-
-// 申请 ID 失败：这一轮走不下去了，把暂存的问题清掉，并复用请求失败信号让界面收回发送状态
-void MainBackend::onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message)
-{
-    m_pendingPrompts.remove(sessionId);
-    emit agentRequestFailed(sessionId, message);
-}
-
-// 提问第三阶段（入库回执）：成功 → 带着消息ID / 会话ID / 用户ID / 问题发 agent_request；
-// 失败 → 本轮取消（库里没存下，就不该让服务器开始回答）
+// 本地占坑成功：这时才向服务器申请正式 ID（服务器那边的提问行要靠这个 ID 对上）
 void MainBackend::onAgentMessageSaved(const QString& sessionId, const QString& messageId, bool success)
 {
-    const QString prompt = m_pendingPrompts.take(sessionId);
-
+    Q_UNUSED(messageId);
     if (!success) {
+        m_pendingPrompts.remove(sessionId);
+        m_pendingLocalIds.remove(sessionId);
         emit agentRequestFailed(sessionId, QStringLiteral("用户消息保存失败，本轮已取消"));
         return;
     }
 
-    // 用户消息更新了会话快照（最后一句/时间），重拉一次抽屉列表
+    // 用户消息更新了会话快照（最后一句/时间）：从本地库重读一次抽屉列表，不访问服务器
     emit dbLoadAgentSessionsRequested();
 
-    // 问题为空 = 用户在这一步之前已经点了停止（stopAgentMessage 清掉了暂存的问题）：
-    // 消息已经落库但不再往下发对话请求
-    if (prompt.isEmpty()) {
+    // 问题为空 = 用户在这一步之前已经点了停止：消息已落库，但不再往下发
+    if (m_pendingPrompts.value(sessionId).isEmpty()) {
+        m_pendingLocalIds.remove(sessionId);
         return;
     }
-    m_agentBackend->sendAgentRequest(sessionId, messageId, prompt);
+
+    m_agentBackend->requestAgentMessageId(sessionId);
+}
+
+// 服务器给了正式 ID：让后台线程把本地那行（临时 ID）原地改成正式 ID
+void MainBackend::onAgentMessageIdAllocated(const QString& sessionId, const QString& messageId)
+{
+    const QString localId = m_pendingLocalIds.value(sessionId);
+    if (localId.isEmpty()) {
+        return;   // 用户已停止并清掉暂存，这条 ID 没有对应的本地行
+    }
+    emit dbReplaceAgentMessageIdRequested(sessionId, localId, messageId);
+}
+
+// 正式 ID 换好了：库里那行已经是服务器认得的 ID，这时才发 agent_request
+void MainBackend::onAgentMessageIdReplaced(const QString& sessionId, const QString& newId, bool success)
+{
+    const QString prompt = m_pendingPrompts.take(sessionId);
+    m_pendingLocalIds.remove(sessionId);
+
+    if (!success) {
+        // 本地那条保留（用户至少能看到自己发过什么），只是这一轮不往下走了
+        emit agentRequestFailed(sessionId, QStringLiteral("消息编号同步失败，本轮已取消"));
+        return;
+    }
+
+    if (prompt.isEmpty()) {
+        return;   // 用户已点停止：消息已落库，不再发对话请求
+    }
+    m_agentBackend->sendAgentRequest(sessionId, newId, prompt);
+}
+
+// 申请 ID 失败：本地那条消息留着（离线可见），复用请求失败信号让界面收回发送状态
+void MainBackend::onAgentMessageIdAllocateFailed(const QString& sessionId, const QString& message)
+{
+    m_pendingPrompts.remove(sessionId);
+    m_pendingLocalIds.remove(sessionId);
+    emit agentRequestFailed(sessionId, message);
 }
 
 // 回读某个会话的历史消息（最近 50 条）：只发请求，
@@ -1136,9 +1169,10 @@ void MainBackend::stopAgentMessage(const QString& sessionId)
         m_agentBackend->stopAgentRequest(sessionId);
     }
     m_agentReplyIds.remove(sessionId);
-    // 还可能停在"申请 ID / 等落库"阶段：把暂存的问题丢掉，
-    // 之后即使 ID 回执晚到，也不会再发对话请求（见 onAgentMessageSaved 的空问题判断）
+    // 还可能停在"等落库 / 申请 ID / 替换 ID"阶段：把暂存的东西丢掉，
+    // 之后即使回执晚到，也不会再发对话请求（见 onAgentMessageIdReplaced 的空问题判断）
     m_pendingPrompts.remove(sessionId);
+    m_pendingLocalIds.remove(sessionId);
 }
 
 // 服务器逐段推回 AI 回答：先保证这一段落库，再原样转发给界面。
@@ -1374,7 +1408,35 @@ void MainBackend::executeAgentSendMessage(const QJsonObject& params)
     message.tempId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
     m_agentPendingSends.insert(message.tempId);
+
+    // 成功提示要说出「发给谁」：发送回包只带 tempId，名字只能现在记下。
+    // 指令里没带 targetName 就退化成账号显示，总比提示里说不出对象强
+    QString targetLabel = params.value("targetName").toString();
+    if (targetLabel.isEmpty()) {
+        targetLabel = targetId;
+    }
+    m_agentPendingSendNames.insert(message.tempId, targetLabel);
+
     m_chatBackend->startSendMessage(targetId, message);
+
+    // 智能体替用户发出去的消息，和用户自己发的一样要落到本地，否则切到聊天页
+    // 看不到这条、左侧会话列表也不动。三步：消息行入库 → 会话快照更新 → 重拉列表
+    MessageInfo local;
+    local.id        = message.tempId;     // 先用临时 ID，服务器回 ID 后照常替换
+    local.accountId = m_userid;
+    local.senderId  = m_userid;
+    local.targetId  = targetId;
+    local.contactId = targetId;
+    local.content   = message.content;
+    local.sendTime  = message.sendTime;
+    local.isSelf    = true;
+    local.isRead    = true;
+    local.isFile    = false;   // 智能体这里只发文本；不显式写死会被结构体默认值兜底
+    saveMessage(local);
+
+    // 自己发的不加未读：会话列表里表现为"最后一条变成它、并置顶"
+    emit dbUpdateConversationMessageRequested(targetId, message.content, message.sendTime, false);
+    emit dbLoadConversationsRequested();
 }
 
 void MainBackend::executeAgentDeleteFriend(const QJsonObject& params)
@@ -1406,19 +1468,30 @@ void MainBackend::executeAgentUpdateRemark(const QJsonObject& params)
 void MainBackend::onAgentTaskRejected(const QString& requestId)
 {
     // 数据上什么都不用做：本地从未执行过这条指令。
-    // 界面上也没有常驻的"等待执行"状态（审批卡在回执成功后就收掉了），只留个日志
+    // 但界面上必须出声 —— 审批卡在回执成功后就收成一行小字了，
+    // 如果这里再沉默，用户会以为任务正在悄悄执行
     qDebug() << "智能体任务被服务器拒绝执行：" << requestId;
+    emit agentTaskFailed(QStringLiteral("这条指令没有执行，数据未做任何改动"));
 }
 
 void MainBackend::onAgentTaskSendSucceeded(const QString& tempId, const QString& serverId)
 {
     Q_UNUSED(serverId);
-    m_agentPendingSends.remove(tempId);
+    if (m_agentPendingSends.remove(tempId) == 0) {
+        return;   // 不是智能体发起的那次发送：聊天页自己有反馈，这里不插嘴
+    }
+
+    // 到此时为止幕后的一切都办完了，必须告诉用户一声：
+    // 审批卡已经收成一行小字，如果这里再没动静，用户没法判断到底发没发出去
+    const QString targetName = m_agentPendingSendNames.take(tempId);
+    emit agentTaskSucceeded(QStringLiteral("已替你转达给 %1")
+                                .arg(targetName.isEmpty() ? QStringLiteral("对方") : targetName));
 }
 
 void MainBackend::onAgentTaskSendFailed(const QString& tempId, const QString& serverId)
 {
     Q_UNUSED(serverId);
+    m_agentPendingSendNames.remove(tempId);   // 失败就不再等这条的成功提示，避免映射表泄漏
     if (m_agentPendingSends.remove(tempId) > 0) {
         // 发送失败的回包不带文字原因，给一句能指导用户的提示；不自动重试
         emit agentTaskFailed(QStringLiteral("消息发送失败，可在聊天页手动重发"));

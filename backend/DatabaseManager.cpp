@@ -1355,6 +1355,39 @@ bool DatabaseManager::saveAgentMessage(const QString& sessionId, const QString& 
     return true;
 }
 
+// 临时 ID → 服务器正式 ID：本地"先存"的那一行在库里占着主键，
+// 拿到正式 ID 后原地改主键，历史回读、后续回答都能用同一个 ID 对上。
+// 失败通常是正式 ID 已经存在（同一行被重复处理），此时不再覆盖，交给上层放弃这一轮
+bool DatabaseManager::replaceAgentMessageId(const QString& sessionId, const QString& oldId,
+                                            const QString& newId)
+{
+    if (!m_messageDatabase.isOpen() || sessionId.isEmpty()
+        || oldId.isEmpty() || newId.isEmpty()) {
+        emit agentMessageIdReplaced(sessionId, newId, false);
+        return false;
+    }
+
+    QSqlQuery query(m_messageDatabase);
+    query.prepare(R"(
+        UPDATE agent_messages
+        SET message_id = ?
+        WHERE session_id = ? AND message_id = ?
+    )");
+    query.bindValue(0, newId);
+    query.bindValue(1, sessionId);
+    query.bindValue(2, oldId);
+
+    if (!query.exec() || query.numRowsAffected() == 0) {
+        qDebug() << "Failed to replace agent message id:" << query.lastError().text()
+                 << "affected:" << query.numRowsAffected();
+        emit agentMessageIdReplaced(sessionId, newId, false);
+        return false;
+    }
+
+    emit agentMessageIdReplaced(sessionId, newId, true);
+    return true;
+}
+
 // 存 AI 回答的一段（is_self=0）。message_id 由主后端在一条回答开始时生成，
 // 同一条回答的所有分块共用它；chunk_seq 在库内自增（MAX+1），调用方不用维护序号。
 // 这里**不**更新 agent_sessions 快照：抽屉里那行显示的是"最后一条用户提问"，

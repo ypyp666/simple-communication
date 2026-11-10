@@ -60,6 +60,8 @@ private slots:
     void onAgentTaskUnsupported(const QString& action);
     // 智能体指令执行失败：把接口原始 message 显示出来，让用户自己决定要不要重来
     void onAgentTaskFailed(const QString& message);
+    // 执行成功：同样要提示。只有失败才说话，用户就分不清是办成了还是没执行
+    void onAgentTaskSucceeded(const QString& message);
     void onToastTimeout();
 
 private:
