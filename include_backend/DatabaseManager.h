@@ -76,6 +76,31 @@ public slots:
     bool clearConversationUnread(const QString& contactId);
     bool deleteConversation(const QString& conversationId);
 
+    // === 智能体会话 / 用户消息（每个账号独立的 messages_<accountId>.db）===
+    // 会话表给智能体页抽屉用（一行 = 一个会话）。
+    // 消息表按"分块"存：同一条消息可以有多行（chunk_seq 递增），
+    // 用户提问一块、AI 流式回答每收到一段写一块 —— 单块再大也不会撑爆一行，
+    // 回读时按 (message_id) 归组、按 (created_at, chunk_seq) 拼回整条
+    void loadAgentSessions();
+    bool createAgentSession(const QString& sessionId, const QString& title, const QDateTime& createdAt);
+    bool saveAgentMessage(const QString& sessionId, const QString& messageId,
+                          const QString& content, const QDateTime& createdAt);
+    // 存 AI 回答的一段（is_self=0，chunk_seq 由库内自增）；不碰会话快照
+    bool saveAgentMessageChunk(const QString& sessionId, const QString& messageId,
+                               const QString& content, const QDateTime& createdAt);
+    // 回读某个会话最近的若干条消息（按时间正序，每条已拼成完整内容）
+    void loadAgentMessages(const QString& sessionId);
+    // 用服务器下发的会话列表核对本地：服务器有、本地没有 → 补插（只写 ID + 名字）；
+    // 本地有、服务器没有 → 说明已被删，连同该会话的消息一起删掉。
+    // 整批在一个事务里做，做完顺手重拉一次列表（emit agentSessionsLoaded）让抽屉刷新
+    void syncAgentSessions(const QList<ConversationInfo>& sessions);
+    // 删除一个智能体会话：同一事务里先删该会话的全部消息、再删会话行。
+    // 消息可能成百上千条，所以这个槽只在后台 DB 线程执行（主线程发请求信号进来），
+    // UI 不会被删库拖住
+    bool deleteAgentSession(const QString& sessionId);
+    // 重命名会话：只改 agent_sessions.title
+    bool renameAgentSession(const QString& sessionId, const QString& title);
+
     // === 联系人操作 ===
     QList<ContactInfo> loadContacts();
     bool saveContact(const ContactInfo& contact);
@@ -97,6 +122,13 @@ signals:
     // 否则调用方会一直等不到回音（与 messagesPageLoaded 的处理一致）
     void contactsLoaded(const QList<ContactInfo>& contacts);
     void conversationsLoaded(const QList<ConversationInfo>& conversations);
+    // 智能体会话列表（喂 AgentWindow 抽屉）。复用 ConversationInfo 渲染：
+    // id=会话ID、name=标题、lastMessage/lastTime=最后一条用户输入快照
+    void agentSessionsLoaded(const QList<ConversationInfo>& sessions);
+    // 智能体会话消息回读结果（sessionId 原样带回，UI 用它过滤"这屏是不是这个会话"）
+    void agentMessagesLoaded(const QString& sessionId, const QList<AgentMessageInfo>& messages);
+    // 用户提问落库结果：主后端靠它决定"入库成功才发对话请求"（含原样的 sessionId/messageId）
+    void agentMessageSaved(const QString& sessionId, const QString& messageId, bool success);
     // 分页查询结果（后台线程发出，主线程的 MainBackend 接收后转发 UI）。
     // hasMore：返回条数 == pageSize 就认为历史还没翻到底（最后一页恰好整页时
     // 会多查一次空页，无害）；UI 据此决定"滚到顶部还拉不拉更早一页"
@@ -114,6 +146,8 @@ private:
     bool createMessageTable();
     bool createContactTable();
     bool createConversationTable();
+    bool createAgentSessionTable();
+    bool createAgentMessageTable();
     
 
     QString getDatabasePath() const;

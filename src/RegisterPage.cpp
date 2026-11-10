@@ -224,6 +224,7 @@ RegisterPage::RegisterPage(MainBackend* backend, QWidget *parent)
     connect(m_backend, &MainBackend::registerWaiting, this, &RegisterPage::onRegisterWaiting);
     connect(m_backend, &MainBackend::registerSuccess, this, &RegisterPage::onRegisterSuccess);
     connect(m_backend, &MainBackend::registerFailed, this, &RegisterPage::onRegisterFailed);
+    connect(m_backend, &MainBackend::registerRateLimited, this, &RegisterPage::onRegisterRateLimited);
     // 网络层连不上（服务器没跑/断网）与"服务器拒绝"分开：信号带 reason，槽用不到，靠参数少的槽自动丢弃
     connect(m_backend, &MainBackend::registerNetworkError, this, &RegisterPage::onRegisterNetworkError);
     connect(m_backend, &MainBackend::registerTimeout, this, &RegisterPage::onRegisterTimeout);
@@ -232,6 +233,7 @@ RegisterPage::RegisterPage(MainBackend* backend, QWidget *parent)
     connect(m_backend, &MainBackend::connectForRegisterWaiting, this, &RegisterPage::onConnectForRegisterWaiting);
     connect(m_backend, &MainBackend::connectForRegisterSuccess, this, &RegisterPage::onConnectForRegisterSuccess);
     connect(m_backend, &MainBackend::connectForRegisterFailed, this, &RegisterPage::onConnectForRegisterFailed);
+    connect(m_backend, &MainBackend::connectForRegisterRateLimited, this, &RegisterPage::onConnectForRegisterRateLimited);
     connect(m_backend, &MainBackend::connectForRegisterTimeout, this, &RegisterPage::onConnectForRegisterTimeout);
     // 等待动画定时器 → 刷新按钮上的省略号（与忘记密码页同一套）
     connect(m_registerAnimTimer, &QTimer::timeout, this, &RegisterPage::updateSubmitButtonAnimation);
@@ -980,6 +982,17 @@ void RegisterPage::onRegisterTimeout()
     triggerErrorFeedback("注册连接超时，请检查网络后重试");
 }
 
+// 被服务器限流（code=429，点得太频繁）：收尾动作与"注册失败"相同（停动画/解锁/复位按钮），
+// 只有提示语区分开——不是账号问题，是点得太频繁
+void RegisterPage::onRegisterRateLimited()
+{
+    m_registerAnimTimer->stop();
+    setInputsEnabled(true);
+    regSubmitBtn->setText(m_originalSubmitText);
+
+    triggerErrorFeedback("操作过于频繁，请稍后再试");
+}
+
 // 取号连接中：账号行指示器转圈（骨架，逻辑待补）
 void RegisterPage::onConnectForRegisterWaiting()
 {
@@ -1003,6 +1016,16 @@ void RegisterPage::onConnectForRegisterFailed()
 void RegisterPage::onConnectForRegisterTimeout()
 {
     m_accountStatusIndicator->setStatus(MessageStatusIndicator::Status::Failed);
+}
+
+// 取号被服务器限流（code=429）：指示器变红可重试（同失败），另在提示行给一句文字——
+// 只给红感叹号的话用户不知道"等一会儿再点"才是对的。不抖按钮：取号阶段用户还没输入
+void RegisterPage::onConnectForRegisterRateLimited()
+{
+    m_accountStatusIndicator->setStatus(MessageStatusIndicator::Status::Failed);
+    m_registerMismatchHint->setStyleSheet(
+        "QLabel { color: rgba(224, 91, 91, 0.6); font-size: 12px; font-weight: bold; }");
+    m_registerMismatchHint->setText("操作过于频繁，请稍后再试");
 }
 
 // 槽函数：刷新提交按钮动画（"正在注册"后面的点，500ms 多一个点、循环到 3 个）

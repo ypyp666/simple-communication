@@ -30,6 +30,14 @@ enum class  CmdType {
     PullDelFriendCache,//上线拉取离线删除好友墓碑
     AckDelFriendCache,//回执并清除已同步的删除墓碑
     Examine,//心跳检验（纯存活探测，不查库）
+    AgentRequest,//智能体请求，前端申请调用智能体服务，后端转发给智能体服务端
+    AgentMessageCreate,//建消息行：服务器先分配正式消息ID回给客户端，客户端再带着它发 agent_request
+    AgentStop,//中断某条会话正在进行的智能体回答（流程结束或用户中途点停止）
+    AgentSessionCreate,//新建智能体会话（会话ID由客户端生成，服务器只按它建行）
+    AgentSessionRename,//智能体会话改名
+    AgentSessionDelete,//删除智能体会话
+    AgentSessionsList,//登录后拉取本账号的全部智能体会话（请求叫 pull，响应包叫 list）
+    AgentApprove,//用户对智能体的阻断审批回执（同意 / 拒绝），服务器据此续跑那一轮
 };
 
     CmdType  JsonToCmdType(std::string type);
@@ -58,7 +66,14 @@ enum class  CmdType {
     std::string HandlePullDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleAckDelFriendCache(const json& req, mysqlconn& conn, SessionPtr session);
     std::string HandleExamine(const json& req, mysqlconn& conn, SessionPtr session);
-    
+    std::string HandleAgentRequest(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentMessageCreate(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentStop(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionCreate(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionRename(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionDelete(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentSessionsList(const json& req, mysqlconn& conn, SessionPtr session);
+    std::string HandleAgentApprove(const json& req, mysqlconn& conn, SessionPtr session);
 
 inline std::unordered_map<CmdType, CmdHandler> cmd_table
 {
@@ -84,7 +99,18 @@ inline std::unordered_map<CmdType, CmdHandler> cmd_table
     {CmdType::PullDelFriendCache, HandlePullDelFriendCache},
     {CmdType::AckDelFriendCache, HandleAckDelFriendCache},
     {CmdType::Examine, HandleExamine},
-
+    {CmdType::AgentRequest, HandleAgentRequest},
+    // 注意：枚举值和处理器必须成对登记。漏登记的话 message 会在 cmd_table.find() 里
+    // 落到 end()，客户端只能收到一个空包，看起来就是"请求石沉大海"
+    {CmdType::AgentMessageCreate, HandleAgentMessageCreate},
+    {CmdType::AgentStop, HandleAgentStop},
+    {CmdType::AgentSessionCreate, HandleAgentSessionCreate},
+    {CmdType::AgentSessionRename, HandleAgentSessionRename},
+    {CmdType::AgentSessionDelete, HandleAgentSessionDelete},
+    {CmdType::AgentSessionsList, HandleAgentSessionsList},
+    // 审批回执也是一条普通命令：客户端发 agent_approve，服务器异步续跑。
+    // 登记在这里的意义和上面那些完全一样 —— 漏了就是一个空包，请求直接消失
+    {CmdType::AgentApprove, HandleAgentApprove},
 };
 
 #endif //UNTITLED_TABLE_H

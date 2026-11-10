@@ -74,6 +74,7 @@ private:
     void onRegisterWaiting();        // 连接/等待中：锁页面 + "正在注册..."动画
     void onRegisterSuccess();        // 注册成功：绿色提示 + 清空输入 + 解锁
     void onRegisterFailed();         // 仅"服务器明确拒绝"（如账号已存在）
+    void onRegisterRateLimited();    // 被服务器限流（code=429）：点得太频繁，与"注册被拒"分开提示
     void onRegisterNetworkError();   // 网络层连不上（服务器没跑/断网），与服务器拒绝分开提示
     void onRegisterTimeout();        // 连接超时
     // ===== "取号"（进页即拉起 TCP 的后端连接阶段）各阶段槽函数（骨架，逻辑待补）=====
@@ -81,6 +82,7 @@ private:
     void onConnectForRegisterWaiting();   // 连接中
     void onConnectForRegisterSuccess(const QString& account);   // 连接建立成功，服务器下发的账号 ID 从参数进来
     void onConnectForRegisterFailed();    // 网络层连不上（与"注册被拒"分开提示）
+    void onConnectForRegisterRateLimited();   // 被服务器限流（code=429）：点得太频繁，提示等一会儿
     void onConnectForRegisterTimeout();   // 连接超时
     // 槽函数：刷新提交按钮动画（"正在注册..."后面的点），骨架待补
     void updateSubmitButtonAnimation();

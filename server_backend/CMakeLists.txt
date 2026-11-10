@@ -15,6 +15,9 @@ find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MYSQL REQUIRED mysqlclient)
 
+# libcurl 依赖查找（服务器调智能体走 HTTP，用 curl 的 easy 接口）
+pkg_check_modules(CURL REQUIRED libcurl)
+
 # 生成即时通信服务器可执行程序
 add_executable(im_server
         src/main.cpp
@@ -24,6 +27,7 @@ add_executable(im_server
         src/FunctionalFunction.cpp
         src/tcp_server.cpp
         src/OnlineSessionManager.cpp
+        src/agent_tcp.cpp
 
         include/mysql.h
         include/json_shift.h
@@ -31,9 +35,9 @@ add_executable(im_server
         include/FunctionalFunction.h
         include/tcp_server.h
         include/OnlineSessionManager.h
+        include/agent_tcp.h
 
         nlohmann/json.hpp
-
 
 
 
@@ -42,9 +46,14 @@ add_executable(im_server
 # 链接库统一写在一条，更整洁
 target_link_libraries(im_server PRIVATE
         ${MYSQL_LIBRARIES}
+        ${CURL_LIBRARIES}
         Threads::Threads
 )
 
 # MySQL头文件、库目录保留不变
 target_include_directories(im_server PRIVATE ${MYSQL_INCLUDE_DIRS})
 target_link_directories(im_server PRIVATE ${MYSQL_LIBRARY_DIRS})
+
+# libcurl 的头文件与库目录
+target_include_directories(im_server PRIVATE ${CURL_INCLUDE_DIRS})
+target_link_directories(im_server PRIVATE ${CURL_LIBRARY_DIRS})

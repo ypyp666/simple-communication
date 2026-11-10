@@ -249,8 +249,10 @@ void ContactList::setContacts(const QList<ContactInfo>& contacts)
     {
         QListWidgetItem* item = new QListWidgetItem(listWidget);
         item->setData(Qt::UserRole, contact.id);         // 藏好友 ID，点击后据此知道是谁
+        //qt的listwidgetitem能按不同角色存多份数据
+        //qt的UserRole是自定义的，用户可以自定义数据类型，这里用UserRole+1来存储好友名称
         // 名字直接存 item 上（用 Role+1），比遍历控件树去抠 QLabel 文本可靠得多
-        item->setData(Qt::UserRole + 1, contact.name);
+        item->setData(Qt::UserRole + 1, contact.name);//用不同编号来存储不同数据
         item->setSizeHint(QSize(0, kItemHeight));
 
         QWidget* container = new QWidget();   // 装这一行的所有子控件
